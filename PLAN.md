@@ -78,11 +78,19 @@ plains-nexus app registration (no new secret to provision).
 - [ ] End-to-end delegated flow (real user consent → browse → import → auto-sync) — pending
       redirect-URI registration + deploy.
 
-## Next: package the processing job (Databricks Job + cluster spec / bundle)
+## Source control + deploy — IN PROGRESS
 
-- [ ] Job definition (cluster spec pinning `requirements.txt`, schedule for the N-min sweep,
-      `python -m processing.job --loop --sweep`).
-- [ ] Deploy the Flask app as a Databricks App; grant the app SP access to schema + volume + secrets.
+- [x] Private GitHub repo `HyprPixl/plains-document-management` (main pushed).
+      `.gitignore` guards `__pycache__` + secrets; `app.yaml` carries only secret-scope
+      **key names**, never values.
+- [x] `APP_BASE_URL` set to the deployed app URL
+      (`plains-document-management-1979327425712808.8.azure.databricksapps.com`).
+- [x] `job.json` — Databricks Job definition (continuous, single task,
+      `python -m processing.job --loop --sweep --sync`, cluster installs `requirements.txt`).
+- [ ] User: wire the repo into the Databricks App + deploy; grant the app SP access to
+      schema + `docs` volume + secret scope.
+- [ ] User: register `<APP_BASE_URL>/api/sharepoint/callback` on the plains-nexus app reg.
+- [ ] Create the job from `job.json` (`databricks jobs create --json @job.json`).
 - [ ] Re-run the DI `output=["pdf"]` path on the job cluster to close [!] above.
 
 ## What can be tested now vs. later

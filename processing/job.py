@@ -362,12 +362,31 @@ def run_once(do_sweep: bool = False, do_sync: bool = False) -> int:
     return len(docs)
 
 
+def drain(do_sweep: bool = False, do_sync: bool = False, max_passes: int = 10000) -> int:
+    """Discovery once, then process the pending backlog until empty, then return.
+
+    This is the cost-optimal mode for a *scheduled* job: the cluster wakes, clears the
+    queue, and terminates — no idle compute between triggers. Discovery (sweep/sync) runs
+    only on the first pass so it isn't repeated per batch.
+    """
+    total = first = 0
+    while first < max_passes:
+        n = run_once(do_sweep=(do_sweep and first == 0), do_sync=(do_sync and first == 0))
+        first += 1
+        total += n
+        if n == 0:
+            break
+    print(f"Drain complete: processed {total} doc(s) across {first} pass(es).")
+    return total
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--loop", action="store_true", help="run continuously")
-    ap.add_argument("--once", action="store_true", help="single pass then exit")
-    ap.add_argument("--sweep", action="store_true", help="include app-only SharePoint sweep each pass")
-    ap.add_argument("--sync", action="store_true", help="include delegated auto-sync each pass")
+    ap.add_argument("--loop", action="store_true", help="run continuously (near-real-time)")
+    ap.add_argument("--drain", action="store_true", help="clear the backlog then exit (scheduled mode)")
+    ap.add_argument("--once", action="store_true", help="single batch then exit")
+    ap.add_argument("--sweep", action="store_true", help="include app-only SharePoint sweep")
+    ap.add_argument("--sync", action="store_true", help="include delegated auto-sync")
     ap.add_argument("--idle-sleep", type=int, default=30, help="seconds to sleep when idle in loop mode")
     args = ap.parse_args()
 
@@ -382,6 +401,8 @@ def main():
             n = run_once(do_sweep=args.sweep, do_sync=do_sync)
             if n == 0:
                 time.sleep(args.idle_sleep)
+    elif args.drain:
+        drain(do_sweep=args.sweep, do_sync=args.sync)
     else:
         run_once(do_sweep=args.sweep, do_sync=args.sync)
 

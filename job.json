@@ -1,0 +1,51 @@
+{
+  "name": "document-hub-processing",
+  "max_concurrent_runs": 1,
+  "tags": {"project": "document-hub"},
+  "git_source": {
+    "git_url": "https://github.com/HyprPixl/plains-document-management",
+    "git_provider": "gitHub",
+    "git_branch": "main"
+  },
+  "job_clusters": [
+    {
+      "job_cluster_key": "dochub_worker",
+      "new_cluster": {
+        "spark_version": "17.3.x-scala2.13",
+        "node_type_id": "Standard_D4ds_v5",
+        "num_workers": 0,
+        "spark_conf": {
+          "spark.databricks.cluster.profile": "singleNode",
+          "spark.master": "local[*, 4]"
+        },
+        "custom_tags": {"ResourceClass": "SingleNode"},
+        "data_security_mode": "SINGLE_USER"
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "process",
+      "description": "OCR + field extraction; app-only sweep + delegated auto-sync, then drain the queue.",
+      "job_cluster_key": "dochub_worker",
+      "spark_python_task": {
+        "python_file": "worker.py",
+        "source": "GIT",
+        "parameters": ["--drain", "--sweep", "--sync"]
+      },
+      "libraries": [
+        {"pypi": {"package": "azure-ai-documentintelligence>=1.0.0"}},
+        {"pypi": {"package": "pypdf>=4.0"}},
+        {"pypi": {"package": "cryptography>=42.0"}},
+        {"pypi": {"package": "azure-identity>=1.15,<2.0"}},
+        {"pypi": {"package": "requests>=2.31,<3.0"}}
+      ],
+      "timeout_seconds": 3300
+    }
+  ],
+  "trigger": {
+    "pause_status": "UNPAUSED",
+    "periodic": {"interval": 10, "unit": "MINUTES"}
+  },
+  "queue": {"enabled": true}
+}
