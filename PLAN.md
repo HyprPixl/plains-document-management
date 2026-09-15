@@ -85,13 +85,26 @@ plains-nexus app registration (no new secret to provision).
       **key names**, never values.
 - [x] `APP_BASE_URL` set to the deployed app URL
       (`plains-document-management-1979327425712808.8.azure.databricksapps.com`).
-- [x] `job.json` — Databricks Job definition (continuous, single task,
-      `python -m processing.job --loop --sweep --sync`, cluster installs `requirements.txt`).
-- [ ] User: wire the repo into the Databricks App + deploy; grant the app SP access to
-      schema + `docs` volume + secret scope.
+- [x] `job.json` + `worker.py` — Databricks Job `document-hub-processing` (id 607689951574858),
+      single-node cluster, git source (`main`), **scheduled every 10 min** running
+      `worker.py --drain --sweep --sync` (drain = clear backlog then terminate; cost-optimal).
+- [x] App deployed by user; app SP `app-4850yt` (`532acbc1-…`) granted USE_CATALOG on
+      `product_dev`, USE_SCHEMA/SELECT/MODIFY on `document_hub`, READ/WRITE on `docs` volume,
+      READ on secret scope `pna-wu2-dm-dev-data-keyv`. `/api/me` unblocked.
+- [x] Job validated on a fresh job cluster: import bug fixed (see below), `--sweep` discovered
+      + downloaded + registered the Land Records connected source (Graph auth → resolve →
+      recursive list → download → volume write → Delta insert all working). Imported docs land
+      `unclassified/pending` → Manage "Needs classification" queue.
+- [!] Fixed: `.gitignore` rule `secrets.*` had excluded `processing/secrets.py` (code, not a
+      secret) → first run failed `ImportError: cannot import name 'secrets'`. Rule narrowed;
+      file committed.
+- [ ] **User: redeploy the app from latest `main`** — the running deployment predates the
+      `[hidden]` overlay CSS fix and the `APP_BASE_URL` value.
 - [ ] User: register `<APP_BASE_URL>/api/sharepoint/callback` on the plains-nexus app reg.
-- [ ] Create the job from `job.json` (`databricks jobs create --json @job.json`).
-- [ ] Re-run the DI `output=["pdf"]` path on the job cluster to close [!] above.
+- [ ] Close DI `output=["pdf"]` on the job cluster: classify a doc so a scheduled run OCRs it
+      (nothing gets processed until at least one doc is `classified`).
+- [ ] Decide whether the whole `land_records` source should stay auto-imported (it's enabled;
+      disable in `sources` if only a sample was wanted). Sweep is incremental after first pull.
 
 ## What can be tested now vs. later
 
