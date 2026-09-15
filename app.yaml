@@ -1,0 +1,43 @@
+command: ["gunicorn", "app:app", "-w", "4", "-b", "0.0.0.0:8000", "--timeout", "120"]
+
+env:
+  - name: CATALOG
+    value: "product_dev"
+  - name: SCHEMA
+    value: "document_hub"
+  - name: DOCS_VOLUME
+    value: "/Volumes/product_dev/document_hub/docs"
+  - name: SQL_WAREHOUSE_ID
+    value: "4d7f25b1bd5fddf1"
+  - name: EXTRACT_MODEL
+    value: "databricks-claude-sonnet-4"
+  - name: PROMPT_VERSION
+    value: "v1"
+  # Processing job / SharePoint (used by the job, not the web app):
+  - name: DI_ENDPOINT
+    value: "https://westus2.api.cognitive.microsoft.com/"
+  - name: DI_SECRET_SCOPE
+    value: "pna-wu2-dm-dev-data-keyv"
+  - name: DI_SECRET_KEY
+    value: "pna-wu2-datamgt-dev-di01--key"
+  - name: SP_SECRET_SCOPE
+    value: "pna-wu2-dm-dev-data-keyv"
+  - name: SP_CLIENT_ID_KEY
+    value: "sharepointspn--clientid"
+  - name: SP_CLIENT_SECRET_KEY
+    value: "sharepointspn--clientsecret"
+  - name: SP_TENANT_ID_KEY
+    value: "plains--tenant-id"
+  # Delegated (on-behalf-of-user) SharePoint — reuses plains-nexus app reg:
+  - name: SP_DELEG_SECRET_SCOPE
+    value: "pna-wu2-dm-dev-data-keyv"
+  - name: SP_DELEG_CLIENT_ID_KEY
+    value: "pna-datamgmt-terraform-appreg-client-id"
+  - name: SP_DELEG_CLIENT_SECRET_KEY
+    value: "pna-datamgmt-terraform-appreg-client-secret"
+  - name: SP_DELEG_TENANT_ID_KEY
+    value: "plains-tenant-id"
+  # Optional explicit public URL; if unset, derived from X-Forwarded-* at runtime.
+  # Must match the redirect URI registered on the app: <APP_BASE_URL>/api/sharepoint/callback
+  - name: APP_BASE_URL
+    value: "https://plains-document-management-1979327425712808.8.azure.databricksapps.com"

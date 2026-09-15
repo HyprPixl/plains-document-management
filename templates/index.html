@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Document Hub</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">◧</span>
+      <span class="brand-name">Document Hub</span>
+    </div>
+    <nav class="surface-switch" role="tablist">
+      <button class="surface-tab" data-surface="manage" role="tab">Manage</button>
+      <button class="surface-tab" data-surface="explore" role="tab">Explore</button>
+    </nav>
+    <div class="user-chip" id="userChip">…</div>
+  </header>
+
+  <main>
+    <!-- ─────────────── MANAGE ─────────────── -->
+    <section id="surface-manage" class="surface">
+      <div class="surface-head">
+        <h1>Manage documents</h1>
+        <p class="muted">Upload, classify, and verify documents before they become searchable.</p>
+      </div>
+
+      <div class="stat-row" id="statRow"></div>
+
+      <div class="panel upload-panel">
+        <div class="upload-drop" id="uploadDrop">
+          <input type="file" id="fileInput" multiple hidden>
+          <div class="upload-inner">
+            <div class="upload-icon">⬆</div>
+            <div><strong>Drop files here</strong> or <button class="link-btn" id="browseBtn">browse</button></div>
+            <div class="muted small">PDF, Word, Excel, PowerPoint, images, email — grouped or individual</div>
+          </div>
+        </div>
+        <div class="upload-alt" id="spEntry" hidden>
+          <span class="muted small">or</span>
+          <button class="btn" id="spImportBtn">Import from SharePoint…</button>
+        </div>
+        <div id="uploadResults" class="upload-results"></div>
+      </div>
+
+      <div class="panel" id="syncPanel" hidden>
+        <div class="panel-head">
+          <div class="tab-group"><button class="qtab active" disabled>Auto-synced folders</button></div>
+        </div>
+        <div id="syncList" class="sync-list"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div class="tab-group" id="queueTabs">
+            <button class="qtab active" data-queue="unclassified">Needs classification</button>
+            <button class="qtab" data-queue="needs_review">Needs review</button>
+            <button class="qtab" data-queue="verified">Verified</button>
+            <button class="qtab" data-queue="all">All</button>
+          </div>
+          <div class="bulk-bar" id="bulkBar" hidden>
+            <span id="bulkCount">0 selected</span>
+            <button class="btn" id="bulkClassifyBtn">Classify selected…</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="doc-table">
+            <thead>
+              <tr>
+                <th class="col-check"><input type="checkbox" id="selectAll"></th>
+                <th>Document</th><th>Business unit</th><th>Type</th>
+                <th>Extraction</th><th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="docRows"></tbody>
+          </table>
+          <div class="empty" id="docEmpty" hidden>Nothing here yet.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────── EXPLORE ─────────────── -->
+    <section id="surface-explore" class="surface" hidden>
+      <div class="surface-head">
+        <h1>Explore</h1>
+        <p class="muted">Search verified documents by content, title, or category.</p>
+      </div>
+      <div class="search-bar">
+        <input type="search" id="searchInput" placeholder="Search documents…">
+        <select id="filterBU"><option value="">All business units</option></select>
+        <select id="filterType"><option value="">All types</option></select>
+        <button class="btn primary" id="searchBtn">Search</button>
+      </div>
+      <div id="searchResults" class="result-grid"></div>
+    </section>
+  </main>
+
+  <!-- ─────────── Detail drawer (verify + fields) ─────────── -->
+  <div class="drawer-scrim" id="drawerScrim" hidden></div>
+  <aside class="drawer" id="drawer" hidden>
+    <div class="drawer-head">
+      <div>
+        <div class="drawer-title" id="drawerTitle">Document</div>
+        <div class="muted small" id="drawerSub"></div>
+      </div>
+      <button class="icon-btn" id="drawerClose">✕</button>
+    </div>
+    <div class="drawer-body" id="drawerBody"></div>
+    <div class="drawer-foot" id="drawerFoot"></div>
+  </aside>
+
+  <!-- ─────────── Classify modal ─────────── -->
+  <div class="modal-scrim" id="classifyScrim" hidden>
+    <div class="modal">
+      <h2>Classify documents</h2>
+      <p class="muted small" id="classifyCount"></p>
+      <label>Business unit
+        <select id="clBU"></select>
+      </label>
+      <label>Document type
+        <select id="clType"></select>
+      </label>
+      <label>Department
+        <select id="clDept"></select>
+      </label>
+      <div class="modal-foot">
+        <button class="btn" id="classifyCancel">Cancel</button>
+        <button class="btn primary" id="classifyApply">Apply &amp; queue extraction</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─────────── SharePoint browser modal ─────────── -->
+  <div class="modal-scrim" id="spScrim" hidden>
+    <div class="modal sp-modal">
+      <div class="sp-head">
+        <h2>Import from SharePoint</h2>
+        <button class="icon-btn" id="spClose">✕</button>
+      </div>
+
+      <div id="spConnect" class="sp-connect" hidden>
+        <p class="muted">Connect your Microsoft account to browse the SharePoint sites and files you already have access to. Nothing is shared beyond what you can open yourself.</p>
+        <button class="btn primary" id="spConnectBtn">Connect to SharePoint</button>
+      </div>
+
+      <div id="spBrowser" hidden>
+        <div class="sp-crumbs" id="spCrumbs"></div>
+        <div class="sp-toolbar">
+          <input type="search" id="spSearch" placeholder="Search sites…" hidden>
+          <span class="muted small" id="spSelCount">Nothing selected</span>
+        </div>
+        <div class="sp-list" id="spList"></div>
+      </div>
+
+      <div class="sp-foot" id="spFoot" hidden>
+        <details class="sp-target">
+          <summary>Classify on import (optional)</summary>
+          <div class="sp-target-grid">
+            <label>Business unit<select id="spBU"></select></label>
+            <label>Document type<select id="spType"></select></label>
+            <label>Department<select id="spDept"></select></label>
+          </div>
+        </details>
+        <label class="sp-autosync">
+          <input type="checkbox" id="spAutoSync">
+          Keep this folder in sync automatically
+          <span class="muted small">— new and changed files get pulled in on a schedule. SharePoint connections can be fickle; if the connection lapses you'll be asked to reconnect.</span>
+        </label>
+        <div class="modal-foot">
+          <button class="btn" id="spCancel">Cancel</button>
+          <button class="btn primary" id="spImport" disabled>Import selected</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
