@@ -103,8 +103,15 @@ plains-nexus app registration (no new secret to provision).
 - [ ] User: register `<APP_BASE_URL>/api/sharepoint/callback` on the plains-nexus app reg.
 - [ ] Close DI `output=["pdf"]` on the job cluster: classify a doc so a scheduled run OCRs it
       (nothing gets processed until at least one doc is `classified`).
-- [ ] Decide whether the whole `land_records` source should stay auto-imported (it's enabled;
-      disable in `sources` if only a sample was wanted). Sweep is incremental after first pull.
+- [x] Removed the bulk Land Records import (user didn't want the whole SharePoint corpus):
+      deleted 454 `land_records` docs + their volume files, disabled the `land_records`
+      source, dropped `--sweep` from the job (params now `--drain --sync`), and **paused the
+      schedule**. Processing is now on-demand / delegated-only:
+        - manual per-folder imports via the SharePoint UI, and
+        - opt-in delegated auto-sync (`--sync`) for folders a user explicitly arms.
+      Unpause the job (or run-now) once there are classified docs or armed syncs to process.
+      Re-enable `sources.land_records` + re-add `--sweep` only if a full connected-source
+      pull is ever wanted.
 
 ## What can be tested now vs. later
 

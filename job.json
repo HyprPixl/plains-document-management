@@ -31,7 +31,7 @@
       "spark_python_task": {
         "python_file": "worker.py",
         "source": "GIT",
-        "parameters": ["--drain", "--sweep", "--sync"]
+        "parameters": ["--drain", "--sync"]
       },
       "libraries": [
         {"pypi": {"package": "azure-ai-documentintelligence>=1.0.0"}},
@@ -44,7 +44,7 @@
     }
   ],
   "trigger": {
-    "pause_status": "UNPAUSED",
+    "pause_status": "PAUSED",
     "periodic": {"interval": 10, "unit": "MINUTES"}
   },
   "queue": {"enabled": true}
