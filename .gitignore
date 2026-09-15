@@ -17,7 +17,8 @@ Thumbs.db
 .idea/
 
 # Secrets — never commit. Config uses secret scopes, but guard anyway.
+# (Note: processing/secrets.py is CODE — a thin dbutils/SDK secret-reader — not a secret.)
 .env
+.env.*
 *.pem
 *.key
-secrets.*

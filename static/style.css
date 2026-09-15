@@ -1,4 +1,10 @@
 /* Document Hub — business-facing light theme */
+
+/* The `hidden` attribute must always win: class rules that set `display` (e.g. the
+   modal/drawer scrims use display:flex / position:fixed) otherwise override the browser's
+   low-specificity [hidden] rule, leaving overlays stuck open on load. */
+[hidden] { display: none !important; }
+
 :root {
   --bg: #f5f7fa;
   --panel: #ffffff;
