@@ -6,6 +6,7 @@ const state = {
   taxonomy: { department: [], document_type: [] },
   surface: "manage",
   queue: "unclassified",
+  fieldsMode: false,
   selected: new Set(),
   currentDoc: null,
 };
@@ -87,18 +88,32 @@ async function init() {
     const [me, tax] = await Promise.all([api("/api/me"), api("/api/taxonomy")]);
     state.me = me; state.taxonomy = tax;
     $("#userChip").textContent = me.email + (me.is_admin ? " · admin" : "");
-    // The extraction-fields admin panel lives inside Manage; reveal it once identity is known.
-    if (me.is_admin && state.surface === "manage") { $("#fieldsPanel").hidden = false; loadFieldDefs(); }
+    // The "Modify fields" toggle lives in the queue header; reveal it once identity is known.
+    if (me.is_admin && state.surface === "manage") $("#modifyFieldsBtn").hidden = false;
     if (state.surface === "explore") loadExploreFilters();  // refill filters now taxonomy is in
   } catch (e) { toast("Load failed: " + e.message, true); }
 }
 
 // ─────────────────────────────────────────────── MANAGE ──
 async function loadManage() {
+  setFieldsMode(false);  // always land on the document view, not the fields editor
+  if (state.me?.is_admin) $("#modifyFieldsBtn").hidden = false;
   loadStats();
   loadDocs();
   refreshSharePoint();
-  if (state.me?.is_admin) { $("#fieldsPanel").hidden = false; loadFieldDefs(); }
+}
+// Manage has two mutually-exclusive views: the document queue (table) and the extraction-
+// fields editor. "Modify fields" swaps to the editor and collapses the table; picking a queue
+// tab / stat card swaps back. Admin-only (the button is hidden otherwise).
+function setFieldsMode(on) {
+  state.fieldsMode = on;
+  $("#docTableWrap").hidden = on;
+  $("#fieldsPanel").hidden = !on;
+  $("#modifyFieldsBtn").classList.toggle("active", on);
+  if (on) {
+    loadFieldDefs();
+    $("#fieldsPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+  }
 }
 function skeletonStatCards() {
   $("#statRow").replaceChildren(
@@ -138,6 +153,7 @@ function wireQueueTabs() {
   $("#bulkClassifyBtn").addEventListener("click", openClassify);
 }
 function selectQueue(q) {
+  if (state.fieldsMode) setFieldsMode(false);  // a queue tab / stat card returns to the table
   state.queue = q;
   state.selected.clear(); updateBulkBar();
   $$("#queueTabs .qtab").forEach((b) => b.classList.toggle("active", b.dataset.queue === q));
@@ -1004,6 +1020,8 @@ const TYPE_LABELS = { text: "Text", long_text: "Long text", date: "Date", curren
   number: "Number", picklist: "Picklist", multi: "Multi-value", summary: "Summary" };
 
 function wireFields() {
+  $("#modifyFieldsBtn").addEventListener("click", () => setFieldsMode(true));
+  $("#fieldsDoneBtn").addEventListener("click", () => setFieldsMode(false));
   $("#fieldAddBtn").addEventListener("click", () => openFieldModal(null));
   $("#ffCancel").addEventListener("click", () => ($("#fieldScrim").hidden = true));
   $("#ffSave").addEventListener("click", saveFieldDef);

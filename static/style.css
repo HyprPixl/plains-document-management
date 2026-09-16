@@ -135,6 +135,9 @@ main { max-width: 1160px; margin: 0 auto; padding: 28px 24px 80px; }
 .link-btn { border: 0; background: none; color: var(--brand); font: inherit; cursor: pointer; padding: 0; text-decoration: underline; }
 .icon-btn { border: 0; background: none; font-size: 18px; cursor: pointer; color: var(--muted); }
 
+.head-actions { display: flex; align-items: center; gap: 10px; }
+.btn.small.active { background: var(--brand); border-color: var(--brand); color: var(--brand-ink); }
+
 .empty { padding: 40px; text-align: center; color: var(--muted); }
 
 /* ── Loading skeletons ── */

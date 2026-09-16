@@ -60,12 +60,15 @@
             <button class="qtab" data-queue="verified">Verified</button>
             <button class="qtab" data-queue="all">All</button>
           </div>
-          <div class="bulk-bar" id="bulkBar" hidden>
-            <span id="bulkCount">0 selected</span>
-            <button class="btn" id="bulkClassifyBtn">Classify selected…</button>
+          <div class="head-actions">
+            <div class="bulk-bar" id="bulkBar" hidden>
+              <span id="bulkCount">0 selected</span>
+              <button class="btn" id="bulkClassifyBtn">Classify selected…</button>
+            </div>
+            <button class="btn small" id="modifyFieldsBtn" hidden>Modify fields</button>
           </div>
         </div>
-        <div class="table-wrap">
+        <div class="table-wrap" id="docTableWrap">
           <table class="doc-table">
             <thead>
               <tr>
@@ -79,11 +82,14 @@
         </div>
       </div>
 
-      <!-- Extraction fields (admin only) -->
+      <!-- Extraction fields (admin only) — toggled from "Modify fields" in the queue header -->
       <div class="panel" id="fieldsPanel" hidden>
         <div class="panel-head">
           <div class="tab-group"><button class="qtab active" disabled>Extraction fields</button></div>
-          <button class="btn small" id="fieldAddBtn">Add field</button>
+          <div class="head-actions">
+            <button class="btn small" id="fieldAddBtn">Add field</button>
+            <button class="btn small" id="fieldsDoneBtn">Done</button>
+          </div>
         </div>
         <div class="fields-body">
           <p class="muted small">Define the fields extracted for each document type. Common fields apply to every document; a clear description with an example guides the AI extraction. Fields marked <strong>*</strong> must be filled before a document can be verified.</p>
