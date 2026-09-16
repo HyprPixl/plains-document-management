@@ -198,6 +198,10 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #cfe0f5; border-c
 .field-row label { display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px; }
 .field-row input, .field-row select, .field-row textarea { width: 100%; }
 .field-row .prov { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.field-row textarea { min-height: 68px; resize: vertical; line-height: 1.5; }
+.field-row textarea.summary-box { min-height: 150px; max-height: 340px; overflow-y: auto; }
+.list-editor { display: flex; flex-direction: column; gap: 8px; }
+.list-editor .tag-chip { font-size: 13px; padding: 3px 10px; }
 .field-row.req label::after { content: " *"; color: var(--danger); }
 .section-label { font-size: 12px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); margin: 18px 0 10px; }
 .links-list { display: flex; flex-direction: column; gap: 6px; }

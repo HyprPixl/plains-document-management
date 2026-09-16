@@ -355,13 +355,20 @@ function renderDrawer(data) {
     const val = f.confirmed_value ?? f.proposed_value ?? "";
     const row = el("div", { class: "field-row" + (f.required_for_verify ? " req" : "") });
     row.append(el("label", {}, f.label));
+    // Multi-value fields (topics, parties) come back as JSON arrays — render them as an
+    // editable chip list rather than dumping raw JSON into a text box. Also normalise the
+    // legacy [{name,role}] shape into "Name — role" strings for display.
+    const list = asStringList(val, f.data_type);
     let input;
     if (f.options) {
       input = el("select", { "data-key": f.field_key });
       input.append(el("option", { value: "" }, "—"));
       f.options.forEach((o) => input.append(el("option", { value: o, ...(o === val ? { selected: "" } : {}) }, o)));
-    } else if (f.data_type === "long_text") {
-      input = el("textarea", { "data-key": f.field_key, rows: "3" }); input.value = val;
+    } else if (list) {
+      input = listEditor(f.field_key, list);
+    } else if (f.data_type === "summary" || f.data_type === "long_text") {
+      input = el("textarea", { "data-key": f.field_key,
+        class: f.data_type === "summary" ? "summary-box" : "" }); input.value = val;
     } else {
       input = el("input", { type: f.data_type === "date" ? "date" : "text", "data-key": f.field_key });
       input.value = val;
@@ -436,7 +443,7 @@ function renderExtractPreview(container, defs) {
     container.append(el("div", { class: "extract-field" },
       el("div", { class: "ef-head" },
         el("span", { class: "ef-label" }, f.label + (f.required_for_verify ? " *" : "")),
-        el("span", { class: "ef-type" }, f.data_type)),
+        el("span", { class: "ef-type" }, TYPE_LABELS[f.data_type] || f.data_type)),
       f.extraction_prompt_hint
         ? el("div", { class: "ef-hint muted small" }, f.extraction_prompt_hint) : null));
   });
@@ -479,6 +486,55 @@ function renderTags(docId, tags) {
       } catch (e2) { toast("Failed: " + e2.message, true); }
     } });
   wrap.append(chips, input);
+  return wrap;
+}
+// Turn a stored field value into a list of display strings, or null if it isn't list-shaped.
+// `multi` fields are always lists (empty when blank); other types only when the value is a
+// JSON array (e.g. a legacy [{name,role}] parties value we want to show cleanly).
+function asStringList(val, dataType) {
+  if (val === "" || val == null) return dataType === "multi" ? [] : null;
+  let arr = val;
+  if (typeof val === "string") {
+    const s = val.trim();
+    if (!s.startsWith("[")) return dataType === "multi" ? [val] : null;
+    try { arr = JSON.parse(s); } catch { return null; }
+  }
+  if (!Array.isArray(arr)) return null;
+  return arr.map(itemToStr).filter((x) => x !== "");
+}
+function itemToStr(item) {
+  if (item == null) return "";
+  if (typeof item === "object") {
+    if (item.name && item.role) return `${item.name} — ${item.role}`;
+    if (item.name) return String(item.name);
+    return Object.values(item).filter(Boolean).map(String).join(" — ");
+  }
+  return String(item);
+}
+// Editable chip list backed by a hidden input[data-key] holding the JSON array, so the
+// normal collectFieldValues()/save path stores it as a JSON string like everything else.
+function listEditor(key, items) {
+  const wrap = el("div", { class: "list-editor" });
+  const hidden = el("input", { type: "hidden", "data-key": key });
+  const chips = el("div", { class: "tag-chips" });
+  const sync = () => (hidden.value = JSON.stringify(items));
+  const draw = () => {
+    chips.replaceChildren(...items.map((t, i) =>
+      el("span", { class: "tag-chip" }, t,
+        el("button", { class: "tag-x", title: "Remove", type: "button",
+          onclick: () => { items.splice(i, 1); draw(); sync(); } }, "✕"))));
+    if (!items.length) chips.append(el("span", { class: "muted small" }, "None."));
+  };
+  const input = el("input", { type: "text", placeholder: "Add and press Enter",
+    onkeydown: (e) => {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      const v = input.value.trim();
+      if (!v || items.includes(v)) { input.value = ""; return; }
+      items.push(v); input.value = ""; draw(); sync();
+    } });
+  draw(); sync();
+  wrap.append(hidden, chips, input);
   return wrap;
 }
 function collectFieldValues() {
