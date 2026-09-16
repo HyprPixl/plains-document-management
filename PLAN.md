@@ -43,14 +43,18 @@ Supersedes the Business-Unit-centric model in SPEC §6/§14. Decisions locked wi
       (`allowed_site`), drop BU taxonomy rows. (applied via MCP)
 - [x] Import: capture + store `sp_site_id/name`, `sp_drive_id`, `sp_path`, `sp_web_url` on every
       registered doc (both queued import and delegated sync). — code done (ef76b17)
-  - [ ] Backfill existing docs' SP-location from `source_ref` (drive_id/item_id) via Graph
-        (needs a delegated token; run on the job/databricks).
+  - [x] Backfill code: `sp.backfill_sp_locations` + `POST /api/admin/backfill-sp` (admin, uses
+        caller's delegated read token, resolves site/path from `source_ref`). (2ce161a)
+        — [ ] still needs to be *run* once against the existing corpus (admin must be connected).
 - [x] Permissions: `perms_where` on `sp_site_id`; `/api/me` returns `allowed_sites`. (ef76b17)
-  - [ ] Site-membership capture into `permissions.allowed_site` on connect/refresh (perms_where
-        depends on it; inert today since only caleb=ADMIN).
+  - [x] Site-membership capture: `sp.sync_user_sites` writes site-scoped `permissions` rows on
+        OAuth connect + `POST /api/sharepoint/resync-sites`; `_can_import` opened to any
+        authenticated user so the delegated model can bootstrap. (2ce161a)
 - [x] Explore: path in full-text search + path prefix filter; BU facet removed. (ef76b17)
 - [x] Tags: add/remove UI in drawer; "has tag" filter in Explore; BU picker dropped from
       classify + SharePoint import. (ef76b17)
+- [x] Review UX: side-by-side workspace — inline document viewer (left) + fields/verify/tags
+      (right), like plains-nexus. Replaces the right-hand drawer. (2ce161a)
 
 **Blocked on write scopes (upload → SharePoint):**
 - [ ] **External:** expand delegated scopes to `Files.ReadWrite.All` / `Sites.ReadWrite.All` →
