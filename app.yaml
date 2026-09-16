@@ -10,7 +10,7 @@ env:
   - name: SQL_WAREHOUSE_ID
     value: "4d7f25b1bd5fddf1"
   - name: EXTRACT_MODEL
-    value: "databricks-claude-sonnet-5"
+    value: "databricks-claude-sonnet-4-5"
   - name: PROMPT_VERSION
     value: "v1"
   # Processing job / SharePoint (used by the job, not the web app):

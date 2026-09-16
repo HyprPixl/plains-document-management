@@ -8,7 +8,9 @@ FQ = f"{CATALOG}.{SCHEMA}"  # fully-qualified schema prefix
 DOCS_VOLUME = os.getenv("DOCS_VOLUME", f"/Volumes/{CATALOG}/{SCHEMA}/docs")
 SQL_WAREHOUSE_ID = os.getenv("SQL_WAREHOUSE_ID", "4d7f25b1bd5fddf1")
 
-EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "databricks-claude-sonnet-5")
+# ai_query (batch inference) doesn't support the newest sonnet-5/opus-5 endpoints yet;
+# sonnet-4-5 is the current model that works with ai_query batch calls.
+EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "databricks-claude-sonnet-4-5")
 PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v1")
 
 # Processing job / external services (used by processing/*, not the web app)
