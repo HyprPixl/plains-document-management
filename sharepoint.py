@@ -239,10 +239,19 @@ def list_drives(token: str, site_id: str) -> list[dict]:
             for d in data.get("value", [])]
 
 
+def _item_path(it: dict) -> str:
+    """Human folder path (incl. filename) from a Graph item's parentReference, e.g.
+    '/General/2023/file.pdf'. Empty parent → '/name'."""
+    raw = ((it.get("parentReference") or {}).get("path") or "")
+    folder = raw.split("root:", 1)[1] if "root:" in raw else ""
+    return f"{folder}/{it['name']}"
+
+
 def list_children(token: str, drive_id: str, item_id: str | None) -> list[dict]:
     base = f"{GRAPH}/drives/{drive_id}/items/{item_id or 'root'}/children"
     out, url = [], base
-    params = {"$select": "id,name,size,folder,file,lastModifiedDateTime", "$top": 200}
+    params = {"$select": "id,name,size,folder,file,lastModifiedDateTime,webUrl,parentReference",
+              "$top": 200}
     while url:
         data = _graph(token, url, params)
         params = None  # nextLink already carries them
@@ -252,6 +261,7 @@ def list_children(token: str, drive_id: str, item_id: str | None) -> list[dict]:
                 "is_folder": "folder" in it, "child_count": (it.get("folder") or {}).get("childCount"),
                 "mime": (it.get("file") or {}).get("mimeType"),
                 "modified": it.get("lastModifiedDateTime"),
+                "path": _item_path(it), "web_url": it.get("webUrl"),
             })
         url = data.get("@odata.nextLink")
     out.sort(key=lambda x: (not x["is_folder"], x["name"].lower()))
@@ -282,18 +292,22 @@ def download(token: str, drive_id: str, item_id: str) -> bytes:
 # ─────────────────────────────────────────────────────────────────────── import ──
 
 def import_file(token: str, drive_id: str, item: dict, *, created_by: str, source_id: str,
-                business_unit=None, document_type=None, department=None) -> dict:
+                site_id=None, site_name=None, business_unit=None, document_type=None,
+                department=None) -> dict:
     data = download(token, drive_id, item["id"])
     return ingest.register_bytes(
         data, item["name"], item.get("mime"),
         source_id=source_id, source_ref=f"{drive_id}/{item['id']}", created_by=created_by,
         subdir=f"sharepoint/{source_id}", business_unit=business_unit,
         document_type=document_type, department=department, file_modified_at=item.get("modified"),
+        sp_site_id=site_id, sp_site_name=site_name, sp_drive_id=drive_id,
+        sp_path=item.get("path"), sp_web_url=item.get("web_url"),
     )
 
 
 def import_selection(email: str, drive_id: str, selections: list[dict], *, source_id: str,
-                     business_unit=None, document_type=None, department=None) -> dict:
+                     site_id=None, site_name=None, business_unit=None, document_type=None,
+                     department=None) -> dict:
     """Import a mix of files and folders (folders are walked). Returns a summary.
 
     Synchronous, in-process. Fine for a handful of files; for larger selections use
@@ -306,7 +320,8 @@ def import_selection(email: str, drive_id: str, selections: list[dict], *, sourc
         items = [sel] if not sel.get("is_folder") else walk_files(token, drive_id, sel["id"])
         for it in items:
             r = import_file(token, drive_id, it, created_by=email, source_id=source_id,
-                            business_unit=business_unit, document_type=document_type, department=department)
+                            site_id=site_id, site_name=site_name, business_unit=business_unit,
+                            document_type=document_type, department=department)
             if r["status"] == "new":
                 new += 1
             else:
@@ -317,6 +332,7 @@ def import_selection(email: str, drive_id: str, selections: list[dict], *, sourc
 # ─────────────────────────────────────────────────── queued import (off-app) ──
 
 def enqueue_import(email: str, drive_id: str, selections: list[dict], *, source_id: str,
+                   site_id=None, site_name=None, drive_name=None,
                    business_unit=None, document_type=None, department=None) -> str:
     """Record an import request for the processing job to fulfil, and return its id.
 
@@ -328,10 +344,12 @@ def enqueue_import(email: str, drive_id: str, selections: list[dict], *, source_
     req_id = "imp_" + uuid.uuid4().hex[:12]
     execute(
         f"INSERT INTO {config.IMPORT_JOBS} "
-        f"(id, user_email, drive_id, selections, source_id, business_unit, document_type, "
-        f" department, status, total_files, imported, duplicates, errors, created_at, updated_at) "
+        f"(id, user_email, drive_id, selections, source_id, site_id, site_name, drive_name, "
+        f" business_unit, document_type, department, status, total_files, imported, duplicates, "
+        f" errors, created_at, updated_at) "
         f"VALUES ({lit(req_id)}, {lit(email)}, {lit(drive_id)}, {lit(json.dumps(selections))}, "
-        f"{lit(source_id)}, {lit(business_unit)}, {lit(document_type)}, {lit(department)}, "
+        f"{lit(source_id)}, {lit(site_id)}, {lit(site_name)}, {lit(drive_name)}, "
+        f"{lit(business_unit)}, {lit(document_type)}, {lit(department)}, "
         f"'queued', NULL, 0, 0, 0, current_timestamp(), current_timestamp())"
     )
     return req_id
@@ -393,16 +411,16 @@ def arm_sync(email: str, sel: dict) -> dict:
     return {"id": sync_id, "source_id": source_id}
 
 
-def list_syncs(business_units: list[str] | None = None) -> list[dict]:
+def list_syncs(site_ids: list[str] | None = None) -> list[dict]:
     where = "1=1"
-    if business_units is not None:
-        if not business_units:
+    if site_ids is not None:
+        if not site_ids:
             where = "1=0"
         else:
-            vals = ",".join(lit(b) for b in business_units)
-            where = f"(business_unit IS NULL OR business_unit IN ({vals}))"
+            vals = ",".join(lit(s) for s in site_ids)
+            where = f"(site_id IS NULL OR site_id IN ({vals}))"
     return query(
-        f"SELECT id, source_id, site_name, drive_name, folder_name, business_unit, document_type, "
+        f"SELECT id, source_id, site_name, drive_name, folder_name, document_type, "
         f"user_email, token_status, last_error, unix_timestamp(last_synced_at) AS last_synced, "
         f"unix_timestamp(created_at) AS created FROM {config.SHAREPOINT_SYNCS} WHERE {where} "
         f"ORDER BY created_at DESC"

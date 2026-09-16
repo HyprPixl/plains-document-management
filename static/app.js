@@ -3,7 +3,7 @@
 
 const state = {
   me: null,
-  taxonomy: { business_unit: [], department: [], document_type: [] },
+  taxonomy: { department: [], document_type: [] },
   surface: "manage",
   queue: "unclassified",
   selected: new Set(),
@@ -42,7 +42,11 @@ function toast(msg, isErr = false) {
   t.textContent = msg; t.className = "toast" + (isErr ? " err" : ""); t.hidden = false;
   clearTimeout(toastT); toastT = setTimeout(() => (t.hidden = true), 3200);
 }
-const labelFor = (cat, val) => (state.taxonomy[cat].find((x) => x.value === val) || {}).label || val || "—";
+const labelFor = (cat, val) => ((state.taxonomy[cat] || []).find((x) => x.value === val) || {}).label || val || "—";
+const locationOf = (d) => {
+  const parts = [d.sp_site_name, d.sp_path].filter(Boolean);
+  return parts.length ? parts.join(" ") : "—";
+};
 
 // ─────────────────────────────────────────────── surfaces ──
 function setSurface(name) {
@@ -137,7 +141,7 @@ async function loadDocs() {
     tb.append(el("tr", { onclick: () => openDoc(d.doc_id) },
       el("td", { class: "col-check" }, cb),
       el("td", {}, el("span", { class: "doc-name" }, d.original_filename || "(unnamed)")),
-      el("td", {}, labelFor("business_unit", d.business_unit)),
+      el("td", {}, el("span", { class: "loc muted small", title: d.sp_path || "" }, locationOf(d))),
       el("td", {}, d.document_type || "—"),
       el("td", {}, extractionBadge(d.extraction_status)),
       el("td", {}, statusBadge(d.verification_status))));
@@ -199,21 +203,18 @@ async function uploadFiles(fileList) {
 function wireClassifyModal() {
   $("#classifyCancel").addEventListener("click", () => ($("#classifyScrim").hidden = true));
   $("#classifyApply").addEventListener("click", applyClassify);
-  $("#clBU").addEventListener("change", () => fillTypeSelect($("#clType"), $("#clBU").value));
 }
 function fillSelect(sel, cat, placeholder) {
   sel.replaceChildren(el("option", { value: "" }, placeholder));
-  state.taxonomy[cat].forEach((o) => sel.append(el("option", { value: o.value }, o.label)));
+  (state.taxonomy[cat] || []).forEach((o) => sel.append(el("option", { value: o.value }, o.label)));
 }
-function fillTypeSelect(sel, bu) {
+function fillTypeSelect(sel) {
   sel.replaceChildren(el("option", { value: "" }, "— select —"));
-  state.taxonomy.document_type
-    .filter((o) => !o.business_unit || o.business_unit === bu)
+  (state.taxonomy.document_type || [])
     .forEach((o) => sel.append(el("option", { value: o.value }, o.label)));
 }
 function openClassify() {
-  fillSelect($("#clBU"), "business_unit", "— select —");
-  fillTypeSelect($("#clType"), "");
+  fillTypeSelect($("#clType"));
   fillSelect($("#clDept"), "department", "— none —");
   $("#classifyCount").textContent = `${state.selected.size} document(s) selected`;
   $("#classifyScrim").hidden = false;
@@ -221,11 +222,10 @@ function openClassify() {
 async function applyClassify() {
   const body = {
     doc_ids: [...state.selected],
-    business_unit: $("#clBU").value || null,
     document_type: $("#clType").value || null,
     department: $("#clDept").value || null,
   };
-  if (!body.business_unit && !body.document_type) { toast("Pick at least a business unit or type", true); return; }
+  if (!body.document_type && !body.department) { toast("Pick at least a type or department", true); return; }
   try {
     await api("/api/documents/classify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     await api("/api/documents/enqueue", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ doc_ids: body.doc_ids }) });
@@ -254,12 +254,18 @@ function renderDrawer(data) {
   const d = data.document;
   $("#drawerTitle").textContent = d.original_filename || "Document";
   $("#drawerSub").textContent =
-    `${labelFor("business_unit", d.business_unit)} · ${d.document_type || "unclassified"}`;
+    `${locationOf(d)} · ${d.document_type || "unclassified"}`;
   const body = $("#drawerBody"); body.replaceChildren();
 
-  body.append(el("div", { class: "field-actions" },
+  const actions = el("div", { class: "field-actions" },
     el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}&inline=1`, target: "_blank" }, "View file"),
-    el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}` }, "Download")));
+    el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}` }, "Download"));
+  if (d.sp_web_url)
+    actions.append(el("a", { class: "btn", href: d.sp_web_url, target: "_blank" }, "Open in SharePoint"));
+  body.append(actions);
+
+  body.append(el("div", { class: "section-label" }, "Tags"));
+  body.append(renderTags(d.doc_id, data.tags || []));
 
   body.append(el("div", { class: "section-label" }, "Extracted fields"));
   if (d.extraction_status !== "done")
@@ -307,6 +313,35 @@ function renderDrawer(data) {
       ? el("button", { class: "btn", onclick: () => setVerify(false) }, "Un-verify")
       : el("button", { class: "btn ok", onclick: () => setVerify(true) }, "Save & verify"));
 }
+function renderTags(docId, tags) {
+  const wrap = el("div", { class: "tag-editor" });
+  const chips = el("div", { class: "tag-chips" });
+  const draw = () => {
+    chips.replaceChildren(...tags.map((t) =>
+      el("span", { class: "tag-chip" }, t,
+        el("button", { class: "tag-x", title: "Remove", onclick: async () => {
+          try {
+            await api(`/api/documents/${docId}/tags/${encodeURIComponent(t)}`, { method: "DELETE" });
+            tags = tags.filter((x) => x !== t); draw();
+          } catch (e) { toast("Failed: " + e.message, true); }
+        } }, "✕"))));
+    if (!tags.length) chips.append(el("span", { class: "muted small" }, "No tags yet."));
+  };
+  draw();
+  const input = el("input", { type: "text", placeholder: "Add a tag and press Enter",
+    onkeydown: async (e) => {
+      if (e.key !== "Enter") return;
+      const v = input.value.trim();
+      if (!v || tags.includes(v)) { input.value = ""; return; }
+      try {
+        await api(`/api/documents/${docId}/tags`, { method: "POST",
+          headers: { "content-type": "application/json" }, body: JSON.stringify({ tag: v }) });
+        tags.push(v); input.value = ""; draw();
+      } catch (e2) { toast("Failed: " + e2.message, true); }
+    } });
+  wrap.append(chips, input);
+  return wrap;
+}
 function collectFieldValues() {
   const values = {};
   $$("#drawerBody [data-key]").forEach((i) => (values[i.dataset.key] = i.value));
@@ -334,27 +369,36 @@ async function setVerify(on) {
 }
 
 // ─────────────────────────────────────────────── EXPLORE ──
-function loadExploreFilters() {
-  fillSelectKeep($("#filterBU"), "business_unit", "All business units");
+async function loadExploreFilters() {
   fillSelectKeep($("#filterType"), "document_type", "All types");
+  await loadTagFilter();
   if (!$("#searchResults").children.length) runSearch();
+}
+async function loadTagFilter() {
+  const sel = $("#filterTag"), cur = sel.value;
+  try {
+    const rows = await api("/api/tags");
+    sel.replaceChildren(el("option", { value: "" }, "All tags"));
+    (rows || []).forEach((r) => sel.append(el("option", { value: r.tag }, r.tag)));
+    sel.value = cur;
+  } catch { /* non-fatal */ }
 }
 function fillSelectKeep(sel, cat, placeholder) {
   const cur = sel.value;
   sel.replaceChildren(el("option", { value: "" }, placeholder));
-  state.taxonomy[cat].forEach((o) => sel.append(el("option", { value: o.value }, o.label)));
+  (state.taxonomy[cat] || []).forEach((o) => sel.append(el("option", { value: o.value }, o.label)));
   sel.value = cur;
 }
 function wireExplore() {
   $("#searchBtn").addEventListener("click", runSearch);
   $("#searchInput").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
-  $("#filterBU").addEventListener("change", runSearch);
+  $("#filterTag").addEventListener("change", runSearch);
   $("#filterType").addEventListener("change", runSearch);
 }
 async function runSearch() {
   const params = new URLSearchParams();
   if ($("#searchInput").value) params.set("q", $("#searchInput").value);
-  if ($("#filterBU").value) params.set("business_unit", $("#filterBU").value);
+  if ($("#filterTag").value) params.set("tag", $("#filterTag").value);
   if ($("#filterType").value) params.set("document_type", $("#filterType").value);
   const rows = await api("/api/search?" + params);
   const grid = $("#searchResults"); grid.replaceChildren();
@@ -363,8 +407,9 @@ async function runSearch() {
     grid.append(el("div", { class: "result-card", onclick: () => openDoc(d.doc_id) },
       el("div", { class: "rc-title" }, d.title || d.original_filename),
       el("div", { class: "rc-meta" },
-        el("span", { class: "badge blue" }, labelFor("business_unit", d.business_unit)),
-        el("span", { class: "badge gray" }, d.document_type || "—")),
+        el("span", { class: "badge gray" }, d.document_type || "—"),
+        d.sp_site_name ? el("span", { class: "badge blue" }, d.sp_site_name) : null),
+      d.sp_path ? el("div", { class: "rc-path muted small", title: d.sp_path }, d.sp_path) : null,
       el("div", { class: "rc-sum" }, d.summary || d.original_filename)));
   }
 }
@@ -385,7 +430,6 @@ function wireSharePoint() {
   $("#spCancel").addEventListener("click", closeSharePoint);
   $("#spConnectBtn").addEventListener("click", connectSharePoint);
   $("#spImport").addEventListener("click", doSharePointImport);
-  $("#spBU").addEventListener("change", () => fillTypeSelect($("#spType"), $("#spBU").value));
   let searchT;
   $("#spSearch").addEventListener("input", () => {
     clearTimeout(searchT);
@@ -418,8 +462,7 @@ async function loadSyncs(st) {
   panel.hidden = false;
   list.replaceChildren(...syncs.map((s) => {
     const dead = s.token_status === "needs_reauth";
-    const meta = [labelFor("business_unit", s.business_unit), s.document_type, s.user_email]
-      .filter(Boolean).join(" · ");
+    const meta = [s.document_type, s.user_email].filter(Boolean).join(" · ");
     const last = s.last_synced ? new Date(s.last_synced * 1000).toLocaleString() : "not yet";
     return el("div", { class: "sync-item" + (dead ? " dead" : "") },
       el("div", { class: "sync-main" },
@@ -454,8 +497,7 @@ function openSharePoint() {
   spState.selected.clear();
   spState.view = "sites"; spState.site = null; spState.drive = null; spState.path = [];
   $("#spScrim").hidden = false;
-  fillSelect($("#spBU"), "business_unit", "— none —");
-  fillTypeSelect($("#spType"), "");
+  fillTypeSelect($("#spType"));
   fillSelect($("#spDept"), "department", "— none —");
   $("#spAutoSync").checked = false;
   if (spState.status?.connected) showSpBrowser();
@@ -572,7 +614,7 @@ async function doSharePointImport() {
   if (autosync && folderSel.length !== 1) {
     toast("Auto-sync needs exactly one folder selected", true); return;
   }
-  const bu = $("#spBU").value || null, dt = $("#spType").value || null, dept = $("#spDept").value || null;
+  const dt = $("#spType").value || null, dept = $("#spDept").value || null;
   const btn = $("#spImport"); btn.disabled = true; btn.textContent = "Importing…";
   try {
     if (autosync) {
@@ -580,11 +622,12 @@ async function doSharePointImport() {
       await api("/api/sharepoint/syncs", { method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ site_id: spState.site.id, site_name: spState.site.name,
           drive_id: spState.drive.id, drive_name: spState.drive.name,
-          folder_id: f.id, folder_name: f.name, business_unit: bu, document_type: dt, department: dept }) });
+          folder_id: f.id, folder_name: f.name, document_type: dt, department: dept }) });
     }
     const res = await api("/api/sharepoint/import", { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ drive_id: spState.drive.id, selections, source_id: "sp_import",
-        business_unit: bu, document_type: dt, department: dept }) });
+        site_id: spState.site.id, site_name: spState.site.name, drive_name: spState.drive.name,
+        document_type: dt, department: dept }) });
     toast(`Import queued${autosync ? " · auto-sync on" : ""} — processing in the background…`);
     closeSharePoint();
     pollImportJob(res.request_id);

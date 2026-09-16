@@ -36,6 +36,11 @@ def register_bytes(
     document_type: str | None = None,
     department: str | None = None,
     file_modified_at: str | None = None,
+    sp_site_id: str | None = None,
+    sp_site_name: str | None = None,
+    sp_drive_id: str | None = None,
+    sp_path: str | None = None,
+    sp_web_url: str | None = None,
 ) -> dict:
     """Land bytes + register a document (idempotent by content hash).
 
@@ -64,11 +69,13 @@ def register_bytes(
         f"INSERT INTO {config.DOCUMENTS} "
         f"(doc_id, content_sha256, volume_path, original_filename, mime_type, size_bytes, "
         f" source_id, source_ref, batch_id, business_unit, document_type, department, "
+        f" sp_site_id, sp_site_name, sp_drive_id, sp_path, sp_web_url, "
         f" classification_status, extraction_status, verification_status, mirror_status, "
         f" attempt_count, file_modified_at, created_at, created_by, updated_at) "
         f"VALUES ({lit(doc_id)}, {lit(sha)}, {lit(vpath)}, {lit(filename)}, {lit(mime)}, {len(data)}, "
         f"{lit(source_id)}, {lit(source_ref)}, {lit(batch_id)}, {lit(business_unit)}, "
         f"{lit(document_type)}, {lit(department)}, "
+        f"{lit(sp_site_id)}, {lit(sp_site_name)}, {lit(sp_drive_id)}, {lit(sp_path)}, {lit(sp_web_url)}, "
         f"{lit('classified' if classified else 'unclassified')}, 'pending', 'needs_review', "
         f"'not_mirrored', 0, {lit(file_modified_at)}, current_timestamp(), {lit(created_by)}, "
         f"current_timestamp())"

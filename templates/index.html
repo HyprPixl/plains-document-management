@@ -70,7 +70,7 @@
             <thead>
               <tr>
                 <th class="col-check"><input type="checkbox" id="selectAll"></th>
-                <th>Document</th><th>Business unit</th><th>Type</th>
+                <th>Document</th><th>Location</th><th>Type</th>
                 <th>Extraction</th><th>Status</th>
               </tr>
             </thead>
@@ -88,9 +88,9 @@
         <p class="muted">Search verified documents by content, title, or category.</p>
       </div>
       <div class="search-bar">
-        <input type="search" id="searchInput" placeholder="Search documents…">
-        <select id="filterBU"><option value="">All business units</option></select>
+        <input type="search" id="searchInput" placeholder="Search content, title, or path…">
         <select id="filterType"><option value="">All types</option></select>
+        <select id="filterTag"><option value="">All tags</option></select>
         <button class="btn primary" id="searchBtn">Search</button>
       </div>
       <div id="searchResults" class="result-grid"></div>
@@ -116,9 +116,6 @@
     <div class="modal">
       <h2>Classify documents</h2>
       <p class="muted small" id="classifyCount"></p>
-      <label>Business unit
-        <select id="clBU"></select>
-      </label>
       <label>Document type
         <select id="clType"></select>
       </label>
@@ -158,7 +155,6 @@
         <details class="sp-target">
           <summary>Classify on import (optional)</summary>
           <div class="sp-target-grid">
-            <label>Business unit<select id="spBU"></select></label>
             <label>Document type<select id="spType"></select></label>
             <label>Department<select id="spDept"></select></label>
           </div>

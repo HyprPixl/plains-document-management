@@ -235,3 +235,15 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #cfe0f5; border-c
 .sync-name { font-weight: 600; font-size: 14px; }
 .sync-warn { color: var(--warn); font-size: 12px; margin-top: 4px; }
 .sync-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+/* ── tags + location (SharePoint-as-spine) ── */
+.tag-editor { display: flex; flex-direction: column; gap: 8px; }
+.tag-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.tag-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px;
+  background: #eef2f7; border-radius: 12px; font-size: 12px; }
+.tag-x { border: none; background: none; cursor: pointer; color: var(--muted);
+  font-size: 11px; line-height: 1; padding: 0; }
+.tag-x:hover { color: var(--warn); }
+.loc { display: inline-block; max-width: 260px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; vertical-align: bottom; }
+.rc-path { margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

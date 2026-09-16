@@ -32,9 +32,13 @@ def current_user() -> str:
 
 
 def get_perms(email: str):
-    """Return (is_admin, is_full, allowed_bus:list[str])."""
+    """Return (is_admin, is_full, allowed_sites:list[str]).
+
+    Access is scoped to the SharePoint *sites* a user can reach (site-level mirror). FULL /
+    ADMIN see everything; otherwise a user sees docs whose sp_site_id is in allowed_sites.
+    """
     rows = query(
-        f"SELECT access_type, allowed_business_unit FROM {config.PERMISSIONS} "
+        f"SELECT access_type, allowed_site FROM {config.PERMISSIONS} "
         f"WHERE lower(email) = {lit(email)}"
     )
     if not rows:
@@ -42,12 +46,12 @@ def get_perms(email: str):
     types = {(r["access_type"] or "").upper() for r in rows}
     is_admin = "ADMIN" in types
     is_full = is_admin or "FULL" in types
-    allowed = [r["allowed_business_unit"] for r in rows if r.get("allowed_business_unit")]
+    allowed = [r["allowed_site"] for r in rows if r.get("allowed_site")]
     return (is_admin, is_full, allowed)
 
 
-def perms_where(email: str, col: str = "business_unit") -> str:
-    """SQL predicate enforcing BU-scoped access. Returns '' for full access."""
+def perms_where(email: str, col: str = "sp_site_id") -> str:
+    """SQL predicate enforcing site-scoped access. Returns '' for full access."""
     is_admin, is_full, allowed = get_perms(email)
     if is_full:
         return ""
@@ -72,7 +76,7 @@ def index(_p=None):
 def api_me():
     email = current_user()
     is_admin, is_full, allowed = get_perms(email)
-    return jsonify(email=email, is_admin=is_admin, is_full=is_full, allowed_business_units=allowed)
+    return jsonify(email=email, is_admin=is_admin, is_full=is_full, allowed_sites=allowed)
 
 
 # ────────────────────────────────────────────────────────────────── taxonomy ──
@@ -83,7 +87,7 @@ def api_taxonomy():
         f"SELECT category, value, label, business_unit, sort_order FROM {config.TAXONOMY} "
         f"WHERE active = true ORDER BY category, sort_order"
     )
-    out = {"business_unit": [], "department": [], "document_type": []}
+    out = {"department": [], "document_type": []}
     for r in rows:
         out.setdefault(r["category"], []).append(
             {"value": r["value"], "label": r["label"], "business_unit": r.get("business_unit")}
@@ -140,7 +144,7 @@ def api_documents():
     if cstatus:
         where += f" AND classification_status = {lit(cstatus)}"
     rows = query(
-        f"SELECT doc_id, original_filename, business_unit, document_type, department, "
+        f"SELECT doc_id, original_filename, document_type, department, sp_site_name, sp_path, "
         f"classification_status, extraction_status, verification_status, mirror_status, "
         f"source_id, batch_id, created_at FROM {config.DOCUMENTS} WHERE {where} "
         f"ORDER BY created_at DESC LIMIT 500"
@@ -170,15 +174,12 @@ def api_classify():
     email = current_user()
     body = request.get_json(force=True)
     ids = body.get("doc_ids", [])
-    bu = body.get("business_unit")
     dt = body.get("document_type")
     dept = body.get("department")
     if not ids:
         return jsonify(error="no doc_ids"), 400
     id_list = ",".join(lit(i) for i in ids)
     sets = [f"classification_status = 'classified'", "updated_at = current_timestamp()"]
-    if bu is not None:
-        sets.append(f"business_unit = {lit(bu)}")
     if dt is not None:
         sets.append(f"document_type = {lit(dt)}")
     if dept is not None:
@@ -203,6 +204,44 @@ def api_enqueue():
     )
     _audit(email, "enqueue", f"{len(ids)} docs", None)
     return jsonify(enqueued=len(ids))
+
+
+# ───────────────────────────────────────────────────────────────────── tags ──
+
+@app.get("/api/tags")
+def api_tags():
+    """Distinct tags across the corpus (facet / autocomplete)."""
+    rows = query(
+        f"SELECT tag, count(*) AS n FROM {config.DOCUMENT_TAGS} "
+        f"GROUP BY tag ORDER BY n DESC, tag LIMIT 500"
+    )
+    return jsonify(rows)
+
+
+@app.post("/api/documents/<doc_id>/tags")
+def api_add_tag(doc_id):
+    email = current_user()
+    tag = (request.get_json(force=True).get("tag") or "").strip()
+    if not tag:
+        return jsonify(error="tag required"), 400
+    # Idempotent: only insert if the (doc, tag) pair isn't already present.
+    exists = query(
+        f"SELECT 1 FROM {config.DOCUMENT_TAGS} WHERE doc_id = {lit(doc_id)} AND tag = {lit(tag)} LIMIT 1")
+    if not exists:
+        execute(
+            f"INSERT INTO {config.DOCUMENT_TAGS} (doc_id, tag, created_by, created_at) "
+            f"VALUES ({lit(doc_id)}, {lit(tag)}, {lit(email)}, current_timestamp())")
+        _audit(email, "tag_add", doc_id, {"tag": tag})
+    return jsonify(ok=True, tag=tag)
+
+
+@app.delete("/api/documents/<doc_id>/tags/<path:tag>")
+def api_remove_tag(doc_id, tag):
+    email = current_user()
+    execute(
+        f"DELETE FROM {config.DOCUMENT_TAGS} WHERE doc_id = {lit(doc_id)} AND tag = {lit(tag)}")
+    _audit(email, "tag_remove", doc_id, {"tag": tag})
+    return jsonify(ok=True)
 
 
 @app.get("/api/documents/<doc_id>")
@@ -236,7 +275,9 @@ def api_document(doc_id):
         f"  CASE WHEN l.parent_doc_id = {lit(doc_id)} THEN l.child_doc_id ELSE l.parent_doc_id END "
         f"WHERE l.parent_doc_id = {lit(doc_id)} OR l.child_doc_id = {lit(doc_id)}"
     )
-    return jsonify(document=doc, fields=defs, links=links)
+    tags = [r["tag"] for r in query(
+        f"SELECT tag FROM {config.DOCUMENT_TAGS} WHERE doc_id = {lit(doc_id)} ORDER BY tag")]
+    return jsonify(document=doc, fields=defs, links=links, tags=tags)
 
 
 @app.post("/api/documents/<doc_id>/fields")
@@ -331,14 +372,18 @@ def api_link():
 def api_search():
     email = current_user()
     q = (request.args.get("q") or "").strip()
-    bu = request.args.get("business_unit")
     dt = request.args.get("document_type")
-    where = "verification_status = 'verified'" + perms_where(email)
-    if bu:
-        where += f" AND d.business_unit = {lit(bu)}"
+    dept = request.args.get("department")
+    path = request.args.get("path")  # prefix filter on the SharePoint path
+    tag = request.args.get("tag")
+    where = "verification_status = 'verified'" + perms_where(email, "d.sp_site_id")
     if dt:
         where += f" AND d.document_type = {lit(dt)}"
-    join_txt = ""
+    if dept:
+        where += f" AND d.department = {lit(dept)}"
+    if path:
+        where += f" AND lower(d.sp_path) LIKE {lit(path.lower() + '%')}"
+    join_txt = join_tag = ""
     if q:
         ql = lit(f"%{q.lower()}%")
         join_txt = (
@@ -347,18 +392,22 @@ def api_search():
         )
         where += (
             f" AND (lower(d.original_filename) LIKE {ql} "
+            f"OR lower(coalesce(d.sp_path, '')) LIKE {ql} "
             f"OR lower(coalesce(f_title.confirmed_value, f_title.proposed_value, '')) LIKE {ql} "
             f"OR lower(coalesce(f_sum.confirmed_value, f_sum.proposed_value, '')) LIKE {ql} "
             f"OR lower(coalesce(tx.body, '')) LIKE {ql})"
         )
+    if tag:
+        join_tag = f"JOIN {config.DOCUMENT_TAGS} tg ON tg.doc_id = d.doc_id AND tg.tag = {lit(tag)} "
     rows = query(
-        f"SELECT d.doc_id, d.original_filename, d.business_unit, d.document_type, d.department, "
+        f"SELECT d.doc_id, d.original_filename, d.document_type, d.department, "
+        f"d.sp_site_name, d.sp_path, d.sp_web_url, "
         f"coalesce(f_title.confirmed_value, f_title.proposed_value) AS title, "
         f"coalesce(f_sum.confirmed_value, f_sum.proposed_value) AS summary, d.created_at "
         f"FROM {config.DOCUMENTS} d "
         f"LEFT JOIN {config.DOCUMENT_FIELDS} f_title ON f_title.doc_id = d.doc_id AND f_title.field_key = 'title' "
         f"LEFT JOIN {config.DOCUMENT_FIELDS} f_sum ON f_sum.doc_id = d.doc_id AND f_sum.field_key = 'summary' "
-        f"{join_txt}"
+        f"{join_txt}{join_tag}"
         f"WHERE {where} ORDER BY d.created_at DESC LIMIT 200"
     )
     return jsonify(rows)
@@ -503,8 +552,8 @@ def sp_import():
     try:
         req_id = sp.enqueue_import(
             email, drive_id, selections, source_id=b.get("source_id", "sp_import"),
-            business_unit=b.get("business_unit"), document_type=b.get("document_type"),
-            department=b.get("department"))
+            site_id=b.get("site_id"), site_name=b.get("site_name"), drive_name=b.get("drive_name"),
+            document_type=b.get("document_type"), department=b.get("department"))
     except sp.SPReauth:
         return jsonify(error="reauth"), 401
     _trigger_processing_run()  # best-effort: don't make the user wait for the schedule
@@ -527,8 +576,8 @@ def sp_import_status(req_id):
 def sp_syncs_list():
     email = current_user()
     is_admin, is_full, allowed = get_perms(email)
-    bus = None if is_full else allowed
-    return jsonify(syncs=sp.list_syncs(bus))
+    sites = None if is_full else allowed
+    return jsonify(syncs=sp.list_syncs(sites))
 
 
 @app.post("/api/sharepoint/syncs")

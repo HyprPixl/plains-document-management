@@ -138,8 +138,9 @@ def sync_delegated() -> int:
             f"AND (claim_expires_at IS NULL OR claim_expires_at <= current_timestamp())"
         )
         rows = query(
-            f"SELECT id, source_id, drive_id, folder_id, business_unit, department, document_type, "
-            f"user_email, refresh_token_enc, unix_timestamp(last_synced_at) AS last_synced "
+            f"SELECT id, source_id, site_id, site_name, drive_id, folder_id, business_unit, "
+            f"department, document_type, user_email, refresh_token_enc, "
+            f"unix_timestamp(last_synced_at) AS last_synced "
             f"FROM {config.SHAREPOINT_SYNCS} WHERE id = {lit(sync_id)} AND claimed_by = {lit(WORKER_ID)}"
         )
         if not rows:
@@ -187,6 +188,8 @@ def _sync_one(s: dict, watermark: str | None) -> int:
             created_by=s.get("user_email") or "sync", subdir=f"sharepoint/{s['source_id']}",
             business_unit=s.get("business_unit"), document_type=s.get("document_type"),
             department=s.get("department"), file_modified_at=it.get("modified"),
+            sp_site_id=s.get("site_id"), sp_site_name=s.get("site_name"),
+            sp_drive_id=s["drive_id"], sp_path=it.get("path"), sp_web_url=it.get("web_url"),
         )
         if r["status"] == "new":
             n += 1
@@ -225,8 +228,8 @@ def process_imports() -> int:
             f"AND (claim_expires_at IS NULL OR claim_expires_at <= current_timestamp())"
         )
         rows = query(
-            f"SELECT id, user_email, drive_id, selections, source_id, business_unit, "
-            f"document_type, department FROM {config.IMPORT_JOBS} "
+            f"SELECT id, user_email, drive_id, selections, source_id, site_id, site_name, "
+            f"business_unit, document_type, department FROM {config.IMPORT_JOBS} "
             f"WHERE id = {lit(jid)} AND claimed_by = {lit(WORKER_ID)}"
         )
         if not rows:
@@ -280,6 +283,7 @@ def _run_import(j: dict) -> int:
         try:
             r = sp.import_file(
                 token, drive_id, it, created_by=email, source_id=j["source_id"],
+                site_id=j.get("site_id"), site_name=j.get("site_name"),
                 business_unit=j.get("business_unit"), document_type=j.get("document_type"),
                 department=j.get("department"))
             if r["status"] == "new":
