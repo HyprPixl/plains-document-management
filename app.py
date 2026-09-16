@@ -401,9 +401,12 @@ def api_verify(doc_id):
         f"WHERE fd.active = true AND fd.required_for_verify = true AND "
         f"(fd.applies_to = 'common' OR fd.applies_to = {lit(dtype)})"
     )
+    # A required field is satisfied by a human-confirmed value OR an unedited AI proposal —
+    # the reviewer sees the suggested value in the drawer and vouches for it by verifying.
     have = {r["field_key"]: r for r in query(
-        f"SELECT field_key, confirmed_value FROM {config.DOCUMENT_FIELDS} "
-        f"WHERE doc_id = {lit(doc_id)} AND confirmed_value IS NOT NULL AND confirmed_value <> ''")}
+        f"SELECT field_key FROM {config.DOCUMENT_FIELDS} "
+        f"WHERE doc_id = {lit(doc_id)} AND coalesce(confirmed_value, proposed_value) IS NOT NULL "
+        f"AND coalesce(confirmed_value, proposed_value) <> ''")}
     missing = [r["field_key"] for r in req if r["field_key"] not in have]
     if missing:
         return jsonify(error="missing_required", fields=missing), 400

@@ -398,6 +398,9 @@ function renderDrawer(data) {
       input = el("input", { type: f.data_type === "date" ? "date" : "text", "data-key": f.field_key });
       input.value = val;
     }
+    // Remember the value we rendered so we only save fields the user actually changed —
+    // otherwise a single edit would stamp every field 'human' and confirm all AI guesses.
+    if (input.hasAttribute("data-key")) input.dataset.orig = input.value;
     row.append(input);
     // Per-field AI note removed in favour of the section legend + tint; keep the human marker.
     if (!isAi && f.source_provenance === "human" && f.confirmed_value)
@@ -574,6 +577,7 @@ function listEditor(key, items) {
       items.push(v); input.value = ""; draw(); sync();
     } });
   draw(); sync();
+  hidden.dataset.orig = hidden.value;  // baseline for dirty-tracking (see collectFieldValues)
   wrap.append(hidden, chips, input);
   return wrap;
 }
@@ -625,9 +629,13 @@ function renderLinkAdder(docId, dtype, onLinked) {
   wrap.append(el("div", { class: "link-adder-row" }, rel, search), results);
   return wrap;
 }
+// Only the fields whose value changed from what we rendered — so saving one field doesn't
+// mark the rest as human-edited (verify accepts unedited AI proposals server-side).
 function collectFieldValues() {
   const values = {};
-  $$("#drawerBody [data-key]").forEach((i) => (values[i.dataset.key] = i.value));
+  $$("#drawerBody [data-key]").forEach((i) => {
+    if (i.value !== (i.dataset.orig ?? "")) values[i.dataset.key] = i.value;
+  });
   return values;
 }
 async function saveFields() {
