@@ -83,6 +83,25 @@ databricks jobs run-now 607689951574858
    is `verified` — copy its `confirmed_value`s so the dup lands already-verified. (Roadmap item R;
    confirm the ingest path actually takes this shortcut end-to-end.)
 
+## Tests (Phase 1 item DONE — commit fb3485a)
+
+`tests/` is a pytest suite, **91 tests, fully offline** (`pytest` from repo root; `pytest.ini` sets
+`pythonpath=.`). Dev deps in `requirements-dev.txt`; CI in `.github/workflows/tests.yml` runs on
+push/PR — **keep main green.** Tiers: pure-unit (`test_unit.py`, `test_db.py`), API with a mocked
+`db` (`test_api.py`), processing (`test_processing.py`). `tests/conftest.py` holds the shared
+fakes.
+
+- **The code is NOT import-safe offline.** Every module (`db`, `app`, `ingest`, `processing.job`)
+  constructs `WorkspaceClient()` at **import time**, which hard-fails / slow-probes without
+  Databricks creds. `conftest.py` stubs `WorkspaceClient` (and the Azure DI SDK, a job-only dep)
+  before import. If you add a module or a test file, follow that pattern. A worthwhile Phase 3
+  cleanup: make `_w` lazy so the code imports without creds.
+- To add API/processing tests, mock `db.query`/`db.execute` (see `FakeDB` in conftest) and assert on
+  the **emitted SQL** (column names, guards, provenance) — that's how the load-bearing rules
+  (only-changed-fields save, `coalesce` verify, `'false'` coercion) are pinned. Don't hit a real
+  warehouse.
+- Frontend JS (`asStringList`/`itemToStr`) is untested — no JS harness in the repo.
+
 ## Error handling / logging (Phase 1 item DONE — commit 71e65d5)
 
 Structured error logging is now in place, matching **contract-explorer**'s pattern (stdout
