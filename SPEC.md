@@ -488,6 +488,17 @@ Documents can be linked to each other (stored in `document_links`, §5.4):
     > came from. User chooses: skip duplicates (default) or link this upload as another
     > source reference to the same doc.
 - Dedup is on **content**, not filename — same bytes under a different name = duplicate.
+- **Reuse extracted (and verified) results for free.** Because OCR text, extracted fields,
+  and confirmed values are all keyed on `content_sha256`, a byte-identical document inherits
+  whatever the original already produced instead of re-paying for it:
+  - the original's **OCR/text layer** and **derived searchable PDF** (already cached, §10.2);
+  - the original's **AI-extracted field values** (`extraction_cache`, §10.3) — no model call;
+  - **best of all, if the original is `verified`**, the human-confirmed field values
+    (`document_fields.confirmed_value`) can be **copied onto the duplicate** so it lands
+    already-verified (or one click from it), with provenance recorded as a copy of the source
+    doc — turning a re-upload of a known-good document into a zero-cost, zero-effort add.
+  This is the §4A.3 idempotency guarantee paying off as a direct cost/time win, and it is why
+  §10.3's cache is keyed the way it is.
 - Reuse the `contracts-ver` **change-detection** idea for re-processing: an
   `extraction_sig` (md5 of the proposed field JSON) + `file_modified_at`. A verified doc
   stays verified only while both are unchanged; a changed source file or a schema/prompt

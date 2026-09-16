@@ -2,6 +2,11 @@
 
 Living checklist for building Document Hub. See `SPEC.md` for the design.
 
+> **Next phase is planned in [`ROADMAP.md`](./ROADMAP.md)** (prioritized 2026-09-16): Phase 1
+> observability/tests/benchmarks → Phase 2 Lakebase + scale + permissions → Phase 3 optimization +
+> Fable cleanup → Phase 4 Manage UX overhaul → Phase 5 Explore build-out. This file stays the
+> record of the *current/shipped* build; the roadmap owns what's next.
+
 ## ▶ Model revision — SharePoint as the spine (2026-09-16) — IN PROGRESS
 
 Supersedes the Business-Unit-centric model in SPEC §6/§14. Decisions locked with the user:

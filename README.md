@@ -16,7 +16,9 @@ metadata), mirrored to SharePoint on a fast cadence. See [`SPEC.md`](./SPEC.md).
 
 🟢 **Built, in deployment.** The app and processing job are implemented and locally
 smoke-tested end-to-end against the `product_dev.document_hub` warehouse. `SPEC.md` remains
-the design source of truth; [`PLAN.md`](./PLAN.md) tracks build status per component.
+the design source of truth; [`PLAN.md`](./PLAN.md) tracks build status per component; and
+[`ROADMAP.md`](./ROADMAP.md) is the **prioritized next-phase plan** (Lakebase, observability,
+tests, benchmarks, UX overhaul, Explore build-out).
 
 - **Web app** (Flask, this repo root) — both surfaces, upload + SHA-256 dedup, classify,
   verify, search, download; permission-gated by business unit. Deployed as a Databricks App.
