@@ -15,7 +15,6 @@
     <nav class="surface-switch" role="tablist">
       <button class="surface-tab" data-surface="manage" role="tab">Manage</button>
       <button class="surface-tab" data-surface="explore" role="tab">Explore</button>
-      <button class="surface-tab" data-surface="fields" role="tab" id="fieldsTab" hidden>Fields</button>
     </nav>
     <div class="user-chip" id="userChip">…</div>
   </header>
@@ -79,6 +78,18 @@
           <div class="empty" id="docEmpty" hidden>Nothing here yet.</div>
         </div>
       </div>
+
+      <!-- Extraction fields (admin only) -->
+      <div class="panel" id="fieldsPanel" hidden>
+        <div class="panel-head">
+          <div class="tab-group"><button class="qtab active" disabled>Extraction fields</button></div>
+          <button class="btn small" id="fieldAddBtn">Add field</button>
+        </div>
+        <div class="fields-body">
+          <p class="muted small">Define the fields extracted for each document type. Common fields apply to every document; a clear description with an example guides the AI extraction. Fields marked <strong>*</strong> must be filled before a document can be verified.</p>
+          <div id="fieldDefsList"></div>
+        </div>
+      </div>
     </section>
 
     <!-- ─────────────── EXPLORE ─────────────── -->
@@ -94,21 +105,6 @@
         <button class="btn primary" id="searchBtn">Search</button>
       </div>
       <div id="searchResults" class="result-grid"></div>
-    </section>
-
-    <!-- ─────────────── FIELDS (admin) ─────────────── -->
-    <section id="surface-fields" class="surface" hidden>
-      <div class="surface-head">
-        <h1>Extraction fields</h1>
-        <p class="muted">Define the fields extracted for each document type. A clear description with an example guides the AI extraction and tells reviewers what "good" looks like.</p>
-      </div>
-      <div class="panel" style="padding:16px;">
-        <div class="panel-head" style="border:0; padding:0 0 12px;">
-          <div class="muted small">Common fields apply to every document. Fields marked <strong>*</strong> must be filled before a document can be verified.</div>
-          <button class="btn primary" id="fieldAddBtn">Add field</button>
-        </div>
-        <div id="fieldDefsList"></div>
-      </div>
     </section>
   </main>
 

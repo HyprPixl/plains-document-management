@@ -45,7 +45,7 @@ function toast(msg, isErr = false) {
 const labelFor = (cat, val) => ((state.taxonomy[cat] || []).find((x) => x.value === val) || {}).label || val || "—";
 const locationOf = (d) => {
   const parts = [d.sp_site_name, d.sp_path].filter(Boolean);
-  return parts.length ? parts.join(" ") : "—";
+  return parts.length ? parts.join(" · ") : "—";
 };
 
 // ─────────────────────────────────────────────── surfaces ──
@@ -55,11 +55,9 @@ function setSurface(name) {
   $$(".surface-tab").forEach((b) => b.classList.toggle("active", b.dataset.surface === name));
   $("#surface-manage").hidden = name !== "manage";
   $("#surface-explore").hidden = name !== "explore";
-  $("#surface-fields").hidden = name !== "fields";
   const path = "/" + name;
   if (location.pathname !== path) history.replaceState({}, "", path);
   if (name === "manage") loadManage();
-  else if (name === "fields") loadFieldDefs();
   else loadExploreFilters();
 }
 
@@ -89,7 +87,8 @@ async function init() {
     const [me, tax] = await Promise.all([api("/api/me"), api("/api/taxonomy")]);
     state.me = me; state.taxonomy = tax;
     $("#userChip").textContent = me.email + (me.is_admin ? " · admin" : "");
-    $("#fieldsTab").hidden = !me.is_admin;  // Fields admin is for admins only
+    // The extraction-fields admin panel lives inside Manage; reveal it once identity is known.
+    if (me.is_admin && state.surface === "manage") { $("#fieldsPanel").hidden = false; loadFieldDefs(); }
     if (state.surface === "explore") loadExploreFilters();  // refill filters now taxonomy is in
   } catch (e) { toast("Load failed: " + e.message, true); }
 }
@@ -99,6 +98,7 @@ async function loadManage() {
   loadStats();
   loadDocs();
   refreshSharePoint();
+  if (state.me?.is_admin) { $("#fieldsPanel").hidden = false; loadFieldDefs(); }
 }
 function skeletonStatCards() {
   $("#statRow").replaceChildren(
@@ -118,7 +118,8 @@ async function loadStats() {
     ];
     $("#statRow").replaceChildren(
       ...cards.map(([l, n, q]) =>
-        el("div", { class: "stat-card", onclick: () => selectQueue(q) },
+        el("div", { class: "stat-card" + (state.queue === q ? " active" : ""),
+          onclick: () => selectQueue(q) },
           el("div", { class: "n" }, String(n)), el("div", { class: "l" }, l))
       )
     );
@@ -140,6 +141,9 @@ function selectQueue(q) {
   state.queue = q;
   state.selected.clear(); updateBulkBar();
   $$("#queueTabs .qtab").forEach((b) => b.classList.toggle("active", b.dataset.queue === q));
+  // keep the top stat cards' highlight in sync with the active queue
+  $$("#statRow .stat-card").forEach((c, i) =>
+    c.classList.toggle("active", ["unclassified", "needs_review", "verified"][i] === q));
   loadDocs();
 }
 function skeletonDocRows(n = 5) {
@@ -171,7 +175,7 @@ async function loadDocs() {
       el("td", { class: "col-check" }, cb),
       el("td", {}, el("span", { class: "doc-name" }, d.original_filename || "(unnamed)")),
       el("td", {}, el("span", { class: "loc muted small", title: locationOf(d) },
-        d.sp_path || d.sp_site_name || "—")),
+        locationOf(d))),
       el("td", {}, d.document_type || "—"),
       el("td", {}, stageBadge(d))));
   }

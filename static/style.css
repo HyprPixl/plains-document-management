@@ -63,6 +63,9 @@ main { max-width: 1160px; margin: 0 auto; padding: 28px 24px 80px; }
   flex: 1; min-width: 150px; background: var(--panel); border: 1px solid var(--line);
   border-radius: var(--radius); padding: 14px 16px; box-shadow: var(--shadow);
 }
+.stat-card { cursor: pointer; transition: .12s; }
+.stat-card:hover { border-color: #cfe0f5; }
+.stat-card.active { border-color: var(--brand); box-shadow: 0 0 0 1px var(--brand) inset, var(--shadow); }
 .stat-card .n { font-size: 26px; font-weight: 700; }
 .stat-card .l { color: var(--muted); font-size: 13px; }
 
@@ -278,6 +281,8 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #cfe0f5; border-c
 .ef-hint { margin-top: 3px; }
 
 /* ── Fields admin screen ── */
+.fields-body { padding: 12px 16px 16px; }
+.fields-body > p { margin-top: 0; }
 .fielddefs-group { margin-bottom: 22px; }
 .fielddefs-group h3 { font-size: 15px; margin: 0 0 4px; }
 .fielddef-row { display: flex; align-items: flex-start; gap: 12px; padding: 10px 12px;
