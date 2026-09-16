@@ -168,10 +168,18 @@ are in. Offline suite green (103 tests). What exists now:
   (`valueFrom: database`) + `LAKEBASE_HOST/DB/SCHEMA` + `USE_LAKEBASE_PERMISSIONS` (set `"false"` to
   roll back to the warehouse instantly).
 
-**Not yet done (next):** ⏳ **Measure vs `bench/BASELINE.md`** — needs a deploy (live warehouse +
-Lakebase + SSO), then click **"Run benchmark"** (`POST /api/admin/bench`) and compare the
-`documents`/`stats`/`search`/`document` p50/p95; the permission single-row lookup should drop from
-~1300 ms → single-digit ms. Then migrate `documents` + `document_fields` reads the same way.
+**Measured (2026-09-16, deployed + proven):** the permission read cutover is live. `/api/me`
+(≈ just `get_perms()`) went **~1,300 ms → 5 ms** warm (~260×); the warehouse `permissions`
+slow-query line is gone, no fallbacks. See `bench/BASELINE.md` → "Phase 2 result". Gotcha proven
+on deploy: **4 gunicorn workers bootstrap the PG table concurrently** — Postgres `CREATE … IF NOT
+EXISTS` isn't atomic across sessions, so `_bootstrap` swallows benign concurrent-DDL errors, the
+one-time dedup + UNIQUE index + backfill run under a `pg_advisory_lock`, and writes use
+`ON CONFLICT DO NOTHING`. Don't regress that.
+
+**Not yet done (next):** ⏳ migrate `documents` + `document_fields` (then `stats`/`search`) reads
+to Lakebase the same way — that's what moves the admin **"Run benchmark"** numbers (it times the
+warehouse queries; the permission win doesn't show there because its one lookup is `g`-cached
+outside the timed loops). Consider adding a cache-busting `permissions` op to that bench.
 
 ### Original brief (kept for context)
 

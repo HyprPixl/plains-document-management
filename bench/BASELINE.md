@@ -39,4 +39,21 @@ times over. A tiny single-row lookup taking >1 s is the tell.
   issued redundantly (2–3×/page) — cache it per-request/session. Batch the `document` endpoint's 4
   sequential queries. These help regardless of the data layer.
 - Target after Lakebase: hot endpoints p95 well under ~100 ms.
+
+## Phase 2 result — permissions slice (measured 2026-09-16, on deploy)
+
+The thin slice (permissions read cutover to Lakebase behind `USE_LAKEBASE_PERMISSIONS`, see
+`lakebase.py` + AGENTS.md "Phase 2") is deployed and proven. Measured from the app log on a
+**warm** load (cold-start right after deploy is ~12 s and not representative):
+
+- **`/api/me` (essentially just `get_perms()`): ~1,300 ms → 5 ms** — the single-row permission
+  lookup is now a Postgres round-trip, not a Statement-Execution call. **~260× on that path.**
+- The `SELECT access_type, allowed_site FROM …permissions` warehouse slow-query line is **gone**;
+  no `lakebase perms read failed` fallbacks.
+
+Not yet migrated (still warehouse, so unchanged): `documents` (~1.1 s warm), `stats`, `search`,
+`document`, `taxonomy`, `sp_sessions`. These are the next slice — migrating their reads the same
+way is what will move the admin "Run benchmark" numbers (that endpoint times these warehouse
+queries; the permission win doesn't show there because its one lookup is `g`-cached outside the
+timed loops).
 </content>
