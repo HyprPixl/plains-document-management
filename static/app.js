@@ -143,7 +143,7 @@ function skeletonDocRows(n = 5) {
   $("#docRows").replaceChildren(...Array.from({ length: n }, () =>
     el("tr", { class: "skel-row" },
       el("td", { class: "col-check" }, el("span", { class: "skel", style: "width:16px" }, "")),
-      cell("70%"), cell("55%"), cell("40%"), cell("60%"), cell("50%"))));
+      cell("70%"), cell("55%"), cell("40%"), cell("50%"))));
 }
 async function loadDocs() {
   const q = state.queue;
@@ -169,8 +169,7 @@ async function loadDocs() {
       el("td", {}, el("span", { class: "loc muted small", title: locationOf(d) },
         d.sp_path || d.sp_site_name || "—")),
       el("td", {}, d.document_type || "—"),
-      el("td", {}, extractionBadge(d.extraction_status)),
-      el("td", {}, statusBadge(d.verification_status))));
+      el("td", {}, stageBadge(d))));
   }
   $("#selectAll").checked = false;
 }
@@ -179,17 +178,18 @@ function updateBulkBar() {
   $("#bulkBar").hidden = n === 0;
   $("#bulkCount").textContent = `${n} selected`;
 }
-const statusBadge = (s) => {
-  const map = { verified: ["green", "Verified"], needs_review: ["amber", "Needs review"], failed: ["red", "Failed"] };
-  const [c, t] = map[s] || ["gray", s || "—"];
-  return el("span", { class: "badge " + c }, t);
-};
-const extractionBadge = (s) => {
-  const map = { done: ["green", "Extracted"], processing: ["blue", "Processing"],
-    pending: ["amber", "Queued"], failed: ["red", "Failed"] };
-  const [c, t] = map[s] || ["gray", s || "—"];
-  return el("span", { class: "badge " + c }, t);
-};
+// One badge tells the doc's whole stage: classify → extract → review → verified.
+function stageBadge(d) {
+  if (d.classification_status !== "classified")
+    return el("span", { class: "badge gray" }, "Awaiting classification");
+  if (d.verification_status === "verified")
+    return el("span", { class: "badge green" }, "Verified");
+  if (d.extraction_status === "pending" || d.extraction_status === "processing")
+    return el("span", { class: "badge amber" }, "Pending extraction");
+  if (d.extraction_status === "failed")
+    return el("span", { class: "badge red" }, "Extraction failed");
+  return el("span", { class: "badge blue" }, "Review");
+}
 
 // ─────────────────────────────────────────────── UPLOAD ──
 function wireUpload() {
@@ -220,8 +220,7 @@ async function uploadFiles(fileList) {
       el("td", {}, el("span", { class: "doc-name" }, f.name)),
       el("td", {}, el("span", { class: "muted small" }, "—")),
       el("td", {}, "—"),
-      el("td", {}, el("span", { class: "badge blue" }, "Uploading…")),
-      el("td", {}, el("span", { class: "badge gray" }, "—")))));
+      el("td", {}, el("span", { class: "badge blue" }, "Uploading…")))));
   }
   try {
     const res = await api("/api/upload", { method: "POST", body: fd });
@@ -331,6 +330,10 @@ function renderDrawer(data) {
     actions.append(el("a", { class: "btn", href: d.sp_web_url, target: "_blank" }, "Open in SharePoint"));
   body.append(actions);
 
+  // Unclassified docs get a classify-first panel (no extracted fields yet); once classified
+  // they leave this queue and enter review with the full field editor.
+  if (d.classification_status !== "classified") { renderClassify(body, data); return; }
+
   body.append(el("div", { class: "section-label" }, "Tags"));
   body.append(renderTags(d.doc_id, data.tags || []));
 
@@ -379,6 +382,39 @@ function renderDrawer(data) {
     d.verification_status === "verified"
       ? el("button", { class: "btn", onclick: () => setVerify(false) }, "Un-verify")
       : el("button", { class: "btn ok", onclick: () => setVerify(true) }, "Save & verify"));
+}
+// Right-hand panel for an unclassified doc: pick type/department, then classify + queue
+// extraction in one step. The viewer on the left lets the user read the doc while deciding.
+function renderClassify(body, data) {
+  const d = data.document;
+  body.append(el("div", { class: "section-label" }, "Classify this document"));
+  body.append(el("p", { class: "muted small" },
+    "Choose a type to queue extraction and move this into review."));
+
+  const typeSel = el("select", {}); fillTypeSelect(typeSel); typeSel.value = d.document_type || "";
+  const deptSel = el("select", {}); fillSelect(deptSel, "department", "— none —"); deptSel.value = d.department || "";
+  const typeRow = el("div", { class: "field-row" }, el("label", {}, "Document type"), typeSel);
+  const deptRow = el("div", { class: "field-row" }, el("label", {}, "Department"), deptSel);
+  body.append(typeRow, deptRow);
+
+  body.append(el("div", { class: "section-label" }, "Tags"));
+  body.append(renderTags(d.doc_id, data.tags || []));
+
+  $("#drawerFoot").replaceChildren(
+    el("button", { class: "btn primary",
+      onclick: () => classifyOne(d.doc_id, typeSel.value || null, deptSel.value || null) },
+      "Classify & queue extraction"));
+}
+async function classifyOne(id, dt, dept) {
+  if (!dt && !dept) { toast("Pick at least a type or department", true); return; }
+  try {
+    await api("/api/documents/classify", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ doc_ids: [id], document_type: dt, department: dept }) });
+    await api("/api/documents/enqueue", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ doc_ids: [id] }) });
+    toast("Classified and queued for extraction");
+    closeDrawer(); loadManage();
+  } catch (e) { toast("Failed: " + e.message, true); }
 }
 function renderTags(docId, tags) {
   const wrap = el("div", { class: "tag-editor" });

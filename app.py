@@ -140,7 +140,9 @@ def api_documents():
     cstatus = request.args.get("classification_status")
     where = "1=1" + perms_where(email)
     if status:
-        where += f" AND verification_status = {lit(status)}"
+        # A doc only enters the review pipeline once it's classified; unclassified docs stay
+        # in the classification queue even though they carry a default needs_review status.
+        where += f" AND verification_status = {lit(status)} AND classification_status = 'classified'"
     if cstatus:
         where += f" AND classification_status = {lit(cstatus)}"
     rows = query(
@@ -159,7 +161,7 @@ def api_stats():
     where = "1=1" + perms_where(email)
     rows = query(
         f"SELECT verification_status AS s, count(*) AS n FROM {config.DOCUMENTS} "
-        f"WHERE {where} GROUP BY verification_status"
+        f"WHERE {where} AND classification_status = 'classified' GROUP BY verification_status"
     )
     unclassified = query(
         f"SELECT count(*) AS n FROM {config.DOCUMENTS} "
