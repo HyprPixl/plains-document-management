@@ -32,6 +32,10 @@ SP_DELEG_SCOPES = os.getenv("SP_DELEG_SCOPES", "openid profile offline_access Fi
 APP_BASE_URL = os.getenv("APP_BASE_URL", "")
 SP_SYNC_INTERVAL = int(os.getenv("SP_SYNC_INTERVAL", "1800"))  # delegated sync cadence (sec)
 
+# Processing job id — the web app best-effort triggers a run when work is enqueued
+# (import queued) so it doesn't wait for the schedule. Empty = no auto-trigger.
+PROCESSING_JOB_ID = os.getenv("PROCESSING_JOB_ID", "")
+
 # Work-claim lease length (seconds) for the processing job
 CLAIM_LEASE_SECONDS = int(os.getenv("CLAIM_LEASE_SECONDS", "600"))
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "5"))
@@ -54,3 +58,4 @@ AUDIT_LOG = t("audit_log")
 SP_OAUTH_STATE = t("sp_oauth_state")
 SP_SESSIONS = t("sp_sessions")
 SHAREPOINT_SYNCS = t("sharepoint_syncs")
+IMPORT_JOBS = t("import_jobs")

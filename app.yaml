@@ -41,3 +41,7 @@ env:
   # Must match the redirect URI registered on the app: <APP_BASE_URL>/api/sharepoint/callback
   - name: APP_BASE_URL
     value: "https://plains-document-management-1979327425712808.8.azure.databricksapps.com"
+  # Processing job — app best-effort triggers a run when an import is queued (needs the app
+  # SP to have CAN_MANAGE_RUN on this job; harmless no-op otherwise).
+  - name: PROCESSING_JOB_ID
+    value: "607689951574858"

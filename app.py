@@ -501,14 +501,26 @@ def sp_import():
     if not drive_id or not selections:
         return jsonify(error="drive_id and selections required"), 400
     try:
-        summary = sp.import_selection(
+        req_id = sp.enqueue_import(
             email, drive_id, selections, source_id=b.get("source_id", "sp_import"),
             business_unit=b.get("business_unit"), document_type=b.get("document_type"),
             department=b.get("department"))
     except sp.SPReauth:
         return jsonify(error="reauth"), 401
-    _audit(email, "sp_import", drive_id, summary)
-    return jsonify(**summary)
+    _trigger_processing_run()  # best-effort: don't make the user wait for the schedule
+    _audit(email, "sp_import", drive_id, {"request_id": req_id, "selected": len(selections)})
+    return jsonify(request_id=req_id, queued=True)
+
+
+@app.get("/api/sharepoint/import/<req_id>")
+def sp_import_status(req_id):
+    email = current_user()
+    if not _can_import(email):
+        return jsonify(error="forbidden"), 403
+    st = sp.import_job_status(req_id)
+    if not st:
+        return jsonify(error="not_found"), 404
+    return jsonify(**st)
 
 
 @app.get("/api/sharepoint/syncs")
@@ -560,6 +572,20 @@ def sp_syncs_reconnect(sync_id):
 
 
 # ───────────────────────────────────────────────────────────────────── util ──
+
+def _trigger_processing_run():
+    """Best-effort: kick the processing job so queued work isn't stuck behind the schedule.
+
+    No-op if PROCESSING_JOB_ID is unset or the app SP lacks run permission — the scheduled
+    (or manual run-now) drain will still pick the work up. Never raises into the request.
+    """
+    if not config.PROCESSING_JOB_ID:
+        return
+    try:
+        _w.jobs.run_now(job_id=int(config.PROCESSING_JOB_ID))
+    except Exception as exc:
+        print(f"processing job trigger skipped: {exc}")
+
 
 def _audit(actor, action, target, detail):
     try:

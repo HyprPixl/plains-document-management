@@ -195,6 +195,112 @@ def _sync_one(s: dict, watermark: str | None) -> int:
     return n
 
 
+# ──────────────────────────────────────────── queued SharePoint imports ──
+
+IMPORT_LEASE_SECONDS = int(os.getenv("IMPORT_LEASE", "3600"))
+
+
+def process_imports() -> int:
+    """Fulfil user-queued SharePoint imports (see sharepoint.enqueue_import).
+
+    Each request is claimed with a lease so a killed worker's work is re-claimed after
+    expiry. Registration dedupes by SHA-256, so re-running a partially-done import is safe.
+    Returns the number of documents newly registered across all requests handled.
+    """
+    if not sp.encryption_available():
+        return 0
+    candidates = query(
+        f"SELECT id FROM {config.IMPORT_JOBS} WHERE status IN ('queued', 'processing') "
+        f"AND (claim_expires_at IS NULL OR claim_expires_at <= current_timestamp()) "
+        f"ORDER BY created_at LIMIT 5"
+    )
+    imported = 0
+    for c in candidates:
+        jid = c["id"]
+        # Guarded claim: only take it if still unclaimed/expired.
+        execute(
+            f"UPDATE {config.IMPORT_JOBS} SET claimed_by = {lit(WORKER_ID)}, status = 'processing', "
+            f"claim_expires_at = current_timestamp() + INTERVAL {IMPORT_LEASE_SECONDS} SECONDS, "
+            f"updated_at = current_timestamp() WHERE id = {lit(jid)} "
+            f"AND (claim_expires_at IS NULL OR claim_expires_at <= current_timestamp())"
+        )
+        rows = query(
+            f"SELECT id, user_email, drive_id, selections, source_id, business_unit, "
+            f"document_type, department FROM {config.IMPORT_JOBS} "
+            f"WHERE id = {lit(jid)} AND claimed_by = {lit(WORKER_ID)}"
+        )
+        if not rows:
+            continue
+        try:
+            imported += _run_import(rows[0])
+            execute(
+                f"UPDATE {config.IMPORT_JOBS} SET status = 'done', last_error = NULL, "
+                f"claimed_by = NULL, claim_expires_at = NULL, updated_at = current_timestamp() "
+                f"WHERE id = {lit(jid)}"
+            )
+        except sp.SPReauth as e:
+            execute(
+                f"UPDATE {config.IMPORT_JOBS} SET status = 'error', "
+                f"last_error = {lit(('reconnect required: ' + str(e))[:500])}, "
+                f"claimed_by = NULL, claim_expires_at = NULL, updated_at = current_timestamp() "
+                f"WHERE id = {lit(jid)}"
+            )
+            print(f"  ⚠ import {jid} needs reauth: {e}")
+        except Exception as exc:
+            execute(
+                f"UPDATE {config.IMPORT_JOBS} SET status = 'error', last_error = {lit(str(exc)[:500])}, "
+                f"claimed_by = NULL, claim_expires_at = NULL, updated_at = current_timestamp() "
+                f"WHERE id = {lit(jid)}"
+            )
+            print(f"  ✗ import {jid} error: {exc}")
+            traceback.print_exc()
+    _heartbeat("import", info=f"imported={imported}")
+    return imported
+
+
+def _run_import(j: dict) -> int:
+    """Expand the selection to files, download + register each, updating progress counters."""
+    email, drive_id = j["user_email"], j["drive_id"]
+    selections = json.loads(j["selections"] or "[]")
+    token = sp.access_token_for(email)
+
+    items: list[dict] = []
+    for sel in selections:
+        if sel.get("is_folder"):
+            items.extend(sp.walk_files(token, drive_id, sel["id"]))
+        else:
+            items.append(sel)
+    execute(
+        f"UPDATE {config.IMPORT_JOBS} SET total_files = {len(items)}, "
+        f"updated_at = current_timestamp() WHERE id = {lit(j['id'])}"
+    )
+
+    new = dup = errs = 0
+    for i, it in enumerate(items):
+        try:
+            r = sp.import_file(
+                token, drive_id, it, created_by=email, source_id=j["source_id"],
+                business_unit=j.get("business_unit"), document_type=j.get("document_type"),
+                department=j.get("department"))
+            if r["status"] == "new":
+                new += 1
+            else:
+                dup += 1
+        except Exception as exc:
+            errs += 1
+            print(f"    · import {j['id']} file {it.get('name')!r} failed: {exc}")
+        # Checkpoint every few files: publish progress + extend the lease + refresh token.
+        if (i + 1) % 5 == 0 or (i + 1) == len(items):
+            execute(
+                f"UPDATE {config.IMPORT_JOBS} SET imported = {new}, duplicates = {dup}, errors = {errs}, "
+                f"claim_expires_at = current_timestamp() + INTERVAL {IMPORT_LEASE_SECONDS} SECONDS, "
+                f"updated_at = current_timestamp() WHERE id = {lit(j['id'])}"
+            )
+            token = sp.access_token_for(email)  # re-fetch in case the access token expired
+    print(f"  ⇊ import {j['id']}: {new} new / {dup} dup / {errs} err of {len(items)}")
+    return new
+
+
 def _iso_from_epoch(epoch) -> str | None:
     if not epoch:
         return None
@@ -353,6 +459,15 @@ def run_once(do_sweep: bool = False, do_sync: bool = False) -> int:
         except Exception:
             print("Delegated sync failed (continuing to processing):")
             traceback.print_exc()
+    # Queued user imports run every pass (cheap when the queue is empty) so a late-arriving
+    # request during a drain still gets picked up rather than waiting for the next run.
+    try:
+        n = process_imports()
+        if n:
+            print(f"Imports registered {n} new document(s).")
+    except Exception:
+        print("Import processing failed (continuing to processing):")
+        traceback.print_exc()
     docs = claim_batch(BATCH)
     if docs:
         print(f"[{WORKER_ID}] claimed {len(docs)} doc(s)")

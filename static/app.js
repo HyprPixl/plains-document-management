@@ -585,12 +585,36 @@ async function doSharePointImport() {
     const res = await api("/api/sharepoint/import", { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ drive_id: spState.drive.id, selections, source_id: "sp_import",
         business_unit: bu, document_type: dt, department: dept }) });
-    toast(`Imported ${res.imported} new, ${res.duplicates} already stored${autosync ? " · auto-sync on" : ""}`);
-    closeSharePoint(); loadManage();
+    toast(`Import queued${autosync ? " · auto-sync on" : ""} — processing in the background…`);
+    closeSharePoint();
+    pollImportJob(res.request_id);
   } catch (e) {
     if (e.status === 401) handleSpErr(e);
     else toast("Import failed: " + e.message, true);
   } finally { btn.disabled = false; btn.textContent = "Import selected"; }
+}
+
+// Poll a queued import until it finishes; refresh the Manage queue as docs land.
+async function pollImportJob(reqId, tries = 0) {
+  if (!reqId) { loadManage(); return; }
+  try {
+    const st = await api(`/api/sharepoint/import/${reqId}`);
+    const done = st.imported || 0, dup = st.duplicates || 0, errs = st.errors || 0;
+    if (st.status === "done") {
+      toast(`Import complete: ${done} new, ${dup} already stored${errs ? `, ${errs} failed` : ""}`);
+      loadManage(); return;
+    }
+    if (st.status === "error") {
+      toast("Import failed: " + (st.last_error || "unknown error"), true);
+      loadManage(); return;
+    }
+    if (st.status === "processing" && st.total_files) {
+      toast(`Importing… ${done + dup + errs}/${st.total_files}`);
+      loadManage();
+    }
+  } catch (e) { /* transient; keep polling */ }
+  // Back off from 2s toward 10s; give up surfacing progress after ~10 min (work continues server-side).
+  if (tries < 120) setTimeout(() => pollImportJob(reqId, tries + 1), Math.min(2000 + tries * 500, 10000));
 }
 
 document.addEventListener("DOMContentLoaded", init);

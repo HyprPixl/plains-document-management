@@ -294,7 +294,12 @@ def import_file(token: str, drive_id: str, item: dict, *, created_by: str, sourc
 
 def import_selection(email: str, drive_id: str, selections: list[dict], *, source_id: str,
                      business_unit=None, document_type=None, department=None) -> dict:
-    """Import a mix of files and folders (folders are walked). Returns a summary."""
+    """Import a mix of files and folders (folders are walked). Returns a summary.
+
+    Synchronous, in-process. Fine for a handful of files; for larger selections use
+    enqueue_import (below) so the download+register work runs in the processing job and
+    doesn't hit the web request timeout.
+    """
     token = access_token_for(email)
     new = dup = 0
     for sel in selections:
@@ -307,6 +312,46 @@ def import_selection(email: str, drive_id: str, selections: list[dict], *, sourc
             else:
                 dup += 1
     return {"imported": new, "duplicates": dup}
+
+
+# ─────────────────────────────────────────────────── queued import (off-app) ──
+
+def enqueue_import(email: str, drive_id: str, selections: list[dict], *, source_id: str,
+                   business_unit=None, document_type=None, department=None) -> str:
+    """Record an import request for the processing job to fulfil, and return its id.
+
+    The web request returns immediately; the job claims the row with a lease, walks any
+    folders, downloads + registers each file (dedup by SHA-256, so re-runs are safe), and
+    updates progress counters. This keeps bulk imports off the 120s gunicorn request.
+    """
+    import json
+    req_id = "imp_" + uuid.uuid4().hex[:12]
+    execute(
+        f"INSERT INTO {config.IMPORT_JOBS} "
+        f"(id, user_email, drive_id, selections, source_id, business_unit, document_type, "
+        f" department, status, total_files, imported, duplicates, errors, created_at, updated_at) "
+        f"VALUES ({lit(req_id)}, {lit(email)}, {lit(drive_id)}, {lit(json.dumps(selections))}, "
+        f"{lit(source_id)}, {lit(business_unit)}, {lit(document_type)}, {lit(department)}, "
+        f"'queued', NULL, 0, 0, 0, current_timestamp(), current_timestamp())"
+    )
+    return req_id
+
+
+def import_job_status(req_id: str) -> dict | None:
+    rows = query(
+        f"SELECT id, status, total_files, imported, duplicates, errors, last_error "
+        f"FROM {config.IMPORT_JOBS} WHERE id = {lit(req_id)} LIMIT 1"
+    )
+    return rows[0] if rows else None
+
+
+def recent_import_jobs(email: str, limit: int = 10) -> list[dict]:
+    return query(
+        f"SELECT id, status, total_files, imported, duplicates, errors, last_error, "
+        f"unix_timestamp(created_at) AS created "
+        f"FROM {config.IMPORT_JOBS} WHERE lower(user_email) = {lit(email.lower())} "
+        f"ORDER BY created_at DESC LIMIT {int(limit)}"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────── auto-sync ──
