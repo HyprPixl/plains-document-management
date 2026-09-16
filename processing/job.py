@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import io
 import json
+import logging
 import os
 import socket
 import time
@@ -32,6 +33,17 @@ import ingest
 import sharepoint as sp
 from db import query, execute, lit
 from . import graph, ocr, extract
+
+# Structured logs to stdout so the Databricks Job log captures every processing failure
+# with context (doc_id, stage, traceback) — same format as the app side. We attach our own
+# handler (rather than basicConfig, which is a no-op once the SDK has configured root) so the
+# format is guaranteed regardless of import order.
+logger = logging.getLogger("doc_hub.processing")
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s"))
+logger.handlers = [_handler]
+logger.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
+logger.propagate = False  # our stdout handler is the only sink — avoid double lines
 
 _w = WorkspaceClient()
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
@@ -160,13 +172,13 @@ def sync_delegated() -> int:
                 f"last_error = {lit(str(e)[:500])}, claimed_by = NULL, claim_expires_at = NULL "
                 f"WHERE id = {lit(sync_id)}"
             )
-            print(f"  ⚠ sync {sync_id} needs reauth: {e}")
+            logger.warning("stage=sync sync_id=%s needs reauth: %s", sync_id, e)
         except Exception as exc:
             execute(
                 f"UPDATE {config.SHAREPOINT_SYNCS} SET last_error = {lit(str(exc)[:500])}, "
                 f"claimed_by = NULL, claim_expires_at = NULL WHERE id = {lit(sync_id)}"
             )
-            print(f"  ✗ sync {sync_id} error: {exc}")
+            logger.error("stage=sync sync_id=%s error: %s\n%s", sync_id, exc, traceback.format_exc())
     _heartbeat("sync", info=f"imported={imported}")
     return imported
 
@@ -258,15 +270,14 @@ def process_imports() -> int:
                 f"claimed_by = NULL, claim_expires_at = NULL, updated_at = current_timestamp() "
                 f"WHERE id = {lit(jid)}"
             )
-            print(f"  ⚠ import {jid} needs reauth: {e}")
+            logger.warning("stage=import job_id=%s needs reauth: %s", jid, e)
         except Exception as exc:
             execute(
                 f"UPDATE {config.IMPORT_JOBS} SET status = 'error', last_error = {lit(str(exc)[:500])}, "
                 f"claimed_by = NULL, claim_expires_at = NULL, updated_at = current_timestamp() "
                 f"WHERE id = {lit(jid)}"
             )
-            print(f"  ✗ import {jid} error: {exc}")
-            traceback.print_exc()
+            logger.error("stage=import job_id=%s error: %s\n%s", jid, exc, traceback.format_exc())
     _heartbeat("import", info=f"imported={imported}")
     return imported
 
@@ -302,7 +313,8 @@ def _run_import(j: dict) -> int:
                 dup += 1
         except Exception as exc:
             errs += 1
-            print(f"    · import {j['id']} file {it.get('name')!r} failed: {exc}")
+            logger.error("stage=import job_id=%s file=%r failed: %s\n%s",
+                         j["id"], it.get("name"), exc, traceback.format_exc())
         # Checkpoint every few files: publish progress + extend the lease + refresh token.
         if (i + 1) % 5 == 0 or (i + 1) == len(items):
             execute(
@@ -423,14 +435,14 @@ def _commit_failure(doc, exc) -> None:
     doc_id = doc["doc_id"]
     attempts = (doc.get("attempt_count") or 0) + 1
     msg = f"{type(exc).__name__}: {exc}"[:1000]
-    traceback.print_exc()
     if attempts >= config.MAX_ATTEMPTS:
         execute(
             f"UPDATE {config.DOCUMENTS} SET extraction_status = 'failed', attempt_count = {attempts}, "
             f"error_message = {lit(msg)}, claimed_by = NULL, claim_expires_at = NULL, "
             f"updated_at = current_timestamp() WHERE doc_id = {lit(doc_id)}"
         )
-        print(f"  ✗ {doc_id} FAILED permanently after {attempts} attempts: {msg}")
+        logger.error("doc_id=%s stage=process_doc FAILED permanently after %d attempts: %s\n%s",
+                     doc_id, attempts, msg, traceback.format_exc())
     else:
         backoff = BACKOFF_BASE * (2 ** (attempts - 1))
         execute(
@@ -439,7 +451,8 @@ def _commit_failure(doc, exc) -> None:
             f"next_attempt_at = current_timestamp() + INTERVAL {backoff} SECONDS, "
             f"updated_at = current_timestamp() WHERE doc_id = {lit(doc_id)}"
         )
-        print(f"  ↺ {doc_id} retry {attempts}/{config.MAX_ATTEMPTS} in {backoff}s: {msg}")
+        logger.warning("doc_id=%s stage=process_doc retry %d/%d in %ds: %s\n%s",
+                       doc_id, attempts, config.MAX_ATTEMPTS, backoff, msg, traceback.format_exc())
 
 
 # ─────────────────────────────────────────────────────────── heartbeat ──
@@ -462,26 +475,26 @@ def run_once(do_sweep: bool = False, do_sync: bool = False) -> int:
             n = sweep_sharepoint()
             if n:
                 print(f"Sweep registered {n} new document(s).")
-        except Exception:
-            print("Sweep failed (continuing to processing):")
-            traceback.print_exc()
+        except Exception as exc:
+            logger.error("stage=sweep failed (continuing to processing): %s\n%s",
+                         exc, traceback.format_exc())
     if do_sync:
         try:
             n = sync_delegated()
             if n:
                 print(f"Delegated sync registered {n} new document(s).")
-        except Exception:
-            print("Delegated sync failed (continuing to processing):")
-            traceback.print_exc()
+        except Exception as exc:
+            logger.error("stage=sync failed (continuing to processing): %s\n%s",
+                         exc, traceback.format_exc())
     # Queued user imports run every pass (cheap when the queue is empty) so a late-arriving
     # request during a drain still gets picked up rather than waiting for the next run.
     try:
         n = process_imports()
         if n:
             print(f"Imports registered {n} new document(s).")
-    except Exception:
-        print("Import processing failed (continuing to processing):")
-        traceback.print_exc()
+    except Exception as exc:
+        logger.error("stage=import failed (continuing to processing): %s\n%s",
+                     exc, traceback.format_exc())
     docs = claim_batch(BATCH)
     if docs:
         print(f"[{WORKER_ID}] claimed {len(docs)} doc(s)")

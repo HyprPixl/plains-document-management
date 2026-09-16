@@ -9,6 +9,9 @@ env:
     value: "/Volumes/product_dev/document_hub/docs"
   - name: SQL_WAREHOUSE_ID
     value: "4d7f25b1bd5fddf1"
+  # Structured logs go to stdout (captured by the Databricks App log). Raise to DEBUG to trace.
+  - name: LOG_LEVEL
+    value: "INFO"
   - name: EXTRACT_MODEL
     value: "databricks-claude-sonnet-4-5"
   - name: PROMPT_VERSION

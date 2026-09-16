@@ -7,11 +7,14 @@ processing/ — this web app only enqueues work and reads results from Delta.
 import hashlib
 import io
 import json
+import logging
 import os
 import re
+import traceback
 import uuid
 
-from flask import Flask, Response, jsonify, request, send_file, render_template
+from flask import Flask, Response, g, jsonify, request, send_file, render_template
+from werkzeug.exceptions import HTTPException
 from databricks.sdk import WorkspaceClient
 
 import config
@@ -21,6 +24,61 @@ from db import query, execute, lit
 
 app = Flask(__name__)
 _w = WorkspaceClient()
+
+# ─────────────────────────────────────────────────────────────── logging ──
+# Structured logs to stdout so the Databricks App log captures every error on the
+# request path (pattern from contract-explorer). Each line carries a request id, the
+# route/method, and the forwarded user so a failure can be traced end-to-end.
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s"))
+app.logger.handlers = [_handler]
+app.logger.setLevel(getattr(logging, config.LOG_LEVEL, logging.INFO))
+app.logger.propagate = False  # our stdout handler is the only sink — avoid double lines
+
+
+def _req_ctx() -> str:
+    """Compact request context tag shared by every log line on the request path."""
+    return (f"request_id={getattr(g, 'request_id', '-')} "
+            f"method={request.method} route={request.path} "
+            f"user={getattr(g, 'user_email', '-') or '-'}")
+
+
+@app.before_request
+def _assign_request_id():
+    g.request_id = "r_" + uuid.uuid4().hex[:12]
+    # Best-effort user identity for logs; never let header parsing break the request.
+    try:
+        g.user_email = current_user()
+    except Exception:
+        g.user_email = None
+
+
+@app.after_request
+def _log_response(resp):
+    # Log every 4xx/5xx (not just 500s) so client errors are visible too. 5xx paths that
+    # raised are already logged by the error handler; this catches handler-returned codes.
+    if resp.status_code >= 400:
+        level = logging.ERROR if resp.status_code >= 500 else logging.WARNING
+        app.logger.log(level, f"{resp.status_code} response — {_req_ctx()}")
+    return resp
+
+
+@app.errorhandler(HTTPException)
+def _handle_http_exc(exc: HTTPException):
+    # Explicit aborts / 404s etc. — log at warning, preserve the intended status code and
+    # a friendly JSON body (no stack trace to the business-facing UI).
+    app.logger.warning(f"{exc.code} {exc.name} — {_req_ctx()}")
+    return jsonify(error=exc.name.lower().replace(" ", "_"), detail=exc.description), exc.code
+
+
+@app.errorhandler(Exception)
+def _handle_unhandled_exc(exc: Exception):
+    # Every unhandled exception on the request path: full traceback + context to the log,
+    # a generic message to the browser (SPEC §16 — don't leak internals to business users).
+    app.logger.error(f"unhandled exception — {_req_ctx()}\n{traceback.format_exc()}")
+    return jsonify(error="internal_error",
+                   detail="Something went wrong. The error has been logged.",
+                   request_id=getattr(g, "request_id", None)), 500
 
 # ─────────────────────────────────────────────────────────── auth / permissions ──
 
