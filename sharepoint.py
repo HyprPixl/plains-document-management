@@ -289,6 +289,82 @@ def download(token: str, drive_id: str, item_id: str) -> bytes:
     return r.content
 
 
+# ─────────────────────────────────────── site-membership → permissions mirror ──
+
+def sync_user_sites(email: str, token: str | None = None) -> int:
+    """Mirror a user's delegated SharePoint site visibility into the permissions table.
+
+    A user's own delegated browse reveals exactly the sites they can reach, so we turn each
+    into a site-scoped permission row — app access equals SharePoint access by construction.
+    Refreshes the auto-captured rows on every connect; leaves any ADMIN/FULL grant untouched.
+    Returns the number of sites captured.
+    """
+    if token is None:
+        token = access_token_for(email)
+    site_ids = sorted({s["id"] for s in list_sites(token, "") if s.get("id")})
+    execute(
+        f"DELETE FROM {config.PERMISSIONS} "
+        f"WHERE lower(email) = {lit(email.lower())} AND upper(access_type) = 'SITE'"
+    )
+    if site_ids:
+        vals = ",".join(
+            f"({lit(email.lower())}, 'SITE', {lit(sid)}, current_timestamp())" for sid in site_ids)
+        execute(
+            f"INSERT INTO {config.PERMISSIONS} (email, access_type, allowed_site, updated_at) "
+            f"VALUES {vals}"
+        )
+    return len(site_ids)
+
+
+# ────────────────────────────────────────── backfill SP location on old docs ──
+
+def _get_item(token: str, drive_id: str, item_id: str) -> dict:
+    return _graph(token, f"{GRAPH}/drives/{drive_id}/items/{item_id}",
+                  {"$select": "id,name,webUrl,parentReference"})
+
+
+def _site_display_name(token: str, site_id: str, cache: dict) -> str | None:
+    if site_id not in cache:
+        try:
+            d = _graph(token, f"{GRAPH}/sites/{site_id}", {"$select": "displayName,name"})
+            cache[site_id] = d.get("displayName") or d.get("name")
+        except Exception:
+            cache[site_id] = None
+    return cache[site_id]
+
+
+def backfill_sp_locations(email: str, limit: int = 500) -> dict:
+    """Resolve site/path for already-imported docs missing SP-location columns.
+
+    Uses the caller's delegated token (read scopes only) to look each item up by its stored
+    source_ref (`drive_id/item_id`) and fill sp_site_id/name, sp_drive_id, sp_path, sp_web_url.
+    Idempotent + resumable: only touches rows where sp_site_id IS NULL.
+    """
+    token = access_token_for(email)
+    rows = query(
+        f"SELECT doc_id, source_ref FROM {config.DOCUMENTS} "
+        f"WHERE sp_site_id IS NULL AND source_ref LIKE '%/%' LIMIT {int(limit)}"
+    )
+    names: dict = {}
+    done = err = 0
+    for r in rows:
+        try:
+            drive_id, item_id = r["source_ref"].split("/", 1)
+            it = _get_item(token, drive_id, item_id)
+            pr = it.get("parentReference") or {}
+            site_id = pr.get("siteId")
+            execute(
+                f"UPDATE {config.DOCUMENTS} SET sp_site_id = {lit(site_id)}, "
+                f"sp_site_name = {lit(_site_display_name(token, site_id, names) if site_id else None)}, "
+                f"sp_drive_id = {lit(drive_id)}, sp_path = {lit(_item_path(it))}, "
+                f"sp_web_url = {lit(it.get('webUrl'))} WHERE doc_id = {lit(r['doc_id'])}"
+            )
+            done += 1
+        except Exception:
+            err += 1
+    return {"scanned": len(rows), "updated": done, "errors": err}
+
+
 # ─────────────────────────────────────────────────────────────────────── import ──
 
 def import_file(token: str, drive_id: str, item: dict, *, created_by: str, source_id: str,

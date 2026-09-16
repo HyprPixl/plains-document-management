@@ -97,19 +97,33 @@
     </section>
   </main>
 
-  <!-- ─────────── Detail drawer (verify + fields) ─────────── -->
-  <div class="drawer-scrim" id="drawerScrim" hidden></div>
-  <aside class="drawer" id="drawer" hidden>
-    <div class="drawer-head">
-      <div>
+  <!-- ─────────── Review workspace (viewer left · fields right) ─────────── -->
+  <div class="review-scrim" id="drawerScrim" hidden></div>
+  <section class="review" id="drawer" hidden>
+    <div class="review-head">
+      <div class="review-head-main">
         <div class="drawer-title" id="drawerTitle">Document</div>
         <div class="muted small" id="drawerSub"></div>
       </div>
-      <button class="icon-btn" id="drawerClose">✕</button>
+      <button class="icon-btn" id="drawerClose" title="Close">✕</button>
     </div>
-    <div class="drawer-body" id="drawerBody"></div>
-    <div class="drawer-foot" id="drawerFoot"></div>
-  </aside>
+    <div class="review-split">
+      <div class="review-doc" id="reviewDoc">
+        <iframe id="reviewFrame" title="Document preview" src="about:blank"></iframe>
+        <div class="review-noprev" id="reviewNoPrev" hidden>
+          <div>
+            <div class="review-noprev-ic">📄</div>
+            <p>No inline preview for this file type.</p>
+            <p class="muted small">Use <strong>View file</strong> or <strong>Download</strong> on the right.</p>
+          </div>
+        </div>
+      </div>
+      <div class="review-side">
+        <div class="drawer-body" id="drawerBody"></div>
+        <div class="drawer-foot" id="drawerFoot"></div>
+      </div>
+    </div>
+  </section>
 
   <!-- ─────────── Classify modal ─────────── -->
   <div class="modal-scrim" id="classifyScrim" hidden>

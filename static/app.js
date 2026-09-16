@@ -241,14 +241,32 @@ function wireDrawer() {
   $("#drawerClose").addEventListener("click", closeDrawer);
   $("#drawerScrim").addEventListener("click", closeDrawer);
 }
-function closeDrawer() { $("#drawer").hidden = true; $("#drawerScrim").hidden = true; state.currentDoc = null; }
+function closeDrawer() {
+  $("#drawer").hidden = true; $("#drawerScrim").hidden = true;
+  $("#reviewFrame").src = "about:blank";  // stop loading / free the viewer
+  state.currentDoc = null;
+}
 async function openDoc(docId) {
   try {
     const data = await api("/api/documents/" + docId);
     state.currentDoc = data;
     renderDrawer(data);
+    loadPreview(data.document);
     $("#drawer").hidden = false; $("#drawerScrim").hidden = false;
   } catch (e) { toast("Could not open: " + e.message, true); }
+}
+// Load the file into the left-hand viewer. PDFs (incl. the derived searchable PDF) and
+// images render inline; anything else falls back to the View/Download actions.
+function loadPreview(d) {
+  const frame = $("#reviewFrame"), noprev = $("#reviewNoPrev");
+  const mime = (d.mime_type || "").toLowerCase();
+  const embeddable = !!d.derived_pdf_path || mime === "application/pdf" || mime.startsWith("image/");
+  if (embeddable) {
+    frame.hidden = false; noprev.hidden = true;
+    frame.src = `/api/download?doc_id=${d.doc_id}&inline=1&_t=${Date.now()}`;
+  } else {
+    frame.hidden = true; noprev.hidden = false; frame.src = "about:blank";
+  }
 }
 function renderDrawer(data) {
   const d = data.document;

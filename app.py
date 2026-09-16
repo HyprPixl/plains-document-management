@@ -439,9 +439,9 @@ def api_download():
 # ──────────────────────────────────────────────── SharePoint (delegated OAuth) ──
 
 def _can_import(email: str) -> bool:
-    """Anyone with full access or a BU grant may import/browse SharePoint."""
-    is_admin, is_full, allowed = get_perms(email)
-    return is_full or bool(allowed)
+    """Any authenticated user may connect and browse their *own* SharePoint — delegated
+    access naturally scopes what they see, and connecting is how we learn their sites."""
+    return bool(email)
 
 
 @app.get("/api/sharepoint/status")
@@ -479,6 +479,10 @@ def sp_callback():
     try:
         tok = sp.exchange_code(code, st["redirect_uri"])
         sp.store_session(st["email"], tok, display_name=st["email"])
+        try:
+            sp.sync_user_sites(st["email"], tok.get("access_token"))  # mirror SP sites → perms
+        except Exception:
+            pass  # best-effort; the user is connected regardless
     except sp.SPReauth as e:
         return _sp_close_page(f"Could not complete sign-in: {e}")
     return _sp_close_page(None, return_to=st.get("return_to") or "/manage")
@@ -570,6 +574,30 @@ def sp_import_status(req_id):
     if not st:
         return jsonify(error="not_found"), 404
     return jsonify(**st)
+
+
+@app.post("/api/sharepoint/resync-sites")
+def sp_resync_sites():
+    """Re-mirror the caller's SharePoint site visibility into permissions (idempotent)."""
+    email = current_user()
+    try:
+        n = sp.sync_user_sites(email)
+        return jsonify(sites=n)
+    except sp.SPReauth:
+        return jsonify(error="reauth"), 401
+
+
+@app.post("/api/admin/backfill-sp")
+def sp_backfill():
+    """Admin: fill SP-location columns on legacy docs using the admin's delegated token."""
+    email = current_user()
+    is_admin, _, _ = get_perms(email)
+    if not is_admin:
+        return jsonify(error="forbidden"), 403
+    try:
+        return jsonify(sp.backfill_sp_locations(email, int(request.args.get("limit", 500))))
+    except sp.SPReauth:
+        return jsonify(error="reauth"), 401
 
 
 @app.get("/api/sharepoint/syncs")
