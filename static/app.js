@@ -345,7 +345,13 @@ function renderDrawer(data) {
   body.append(el("div", { class: "section-label" }, "Tags"));
   body.append(renderTags(d.doc_id, data.tags || []));
 
+  const hasAi = data.fields.some((f) => f.proposed_value && !f.confirmed_value);
   body.append(el("div", { class: "section-label" }, "Extracted fields"));
+  // One legend for the whole section rather than a note under every field: AI-suggested
+  // values are tinted; confirmed/edited ones use the normal field styling.
+  if (hasAi)
+    body.append(el("div", { class: "ai-legend small" },
+      el("span", { class: "ai-dot" }), "Tinted fields are AI-suggested — review and confirm."));
   if (d.extraction_status !== "done")
     body.append(el("div", { class: "muted small" },
       d.extraction_status === "failed" ? "Extraction failed — you can still enter fields manually."
@@ -353,7 +359,10 @@ function renderDrawer(data) {
 
   for (const f of data.fields) {
     const val = f.confirmed_value ?? f.proposed_value ?? "";
-    const row = el("div", { class: "field-row" + (f.required_for_verify ? " req" : "") });
+    const isAi = !!(f.proposed_value && !f.confirmed_value);
+    const missing = f.required_for_verify && val === "";
+    const row = el("div", { class: "field-row" + (f.required_for_verify ? " req" : "") +
+      (isAi ? " ai" : "") + (missing ? " missing" : "") });
     row.append(el("label", {}, f.label));
     // Multi-value fields (topics, parties) come back as JSON arrays — render them as an
     // editable chip list rather than dumping raw JSON into a text box. Also normalise the
@@ -374,22 +383,35 @@ function renderDrawer(data) {
       input.value = val;
     }
     row.append(input);
-    if (f.proposed_value && !f.confirmed_value)
-      row.append(el("div", { class: "prov" }, "AI-suggested — review and confirm"));
-    else if (f.source_provenance === "human")
+    // Per-field AI note removed in favour of the section legend + tint; keep the human marker.
+    if (!isAi && f.source_provenance === "human" && f.confirmed_value)
       row.append(el("div", { class: "prov" }, "Edited by a person"));
     body.append(row);
   }
 
   body.append(el("div", { class: "section-label" }, "Related documents"));
   const links = el("div", { class: "links-list" });
-  if (!data.links.length) links.append(el("div", { class: "muted small" }, "No linked documents."));
-  data.links.forEach((l) => links.append(el("div", { class: "link-item" },
-    `${l.relationship}: ${l.original_filename} (${l.document_type || "—"})`)));
+  const RELS = { amendment_of: "Amendment of", attachment_of: "Attachment of",
+    supersedes: "Supersedes", related: "Related to" };
+  const relLabel = (r) => RELS[r] || r;
+  const drawLinks = () => {
+    links.replaceChildren();
+    if (!data.links.length) { links.append(el("div", { class: "muted small" }, "No linked documents.")); return; }
+    data.links.forEach((l) => links.append(el("div", { class: "link-item" },
+      el("span", { class: "link-rel" }, relLabel(l.relationship) + ": "),
+      `${l.original_filename} (${l.document_type || "—"})`)));
+  };
+  drawLinks();
   body.append(links);
-  if (d.document_type === "Amendment" && !data.links.some((l) => l.relationship === "amendment_of"))
-    body.append(el("div", { class: "prov", style: "color:var(--warn)" },
-      "Amendments must be linked to a parent contract before they can be verified."));
+  const needsParent = () => d.document_type === "Amendment" &&
+    !data.links.some((l) => l.relationship === "amendment_of");
+  const warn = el("div", { class: "prov", style: "color:var(--warn)" },
+    "Amendments must be linked to a parent contract before they can be verified.");
+  warn.hidden = !needsParent();
+  body.append(renderLinkAdder(d.doc_id, d.document_type, (newLink) => {
+    data.links.push(newLink); drawLinks(); warn.hidden = !needsParent();
+  }));
+  body.append(warn);
 
   // footer actions
   const foot = $("#drawerFoot"); foot.replaceChildren(
@@ -409,6 +431,8 @@ function renderClassify(body, data) {
   const typeSel = el("select", {}); fillTypeSelect(typeSel); typeSel.value = d.document_type || "";
   const deptSel = el("select", {}); fillSelect(deptSel, "department", "— none —"); deptSel.value = d.department || "";
   const typeRow = el("div", { class: "field-row" }, el("label", {}, "Document type"), typeSel);
+  if (d.document_type)  // pre-filled from the name/path guess at ingest time
+    typeRow.append(el("div", { class: "prov" }, "Suggested from the file name — confirm or change."));
   const deptRow = el("div", { class: "field-row" }, el("label", {}, "Department"), deptSel);
   body.append(typeRow, deptRow);
 
@@ -535,6 +559,54 @@ function listEditor(key, items) {
     } });
   draw(); sync();
   wrap.append(hidden, chips, input);
+  return wrap;
+}
+// Inline "link this document to another" control. amendment_of / attachment_of point the
+// current doc *up* to a parent (current = child); other relationships treat current as parent.
+function renderLinkAdder(docId, dtype, onLinked) {
+  const wrap = el("div", { class: "link-adder" });
+  const rel = el("select", { class: "link-rel-sel" });
+  const opts = dtype === "Amendment"
+    ? [["amendment_of", "Amendment of (parent contract)"], ["related", "Related to"]]
+    : [["related", "Related to"], ["attachment_of", "Attachment of"],
+       ["amendment_of", "Amendment of"], ["supersedes", "Supersedes"]];
+  opts.forEach(([v, l]) => rel.append(el("option", { value: v }, l)));
+  const search = el("input", { type: "text", placeholder: "Find a document by name…" });
+  const results = el("div", { class: "link-results", hidden: true });
+  let cache = null;
+  const ensure = async () => (cache ||= await api("/api/documents"));
+  const doAdd = async (target) => {
+    const relationship = rel.value;
+    const [parent, child] = (relationship === "amendment_of" || relationship === "attachment_of")
+      ? [target.doc_id, docId] : [docId, target.doc_id];
+    try {
+      await api("/api/links", { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ parent_doc_id: parent, child_doc_id: child, relationship }) });
+      toast("Linked");
+      search.value = ""; results.hidden = true;
+      onLinked({ relationship, original_filename: target.original_filename,
+        document_type: target.document_type });
+    } catch (e) { toast("Failed: " + e.message, true); }
+  };
+  let t;
+  search.addEventListener("input", () => {
+    clearTimeout(t);
+    t = setTimeout(async () => {
+      const q = search.value.trim().toLowerCase();
+      if (!q) { results.hidden = true; return; }
+      let docs;
+      try { docs = await ensure(); } catch { return; }
+      const hits = docs.filter((x) => x.doc_id !== docId &&
+        (x.original_filename || "").toLowerCase().includes(q)).slice(0, 8);
+      results.replaceChildren(...hits.map((x) => el("div", { class: "link-result",
+        onclick: () => doAdd(x) },
+        el("span", { class: "doc-name small" }, x.original_filename || "(unnamed)"),
+        el("span", { class: "muted small" }, " " + (x.document_type || "—")))));
+      if (!hits.length) results.replaceChildren(el("div", { class: "muted small link-result" }, "No matches."));
+      results.hidden = false;
+    }, 250);
+  });
+  wrap.append(el("div", { class: "link-adder-row" }, rel, search), results);
   return wrap;
 }
 function collectFieldValues() {

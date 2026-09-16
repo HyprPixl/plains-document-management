@@ -8,6 +8,7 @@ rather than creating a second copy.
 import hashlib
 import io
 import os
+import re
 import uuid
 
 from databricks.sdk import WorkspaceClient
@@ -20,6 +21,45 @@ _w = WorkspaceClient()
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+# Cheap document-type guess from the file name + SharePoint path. This only *suggests* a type
+# (the doc still lands unclassified and waits for a human to confirm); it saves the reviewer
+# from picking from scratch when the name/folder is a dead giveaway. Ordered most-specific
+# first, since e.g. an "amendment" is also an "agreement" and a COI is also a "policy".
+_TYPE_HINTS: list[tuple[str, tuple[str, ...]]] = [
+    ("Amendment", ("amendment", "addendum")),
+    ("Purchase Order", ("purchase order", "purchaseorder", " po ", "po#", "p o number")),
+    ("Invoice", ("invoice", "inv#", "remittance")),
+    ("Insurance / Certificate", ("insurance", "certificate of insurance", "coi", "acord")),
+    ("Land / Right-of-Way", ("right of way", "right-of-way", "row agreement", "easement",
+                              "surface use", "damage settlement", "plat")),
+    ("Permit / Regulatory", ("permit", "regulatory", "authorization to construct", "epa ",
+                              "notice of violation")),
+    ("Inspection / Integrity Report", ("inspection", "integrity", "corrosion", "ndt", " ili ",
+                                        "dig report", "cathodic")),
+    ("Financial Statement", ("financial statement", "balance sheet", "income statement",
+                              "annual report", "10-k", "10-q")),
+    ("HR / Personnel", ("resume", "offer letter", "personnel", "onboarding", "timesheet",
+                         "payroll", "employee handbook", "performance review")),
+    ("Policy / Procedure", ("policy", "procedure", "standard", "sop", "guideline", "manual",
+                             "work instruction")),
+    ("Project (Engineering)", ("as-built", "as built", "p&id", "isometric", "datasheet",
+                                "data sheet", "afe", "engineering", "drawing", "spec sheet")),
+    ("Correspondence", ("correspondence", "letter", "memo", "notice", "email")),
+    ("Contract / Agreement", ("contract", "agreement", "msa", "nda", "lease", "sow",
+                               "statement of work", "master service")),
+]
+
+
+def guess_document_type(filename: str | None, sp_path: str | None = None) -> str | None:
+    """Best-effort document_type from the name/path, or None if nothing matches."""
+    hay = " " + re.sub(r"[_\-.]+", " ", f"{filename or ''} {sp_path or ''}".lower()) + " "
+    hay = re.sub(r"\s+", " ", hay)
+    for dtype, needles in _TYPE_HINTS:
+        if any(n in hay for n in needles):
+            return dtype
+    return None
 
 
 def register_bytes(
@@ -64,7 +104,12 @@ def register_bytes(
     vpath = f"{config.DOCS_VOLUME}/{subdir}/{sha}{ext}"
     _w.files.upload(vpath, io.BytesIO(data), overwrite=True)
 
+    # An explicit type/business_unit (e.g. from a configured auto-sync) classifies the doc.
+    # Otherwise leave it unclassified but pre-fill a *suggested* type from the name/path so the
+    # reviewer just confirms rather than picking blind.
     classified = bool(business_unit or document_type)
+    if not classified and not document_type:
+        document_type = guess_document_type(filename, sp_path)
     execute(
         f"INSERT INTO {config.DOCUMENTS} "
         f"(doc_id, content_sha256, volume_path, original_filename, mime_type, size_bytes, "
