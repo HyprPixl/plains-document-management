@@ -224,6 +224,9 @@ def _bootstrap():
         if _tables_ready:
             return
         conn = _connect()
+        # Base objects only. The UNIQUE index is created later under the advisory lock,
+        # after de-duping, so a pre-existing duplicate (e.g. from an earlier no-constraint
+        # backfill) can't make its creation fail.
         ddl = (
             f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}",
             f"CREATE TABLE IF NOT EXISTS {PERMISSIONS} ("
@@ -233,10 +236,6 @@ def _bootstrap():
             f"  updated_at   TIMESTAMPTZ DEFAULT NOW()"
             f")",
             f"CREATE INDEX IF NOT EXISTS permissions_email_idx ON {PERMISSIONS} (lower(email))",
-            # Uniqueness makes backfill + dual-write idempotent across workers (NULL sites
-            # coalesced so they compare equal). Enables ON CONFLICT DO NOTHING below.
-            f"CREATE UNIQUE INDEX IF NOT EXISTS permissions_uk "
-            f"ON {PERMISSIONS} (lower(email), access_type, COALESCE(allowed_site, ''))",
         )
         for stmt in ddl:
             try:
@@ -250,9 +249,10 @@ def _bootstrap():
 
 
 def _ensure_permissions_ready():
-    """Bootstrap the table and, one time, backfill it from the warehouse if it is still
-    empty — so the cutover is transparent and rollback-safe. A Postgres advisory lock
-    serializes the check-and-backfill across all workers so it seeds exactly once."""
+    """Bootstrap the table, then — once, under a Postgres advisory lock so all workers
+    serialize — de-dup any legacy rows, add the UNIQUE index, and backfill from the
+    warehouse if still empty. The lock guarantees this one-time setup runs exactly once
+    across the 4 gunicorn workers (a per-process threading.Lock can't coordinate them)."""
     global _perms_backfilled
     _bootstrap()
     if _perms_backfilled:
@@ -264,6 +264,19 @@ def _ensure_permissions_ready():
         with conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_lock(%s)", (_BACKFILL_LOCK_KEY,))
             try:
+                # Collapse any pre-existing duplicates (keep one per logical key) so the
+                # UNIQUE index can be built, then make future writes idempotent.
+                cur.execute(
+                    f"DELETE FROM {PERMISSIONS} a USING {PERMISSIONS} b "
+                    f"WHERE a.ctid < b.ctid "
+                    f"AND lower(a.email) = lower(b.email) "
+                    f"AND a.access_type = b.access_type "
+                    f"AND COALESCE(a.allowed_site, '') = COALESCE(b.allowed_site, '')"
+                )
+                cur.execute(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS permissions_uk "
+                    f"ON {PERMISSIONS} (lower(email), access_type, COALESCE(allowed_site, ''))"
+                )
                 cur.execute(f"SELECT count(*) AS n FROM {PERMISSIONS}")
                 n = cur.fetchone()[0]
                 if n == 0:
