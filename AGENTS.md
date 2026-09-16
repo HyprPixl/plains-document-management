@@ -83,10 +83,23 @@ databricks jobs run-now 607689951574858
    is `verified` — copy its `confirmed_value`s so the dup lands already-verified. (Roadmap item R;
    confirm the ingest path actually takes this shortcut end-to-end.)
 
-## Current state of error handling (relevant to Phase 1)
+## Error handling / logging (Phase 1 item DONE — commit 71e65d5)
 
-`app.py` has **no** `import logging`, no `@app.errorhandler`, no `app.logger` use. Failures surface
-ad-hoc — a browser toast, or a silently-`pending` doc when the job fails. Phase 1's first item
-(structured error logging like the other Plains apps) is therefore greenfield. `processing/job.py`
-does use `logging` already — match/extend that on the job side.
+Structured error logging is now in place, matching **contract-explorer**'s pattern (stdout
+`StreamHandler`, format `[%(asctime)s] [%(levelname)s] %(message)s`; Databricks Apps capture
+stdout — there is no error Delta table, by design, to match the sibling apps):
+
+- `app.py`: `app.logger` → stdout handler at `config.LOG_LEVEL`; `@app.before_request` sets
+  `g.request_id`/`g.user_email`; `@app.after_request` logs 4xx (WARNING) / 5xx (ERROR);
+  `@app.errorhandler(HTTPException)` and `@app.errorhandler(Exception)` log with context and return
+  friendly JSON **without** leaking tracebacks (SPEC §16). Context tag convention:
+  `request_id=… method=… route=… user=…`.
+- `processing/job.py`: named logger `doc_hub.processing`, same format; all failure paths now
+  `logger.error/warning` with `doc_id=… stage=… <traceback>` (previously `print`/`traceback.print_exc`).
+- The existing `_audit(...)` → `audit_log` Delta path is the who-did-what trail, **separate** from
+  error logs; left untouched.
+
+**Logging gotcha:** the databricks SDK configures the **root logger on import**, so
+`logging.basicConfig(...)` is a silent no-op (your format is ignored). Attach a handler to your
+named logger directly with `propagate=False` — don't rely on `basicConfig`.
 </content>
