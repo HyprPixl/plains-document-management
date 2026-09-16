@@ -555,6 +555,20 @@ def sp_import():
     selections = b.get("selections", [])
     if not drive_id or not selections:
         return jsonify(error="drive_id and selections required"), 400
+    # Fast path: a small, files-only selection is cheap enough to import inline (a few Graph
+    # downloads well under the 120s request budget), so the user sees docs immediately instead
+    # of waiting on the processing job's cold start. Folders (recursive) and big batches queue.
+    files_only = all(not s.get("is_folder") for s in selections)
+    if files_only and len(selections) <= 8:
+        try:
+            r = sp.import_selection(
+                email, drive_id, selections, source_id=b.get("source_id", "sp_import"),
+                site_id=b.get("site_id"), site_name=b.get("site_name"),
+                document_type=b.get("document_type"), department=b.get("department"))
+        except sp.SPReauth:
+            return jsonify(error="reauth"), 401
+        _audit(email, "sp_import", drive_id, {"inline": True, "selected": len(selections), **r})
+        return jsonify(queued=False, imported=r["imported"], duplicates=r["duplicates"])
     try:
         req_id = sp.enqueue_import(
             email, drive_id, selections, source_id=b.get("source_id", "sp_import"),

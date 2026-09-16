@@ -179,7 +179,17 @@ def _sync_one(s: dict, watermark: str | None) -> int:
         f"UPDATE {config.SHAREPOINT_SYNCS} SET refresh_token_enc = {lit(sp.encrypt(new_refresh))} "
         f"WHERE id = {lit(s['id'])}"
     )
-    files = sp.walk_files(access, s["drive_id"], s.get("folder_id"), modified_after=watermark)
+    # The sync target may be a whole library (folder_id NULL → root walk), a folder, or a
+    # single file. Probe a set folder_id: if it resolves to a file, sync just that item.
+    target = s.get("folder_id")
+    if target:
+        meta = sp.get_file_meta(access, s["drive_id"], target)  # None if it's a folder
+        if meta is not None:
+            files = [meta] if (not watermark or (meta.get("modified") or "") > watermark) else []
+        else:
+            files = sp.walk_files(access, s["drive_id"], target, modified_after=watermark)
+    else:
+        files = sp.walk_files(access, s["drive_id"], None, modified_after=watermark)
     n = 0
     for it in files:
         r = ingest.register_bytes(

@@ -282,6 +282,25 @@ def walk_files(token: str, drive_id: str, item_id: str | None, depth: int = 0,
     return files
 
 
+def get_file_meta(token: str, drive_id: str, item_id: str) -> dict | None:
+    """Return a file-shaped dict for a single driveItem, or None if it's a folder.
+
+    Lets auto-sync target an individual file (not just a folder): the sync tick fetches the
+    one item instead of listing children.
+    """
+    it = _graph(token, f"{GRAPH}/drives/{drive_id}/items/{item_id}",
+                {"$select": "id,name,size,folder,file,lastModifiedDateTime,webUrl,parentReference"})
+    if "folder" in it:
+        return None
+    return {
+        "id": it["id"], "name": it["name"], "size": it.get("size", 0),
+        "is_folder": False, "child_count": None,
+        "mime": (it.get("file") or {}).get("mimeType"),
+        "modified": it.get("lastModifiedDateTime"),
+        "path": _item_path(it), "web_url": it.get("webUrl"),
+    }
+
+
 def download(token: str, drive_id: str, item_id: str) -> bytes:
     r = requests.get(f"{GRAPH}/drives/{drive_id}/items/{item_id}/content",
                      headers={"Authorization": f"Bearer {token}"}, timeout=180)

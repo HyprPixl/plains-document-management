@@ -134,6 +134,17 @@ main { max-width: 1160px; margin: 0 auto; padding: 28px 24px 80px; }
 
 .empty { padding: 40px; text-align: center; color: var(--muted); }
 
+/* ── Loading skeletons ── */
+.skel {
+  display: inline-block; height: 12px; min-width: 40px; border-radius: 6px;
+  background: linear-gradient(90deg, #eef1f5 25%, #e2e8f0 37%, #eef1f5 63%);
+  background-size: 400% 100%; animation: skel-shimmer 1.3s ease-in-out infinite;
+}
+.skel-n { height: 24px; width: 48px; margin: 2px 0; }
+.skel-row td { padding: 12px 16px; }
+.uploading-row td { opacity: .8; }
+@keyframes skel-shimmer { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
+
 /* ── Search / Explore ── */
 .search-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
 .search-bar input[type=search] { flex: 1; min-width: 240px; }
@@ -238,11 +249,7 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #cfe0f5; border-c
 .sp-row .sp-meta { flex-shrink: 0; }
 
 .sp-foot { border-top: 1px solid var(--line); padding: 14px 22px 18px; }
-.sp-target summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--muted); }
-.sp-target-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 12px 0; }
-.sp-target-grid label { display: block; font-size: 12px; font-weight: 600; }
-.sp-target-grid select { width: 100%; }
-.sp-autosync { display: block; font-size: 13px; margin: 10px 0 4px; line-height: 1.5; }
+.sp-autosync { display: block; font-size: 13px; margin: 2px 0 4px; line-height: 1.5; }
 .sp-autosync input { margin-right: 6px; }
 
 /* ── Auto-sync list ── */

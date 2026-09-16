@@ -71,16 +71,23 @@ async function init() {
   wireExplore();
   wireSharePoint();
 
-  state.me = await api("/api/me");
-  $("#userChip").textContent = state.me.email + (state.me.is_admin ? " · admin" : "");
-  state.taxonomy = await api("/api/taxonomy");
-
+  // Paint the shell (with loading placeholders) immediately so the page never sits blank
+  // while the warehouse resumes. Identity + taxonomy load in parallel and fill in after.
   const start = location.pathname.startsWith("/explore")
     ? "explore"
     : location.pathname.startsWith("/manage")
     ? "manage"
     : localStorage.getItem("dochub.surface") || "manage";
+  $("#spEntry").hidden = false;          // show the import affordance greyed until status lands
+  $("#spImportBtn").disabled = true;
   setSurface(start);
+
+  try {
+    const [me, tax] = await Promise.all([api("/api/me"), api("/api/taxonomy")]);
+    state.me = me; state.taxonomy = tax;
+    $("#userChip").textContent = me.email + (me.is_admin ? " · admin" : "");
+    if (state.surface === "explore") loadExploreFilters();  // refill filters now taxonomy is in
+  } catch (e) { toast("Load failed: " + e.message, true); }
 }
 
 // ─────────────────────────────────────────────── MANAGE ──
@@ -89,7 +96,15 @@ async function loadManage() {
   loadDocs();
   refreshSharePoint();
 }
+function skeletonStatCards() {
+  $("#statRow").replaceChildren(
+    ...["Needs classification", "Needs review", "Verified"].map((l) =>
+      el("div", { class: "stat-card" },
+        el("div", { class: "n skel skel-n" }, ""), el("div", { class: "l" }, l)))
+  );
+}
 async function loadStats() {
+  if (!$("#statRow").children.length) skeletonStatCards();
   try {
     const s = await api("/api/stats");
     const cards = [
@@ -123,6 +138,13 @@ function selectQueue(q) {
   $$("#queueTabs .qtab").forEach((b) => b.classList.toggle("active", b.dataset.queue === q));
   loadDocs();
 }
+function skeletonDocRows(n = 5) {
+  const cell = (w) => el("td", {}, el("span", { class: "skel", style: `width:${w}` }, ""));
+  $("#docRows").replaceChildren(...Array.from({ length: n }, () =>
+    el("tr", { class: "skel-row" },
+      el("td", { class: "col-check" }, el("span", { class: "skel", style: "width:16px" }, "")),
+      cell("70%"), cell("55%"), cell("40%"), cell("60%"), cell("50%"))));
+}
 async function loadDocs() {
   const q = state.queue;
   let path = "/api/documents";
@@ -130,8 +152,11 @@ async function loadDocs() {
   if (q === "unclassified") params.set("classification_status", "unclassified");
   else if (q !== "all") params.set("verification_status", q);
   if ([...params].length) path += "?" + params;
+  const tb = $("#docRows");
+  $("#docEmpty").hidden = true;
+  if (!tb.children.length) skeletonDocRows();
   const rows = await api(path);
-  const tb = $("#docRows"); tb.replaceChildren();
+  tb.replaceChildren();
   $("#docEmpty").hidden = rows.length > 0;
   for (const d of rows) {
     const cb = el("input", { type: "checkbox", "data-id": d.doc_id,
@@ -185,6 +210,19 @@ async function uploadFiles(fileList) {
   files.forEach((f) => fd.append("files", f));
   const box = $("#uploadResults");
   box.replaceChildren(el("div", { class: "up-item" }, `Uploading ${files.length} file(s)…`));
+  // Optimistic: drop each file into the table right away with an "Uploading" status so the
+  // user sees it land. loadManage() below replaces these with the authoritative rows.
+  if (state.surface === "manage") {
+    $("#docEmpty").hidden = true;
+    const tb = $("#docRows");
+    files.forEach((f) => tb.prepend(el("tr", { class: "uploading-row" },
+      el("td", { class: "col-check" }, ""),
+      el("td", {}, el("span", { class: "doc-name" }, f.name)),
+      el("td", {}, el("span", { class: "muted small" }, "—")),
+      el("td", {}, "—"),
+      el("td", {}, el("span", { class: "badge blue" }, "Uploading…")),
+      el("td", {}, el("span", { class: "badge gray" }, "—")))));
+  }
   try {
     const res = await api("/api/upload", { method: "POST", body: fd });
     box.replaceChildren(...res.results.map((r) => {
@@ -497,7 +535,9 @@ async function refreshSharePoint() {
   try {
     const st = await api("/api/sharepoint/status");
     spState.status = st;
-    $("#spEntry").hidden = !(st.configured && st.can_import);
+    const ok = !!(st.configured && st.can_import);
+    $("#spEntry").hidden = !ok;
+    $("#spImportBtn").disabled = !ok;
     await loadSyncs(st);
   } catch { /* non-fatal */ }
 }
@@ -545,8 +585,6 @@ function openSharePoint() {
   spState.selected.clear(); spState.visible = [];
   spState.view = "sites"; spState.site = null; spState.drive = null; spState.path = [];
   $("#spScrim").hidden = false;
-  fillTypeSelect($("#spType"));
-  fillSelect($("#spDept"), "department", "— none —");
   $("#spAutoSync").checked = false;
   if (spState.status?.connected) showSpBrowser();
   else { $("#spConnect").hidden = false; $("#spBrowser").hidden = true; $("#spFoot").hidden = true; }
@@ -682,8 +720,8 @@ async function doSharePointImport() {
   if (!entries.length) return;
   const autosync = $("#spAutoSync").checked;
   const folderSel = entries.filter((e) => e.is_folder);
-  if (autosync && folderSel.length !== 1) {
-    toast("Auto-sync needs exactly one folder selected", true); return;
+  if (autosync && entries.length !== 1) {
+    toast("Auto-sync needs exactly one file or folder selected", true); return;
   }
   // Folders import recursively; we only know immediate child counts client-side, so warn.
   if (folderSel.length) {
@@ -696,11 +734,11 @@ async function doSharePointImport() {
       `total may be much larger (subfolders aren't counted here). This runs in the background. Continue?`))
       return;
   }
-  const dt = $("#spType").value || null, dept = $("#spDept").value || null;
+  const dt = null, dept = null;  // classify later in the Manage queue, not at import time
   const btn = $("#spImport"); btn.disabled = true; btn.textContent = "Importing…";
   try {
     if (autosync) {
-      const f = folderSel[0];
+      const f = entries[0];  // a single file or folder — folder_id carries either item id
       await api("/api/sharepoint/syncs", { method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ site_id: spState.site.id, site_name: spState.site.name,
           drive_id: f.drive_id, drive_name: f.drive_name,
@@ -713,18 +751,24 @@ async function doSharePointImport() {
       byDrive.get(e.drive_id).sels.push({ id: e.id, name: e.name, is_folder: e.is_folder,
         mime: e.mime, path: e.path, web_url: e.web_url, modified: e.modified });
     }
-    let firstReq = null;
+    let firstReq = null, inlineNew = 0, inlineDup = 0, anyQueued = false;
     for (const [driveId, g] of byDrive) {
       const res = await api("/api/sharepoint/import", { method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ drive_id: driveId, selections: g.sels, source_id: "sp_import",
           site_id: spState.site.id, site_name: spState.site.name, drive_name: g.drive_name,
           document_type: dt, department: dept }) });
-      firstReq = firstReq || res.request_id;
+      if (res.queued === false) { inlineNew += res.imported || 0; inlineDup += res.duplicates || 0; }
+      else { anyQueued = true; firstReq = firstReq || res.request_id; }
     }
-    toast(`Import queued${byDrive.size > 1 ? ` (${byDrive.size} libraries)` : ""}` +
-      `${autosync ? " · auto-sync on" : ""} — processing in the background…`);
     closeSharePoint();
-    pollImportJob(firstReq);
+    if (anyQueued) {
+      toast(`Import queued${byDrive.size > 1 ? ` (${byDrive.size} libraries)` : ""}` +
+        `${autosync ? " · auto-sync on" : ""} — processing in the background…`);
+      pollImportJob(firstReq);
+    } else {
+      toast(`Imported ${inlineNew} new, ${inlineDup} already stored` + (autosync ? " · auto-sync on" : ""));
+      loadManage();
+    }
   } catch (e) {
     if (e.status === 401) handleSpErr(e);
     else toast("Import failed: " + e.message, true);
