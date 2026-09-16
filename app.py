@@ -145,6 +145,7 @@ def api_documents():
         where += f" AND classification_status = {lit(cstatus)}"
     rows = query(
         f"SELECT doc_id, original_filename, document_type, department, sp_site_name, sp_path, "
+        f"sp_web_url, mime_type, derived_pdf_path, "
         f"classification_status, extraction_status, verification_status, mirror_status, "
         f"source_id, batch_id, created_at FROM {config.DOCUMENTS} WHERE {where} "
         f"ORDER BY created_at DESC LIMIT 500"
@@ -202,6 +203,7 @@ def api_enqueue():
         f"next_attempt_at = NULL, updated_at = current_timestamp() "
         f"WHERE doc_id IN ({id_list}) AND classification_status = 'classified'"
     )
+    _trigger_processing_run()  # kick the job now so extraction doesn't wait for the schedule
     _audit(email, "enqueue", f"{len(ids)} docs", None)
     return jsonify(enqueued=len(ids))
 
@@ -401,7 +403,7 @@ def api_search():
         join_tag = f"JOIN {config.DOCUMENT_TAGS} tg ON tg.doc_id = d.doc_id AND tg.tag = {lit(tag)} "
     rows = query(
         f"SELECT d.doc_id, d.original_filename, d.document_type, d.department, "
-        f"d.sp_site_name, d.sp_path, d.sp_web_url, "
+        f"d.sp_site_name, d.sp_path, d.sp_web_url, d.mime_type, d.derived_pdf_path, "
         f"coalesce(f_title.confirmed_value, f_title.proposed_value) AS title, "
         f"coalesce(f_sum.confirmed_value, f_sum.proposed_value) AS summary, d.created_at "
         f"FROM {config.DOCUMENTS} d "

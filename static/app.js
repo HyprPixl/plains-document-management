@@ -138,10 +138,11 @@ async function loadDocs() {
       onclick: (e) => { e.stopPropagation();
         e.target.checked ? state.selected.add(d.doc_id) : state.selected.delete(d.doc_id);
         updateBulkBar(); } });
-    tb.append(el("tr", { onclick: () => openDoc(d.doc_id) },
+    tb.append(el("tr", { onclick: () => openDoc(d.doc_id, d) },
       el("td", { class: "col-check" }, cb),
       el("td", {}, el("span", { class: "doc-name" }, d.original_filename || "(unnamed)")),
-      el("td", {}, el("span", { class: "loc muted small", title: d.sp_path || "" }, locationOf(d))),
+      el("td", {}, el("span", { class: "loc muted small", title: locationOf(d) },
+        d.sp_path || d.sp_site_name || "—")),
       el("td", {}, d.document_type || "—"),
       el("td", {}, extractionBadge(d.extraction_status)),
       el("td", {}, statusBadge(d.verification_status))));
@@ -243,30 +244,40 @@ function wireDrawer() {
 }
 function closeDrawer() {
   $("#drawer").hidden = true; $("#drawerScrim").hidden = true;
-  $("#reviewFrame").src = "about:blank";  // stop loading / free the viewer
+  const frame = $("#reviewFrame"); frame.src = "about:blank"; frame.dataset.src = "";  // free the viewer
   state.currentDoc = null;
 }
-async function openDoc(docId) {
+// Open instantly with whatever the clicked row already knows (title + viewer), then fill the
+// fields panel from the detail fetch. Avoids a multi-query wait before anything appears.
+async function openDoc(docId, row) {
+  $("#drawer").hidden = false; $("#drawerScrim").hidden = false;
+  if (row) {
+    $("#drawerTitle").textContent = row.original_filename || "Document";
+    $("#drawerSub").textContent = `${locationOf(row)} · ${row.document_type || "unclassified"}`;
+    loadPreview(row);
+  }
+  $("#drawerBody").replaceChildren(el("div", { class: "muted small" }, "Loading…"));
+  $("#drawerFoot").replaceChildren();
   try {
     const data = await api("/api/documents/" + docId);
+    if ($("#drawer").hidden) return;  // user closed it while loading
     state.currentDoc = data;
     renderDrawer(data);
-    loadPreview(data.document);
-    $("#drawer").hidden = false; $("#drawerScrim").hidden = false;
-  } catch (e) { toast("Could not open: " + e.message, true); }
+    loadPreview(data.document);  // refine with authoritative mime/derived
+  } catch (e) { toast("Could not open: " + e.message, true); closeDrawer(); }
 }
 // Load the file into the left-hand viewer. PDFs (incl. the derived searchable PDF) and
-// images render inline; anything else falls back to the View/Download actions.
+// images render inline; anything else falls back to the View/Download actions. Idempotent:
+// re-calling with the same target (row → detail refine) won't reload the iframe.
 function loadPreview(d) {
   const frame = $("#reviewFrame"), noprev = $("#reviewNoPrev");
   const mime = (d.mime_type || "").toLowerCase();
   const embeddable = !!d.derived_pdf_path || mime === "application/pdf" || mime.startsWith("image/");
-  if (embeddable) {
-    frame.hidden = false; noprev.hidden = true;
-    frame.src = `/api/download?doc_id=${d.doc_id}&inline=1&_t=${Date.now()}`;
-  } else {
-    frame.hidden = true; noprev.hidden = false; frame.src = "about:blank";
-  }
+  const target = embeddable ? `/api/download?doc_id=${d.doc_id}&inline=1` : "";
+  if (frame.dataset.src === target) return;
+  frame.dataset.src = target;
+  if (embeddable) { frame.hidden = false; noprev.hidden = true; frame.src = target; }
+  else { frame.hidden = true; noprev.hidden = false; frame.src = "about:blank"; }
 }
 function renderDrawer(data) {
   const d = data.document;
@@ -422,7 +433,7 @@ async function runSearch() {
   const grid = $("#searchResults"); grid.replaceChildren();
   if (!rows.length) { grid.append(el("div", { class: "empty" }, "No matching documents.")); return; }
   for (const d of rows) {
-    grid.append(el("div", { class: "result-card", onclick: () => openDoc(d.doc_id) },
+    grid.append(el("div", { class: "result-card", onclick: () => openDoc(d.doc_id, d) },
       el("div", { class: "rc-title" }, d.title || d.original_filename),
       el("div", { class: "rc-meta" },
         el("span", { class: "badge gray" }, d.document_type || "—"),
