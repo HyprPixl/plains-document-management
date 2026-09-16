@@ -4,6 +4,7 @@ databricks-sdk>=0.20,<1.0
 azure-identity>=1.15,<2.0
 requests>=2.31,<3.0
 cryptography>=42.0  # Fernet encryption for delegated SharePoint refresh tokens
+psycopg2-binary  # Lakebase (Databricks Postgres) hot-path reads — Phase 2 (lakebase.py)
 # Processing job (run on Databricks compute, not required by the web app):
 azure-ai-documentintelligence>=1.0.0
 pypdf>=4.0

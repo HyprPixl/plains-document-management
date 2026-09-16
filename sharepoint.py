@@ -23,6 +23,7 @@ from databricks.sdk import WorkspaceClient
 
 import config
 import ingest
+import lakebase
 from db import query, execute, lit
 
 _w = WorkspaceClient()
@@ -332,6 +333,10 @@ def sync_user_sites(email: str, token: str | None = None) -> int:
             f"INSERT INTO {config.PERMISSIONS} (email, access_type, allowed_site, updated_at) "
             f"VALUES {vals}"
         )
+    # Phase 2 dual-write: mirror the same SITE grants into Lakebase so the new store
+    # stays consistent with the warehouse (no-op unless Lakebase is active). Never lets a
+    # Lakebase hiccup break the warehouse write above.
+    lakebase.mirror_user_sites(email.lower(), site_ids)
     return len(site_ids)
 
 

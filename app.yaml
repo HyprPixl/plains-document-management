@@ -51,3 +51,19 @@ env:
   # SP to have CAN_MANAGE_RUN on this job; harmless no-op otherwise).
   - name: PROCESSING_JOB_ID
     value: "607689951574858"
+  # ── Lakebase (Databricks Postgres OLTP) — Phase 2 hot-path migration ─────────
+  # Binding the `database` resource injects PGHOST/PGDATABASE/PGUSER/PGPORT (+ PGPASSWORD)
+  # for the app SP. SHARED instance with dbx-deal-capture-app — we live only in our own
+  # `document_hub` schema, never `public`. lakebase.py is inert when PGHOST is absent.
+  - name: DATABASE_URL
+    valueFrom: database
+  - name: LAKEBASE_HOST
+    value: "ep-flat-moon-ee1bjbvj.database.westus2.azuredatabricks.net"
+  - name: LAKEBASE_DB
+    value: "databricks_postgres"
+  - name: LAKEBASE_SCHEMA
+    value: "document_hub"
+  # Thin-slice cutover flag: 'true' points get_perms() at Lakebase; set 'false' to roll
+  # back to the warehouse instantly. (Defaults on when PGHOST is bound even if unset.)
+  - name: USE_LAKEBASE_PERMISSIONS
+    value: "true"

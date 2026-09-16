@@ -21,6 +21,7 @@ from databricks.sdk import WorkspaceClient
 
 import config
 import ingest
+import lakebase
 import sharepoint as sp
 from db import query, execute, lit
 
@@ -120,10 +121,22 @@ def get_perms(email: str):
     if cache is not None and key in cache:
         return cache[key]
 
-    rows = query(
-        f"SELECT access_type, allowed_site FROM {config.PERMISSIONS} "
-        f"WHERE lower(email) = {lit(email)}"
-    )
+    # Phase 2: read the single-row permission lookup from Lakebase (single-digit-ms
+    # round trip) when the flag + a bound Postgres host are present; otherwise the
+    # warehouse path is unchanged. Any Lakebase failure falls back to the warehouse so
+    # a page never hard-fails on the new store during cutover.
+    rows = None
+    if config.USE_LAKEBASE_PERMISSIONS and lakebase.enabled():
+        try:
+            rows = lakebase.read_permissions(email)
+        except Exception:
+            app.logger.warning(f"lakebase perms read failed, falling back to warehouse — {_req_ctx()}")
+            rows = None
+    if rows is None:
+        rows = query(
+            f"SELECT access_type, allowed_site FROM {config.PERMISSIONS} "
+            f"WHERE lower(email) = {lit(email)}"
+        )
     if not rows:
         result = (False, False, [])
     else:

@@ -17,6 +17,19 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 # work — tune down to catch more, up to quiet a known-slow path.
 SLOW_QUERY_MS = int(os.getenv("SLOW_QUERY_MS", "1000"))
 
+# ── Lakebase (Databricks Postgres OLTP) — Phase 2 hot-path migration ──────────
+# The `database` app-resource binding injects PGHOST/PGDATABASE/PGUSER/PGPORT when
+# present. USE_LAKEBASE_PERMISSIONS points get_perms() at Lakebase (single-digit-ms
+# round trips) instead of the warehouse; it defaults ON when a Postgres host is bound
+# and OFF otherwise (offline/tests → warehouse fallback). See lakebase.py + AGENTS.md.
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+USE_LAKEBASE_PERMISSIONS = _env_bool("USE_LAKEBASE_PERMISSIONS", default=bool(os.getenv("PGHOST")))
+
 # ai_query (batch inference) doesn't support the newest sonnet-5/opus-5 endpoints yet;
 # sonnet-4-5 is the current model that works with ai_query batch calls.
 EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "databricks-claude-sonnet-4-5")

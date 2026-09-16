@@ -147,7 +147,33 @@ live warehouse + SSO), not offline.
   renders the table + a Copy JSON affordance. Read-only (no writes/ai_query). This measures the
   warehouse round-trip the Lakebase migration is measured against, without CLI/token juggling.
 
-## Phase 2 — Lakebase migration (NEXT, not started — full brief for the fresh agent)
+## Phase 2 — Lakebase migration (thin slice BUILT — permissions cutover behind a flag)
+
+**Status (thin slice shipped):** `lakebase.py` (Pattern A) + the `permissions` read cutover
+are in. Offline suite green (103 tests). What exists now:
+
+- **`lakebase.py`** — Pattern A: `pg_query`/`pg_execute` (params, RealDictCursor), thread-local
+  no-op-close conn, SP-token minting + cache (`LAKEBASE_TOKEN` env override for local probing —
+  never persisted), `CREATE SCHEMA/TABLE IF NOT EXISTS` bootstrap in `document_hub`. **Inert when
+  `PGHOST` is unset** (`enabled()` False → callers fall back to the warehouse); import-safe even
+  without psycopg2 installed (guarded import).
+- **`get_perms()` cutover** (`app.py`): reads Lakebase when `config.USE_LAKEBASE_PERMISSIONS` and
+  `lakebase.enabled()`; **falls back to the warehouse on any Lakebase error** (page never hard-fails
+  during cutover). Still `g`-cached (one lookup/request — pinned by test).
+- **One-time backfill**: `lakebase.read_permissions()` → `_ensure_permissions_ready()` seeds the PG
+  table from the warehouse `permissions` table the first time it's empty (per worker).
+- **Dual-write**: `sp.sync_user_sites()` mirrors SITE grants into Lakebase too (`mirror_user_sites`,
+  no-op when disabled, never breaks the warehouse write) so both stores stay consistent / rollback-safe.
+- **Wiring**: `requirements.txt += psycopg2-binary`; `app.yaml` binds the `database` resource
+  (`valueFrom: database`) + `LAKEBASE_HOST/DB/SCHEMA` + `USE_LAKEBASE_PERMISSIONS` (set `"false"` to
+  roll back to the warehouse instantly).
+
+**Not yet done (next):** ⏳ **Measure vs `bench/BASELINE.md`** — needs a deploy (live warehouse +
+Lakebase + SSO), then click **"Run benchmark"** (`POST /api/admin/bench`) and compare the
+`documents`/`stats`/`search`/`document` p50/p95; the permission single-row lookup should drop from
+~1300 ms → single-digit ms. Then migrate `documents` + `document_fields` reads the same way.
+
+### Original brief (kept for context)
 
 **Goal:** kill the Statement-Execution round-trip tax (see `bench/BASELINE.md`: single-row
 permission lookup **~1300 ms**, fired 2–3×/page; 4-query document fetch **~1900 ms p50**). Lakebase
