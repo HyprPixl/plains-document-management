@@ -439,8 +439,26 @@ const spState = {
   site: null,             // {id, name}
   drive: null,            // {id, name}
   path: [],               // breadcrumb of {id, name} folders inside the drive
-  selected: new Map(),    // id → {id, name, is_folder}
+  selected: new Map(),    // "driveId:itemId" → full selection entry (may span drives)
+  visible: [],            // entries currently listed (for Select all)
 };
+// Composite key so selections don't collide across drives; null id === whole library (root).
+const selKey = (driveId, id) => `${driveId}:${id ?? "__root__"}`;
+function toggleSel(entry, on) {
+  const key = selKey(entry.drive_id, entry.id);
+  if (on) spState.selected.set(key, entry); else spState.selected.delete(key);
+  updateSpSelCount();
+}
+function selectAllVisible() {
+  const vis = spState.visible || [];
+  const allSel = vis.length && vis.every((e) => spState.selected.has(selKey(e.drive_id, e.id)));
+  vis.forEach((e) => {
+    const key = selKey(e.drive_id, e.id);
+    if (allSel) spState.selected.delete(key); else spState.selected.set(key, e);
+  });
+  updateSpSelCount();
+  spState.view === "drives" ? loadSpDrives() : loadSpItems();  // reflect new checkbox states
+}
 
 function wireSharePoint() {
   $("#spImportBtn").addEventListener("click", openSharePoint);
@@ -448,6 +466,7 @@ function wireSharePoint() {
   $("#spCancel").addEventListener("click", closeSharePoint);
   $("#spConnectBtn").addEventListener("click", connectSharePoint);
   $("#spImport").addEventListener("click", doSharePointImport);
+  $("#spSelectAll").addEventListener("click", selectAllVisible);
   let searchT;
   $("#spSearch").addEventListener("input", () => {
     clearTimeout(searchT);
@@ -512,7 +531,7 @@ async function removeSync(id, name) {
 }
 
 function openSharePoint() {
-  spState.selected.clear();
+  spState.selected.clear(); spState.visible = [];
   spState.view = "sites"; spState.site = null; spState.drive = null; spState.path = [];
   $("#spScrim").hidden = false;
   fillTypeSelect($("#spType"));
@@ -556,7 +575,10 @@ function renderCrumbs() {
 function updateSpSelCount() {
   const n = spState.selected.size;
   $("#spSelCount").textContent = n ? `${n} selected` : "Nothing selected";
-  $("#spImport").disabled = n === 0 || !spState.drive;
+  $("#spImport").disabled = n === 0;
+  const vis = spState.visible || [];
+  const allSel = vis.length && vis.every((e) => spState.selected.has(selKey(e.drive_id, e.id)));
+  $("#spSelectAll").textContent = allSel ? "Select none" : "Select all";
 }
 
 function spListBusy() { $("#spList").replaceChildren(el("div", { class: "muted small sp-busy" }, "Loading…")); }
@@ -569,8 +591,8 @@ function handleSpErr(e) {
 }
 
 async function loadSpSites(q) {
-  spState.view = "sites"; renderCrumbs();
-  $("#spSearch").hidden = false; spListBusy();
+  spState.view = "sites"; renderCrumbs(); spState.visible = [];
+  $("#spSearch").hidden = false; $("#spSelectAll").hidden = true; spListBusy();
   try {
     const { sites } = await api("/api/sharepoint/sites?q=" + encodeURIComponent(q || ""));
     const list = $("#spList"); list.replaceChildren();
@@ -583,32 +605,51 @@ async function loadSpSites(q) {
 
 async function loadSpDrives() {
   spState.view = "drives"; spState.drive = null; spState.path = [];
-  $("#spSearch").hidden = true; renderCrumbs(); spListBusy();
+  $("#spSearch").hidden = true; $("#spSelectAll").hidden = false; renderCrumbs(); spListBusy();
   try {
     const { drives } = await api("/api/sharepoint/drives?site_id=" + encodeURIComponent(spState.site.id));
     const list = $("#spList"); list.replaceChildren();
-    if (!drives.length) { list.append(el("div", { class: "empty" }, "No document libraries.")); return; }
-    drives.forEach((d) => list.append(el("div", { class: "sp-row folder", onclick: () => {
-      spState.drive = { id: d.id, name: d.name }; spState.path = []; loadSpItems();
-    } }, el("span", { class: "sp-ic" }, "🗂"), el("span", { class: "sp-nm" }, d.name))));
+    if (!drives.length) { spState.visible = []; list.append(el("div", { class: "empty" }, "No document libraries.")); return; }
+    // A whole library imports as a folder rooted at the drive (id === null → root walk).
+    spState.visible = drives.map((d) => ({ id: null, name: d.name, is_folder: true,
+      drive_id: d.id, drive_name: d.name, child_count: null }));
+    drives.forEach((d) => {
+      const entry = { id: null, name: d.name, is_folder: true, drive_id: d.id,
+        drive_name: d.name, child_count: null };
+      const cb = el("input", { type: "checkbox",
+        ...(spState.selected.has(selKey(d.id, null)) ? { checked: "" } : {}),
+        onclick: (e) => { e.stopPropagation(); toggleSel(entry, e.target.checked); } });
+      list.append(el("div", { class: "sp-row folder" },
+        cb,
+        el("span", { class: "sp-ic" }, "🗂"),
+        el("span", { class: "sp-nm", onclick: () => {
+          spState.drive = { id: d.id, name: d.name }; spState.path = []; loadSpItems();
+        } }, d.name),
+        el("span", { class: "sp-meta muted small" }, "library")));
+    });
+    updateSpSelCount();
   } catch (e) { handleSpErr(e); }
 }
 
 async function loadSpItems() {
-  spState.view = "items"; renderCrumbs(); spListBusy();
+  spState.view = "items"; $("#spSelectAll").hidden = false; renderCrumbs(); spListBusy();
   const parent = spState.path.length ? spState.path[spState.path.length - 1].id : "";
+  const dId = spState.drive.id, dName = spState.drive.name;
   try {
-    const { items } = await api(`/api/sharepoint/items?drive_id=${encodeURIComponent(spState.drive.id)}` +
+    const { items } = await api(`/api/sharepoint/items?drive_id=${encodeURIComponent(dId)}` +
       (parent ? `&item_id=${encodeURIComponent(parent)}` : ""));
     const list = $("#spList"); list.replaceChildren();
-    if (!items.length) { list.append(el("div", { class: "empty" }, "Empty folder.")); return; }
+    // Carry each item's metadata so directly-selected files land with their path/link/mime.
+    const entryOf = (it) => ({ id: it.id, name: it.name, is_folder: it.is_folder,
+      drive_id: dId, drive_name: dName, child_count: it.child_count,
+      mime: it.mime, size: it.size, path: it.path, web_url: it.web_url, modified: it.modified });
+    spState.visible = items.map(entryOf);
+    if (!items.length) { updateSpSelCount(); list.append(el("div", { class: "empty" }, "Empty folder.")); return; }
     items.forEach((it) => {
-      const checked = spState.selected.has(it.id);
-      const cb = el("input", { type: "checkbox", ...(checked ? { checked: "" } : {}),
-        onclick: (e) => { e.stopPropagation();
-          if (e.target.checked) spState.selected.set(it.id, { id: it.id, name: it.name, is_folder: it.is_folder });
-          else spState.selected.delete(it.id);
-          updateSpSelCount(); } });
+      const entry = entryOf(it);
+      const cb = el("input", { type: "checkbox",
+        ...(spState.selected.has(selKey(dId, it.id)) ? { checked: "" } : {}),
+        onclick: (e) => { e.stopPropagation(); toggleSel(entry, e.target.checked); } });
       const row = el("div", { class: "sp-row " + (it.is_folder ? "folder" : "file") },
         cb,
         el("span", { class: "sp-ic" }, it.is_folder ? "📁" : "📄"),
@@ -619,18 +660,30 @@ async function loadSpItems() {
           it.is_folder ? (it.child_count != null ? `${it.child_count} items` : "folder") : fmtSize(it.size)));
       list.append(row);
     });
+    updateSpSelCount();
   } catch (e) { handleSpErr(e); }
 }
 
 const fmtSize = (n) => !n ? "" : n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(0) + " KB" : (n / 1048576).toFixed(1) + " MB";
 
 async function doSharePointImport() {
-  const selections = [...spState.selected.values()];
-  if (!selections.length) return;
+  const entries = [...spState.selected.values()];
+  if (!entries.length) return;
   const autosync = $("#spAutoSync").checked;
-  const folderSel = selections.filter((s) => s.is_folder);
+  const folderSel = entries.filter((e) => e.is_folder);
   if (autosync && folderSel.length !== 1) {
     toast("Auto-sync needs exactly one folder selected", true); return;
+  }
+  // Folders import recursively; we only know immediate child counts client-side, so warn.
+  if (folderSel.length) {
+    const fileCount = entries.length - folderSel.length;
+    const known = folderSel.reduce((s, f) => s + (f.child_count || 0), 0);
+    const atLeast = fileCount + known;
+    if (!confirm(
+      `Importing ${fileCount} file(s) and ${folderSel.length} folder(s).\n\n` +
+      `Folders are imported recursively — that's at least ~${atLeast} file(s), and the true ` +
+      `total may be much larger (subfolders aren't counted here). This runs in the background. Continue?`))
+      return;
   }
   const dt = $("#spType").value || null, dept = $("#spDept").value || null;
   const btn = $("#spImport"); btn.disabled = true; btn.textContent = "Importing…";
@@ -639,16 +692,28 @@ async function doSharePointImport() {
       const f = folderSel[0];
       await api("/api/sharepoint/syncs", { method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ site_id: spState.site.id, site_name: spState.site.name,
-          drive_id: spState.drive.id, drive_name: spState.drive.name,
+          drive_id: f.drive_id, drive_name: f.drive_name,
           folder_id: f.id, folder_name: f.name, document_type: dt, department: dept }) });
     }
-    const res = await api("/api/sharepoint/import", { method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ drive_id: spState.drive.id, selections, source_id: "sp_import",
-        site_id: spState.site.id, site_name: spState.site.name, drive_name: spState.drive.name,
-        document_type: dt, department: dept }) });
-    toast(`Import queued${autosync ? " · auto-sync on" : ""} — processing in the background…`);
+    // Each import job is single-drive, so group the selection by drive → one job per library.
+    const byDrive = new Map();
+    for (const e of entries) {
+      if (!byDrive.has(e.drive_id)) byDrive.set(e.drive_id, { drive_name: e.drive_name, sels: [] });
+      byDrive.get(e.drive_id).sels.push({ id: e.id, name: e.name, is_folder: e.is_folder,
+        mime: e.mime, path: e.path, web_url: e.web_url, modified: e.modified });
+    }
+    let firstReq = null;
+    for (const [driveId, g] of byDrive) {
+      const res = await api("/api/sharepoint/import", { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ drive_id: driveId, selections: g.sels, source_id: "sp_import",
+          site_id: spState.site.id, site_name: spState.site.name, drive_name: g.drive_name,
+          document_type: dt, department: dept }) });
+      firstReq = firstReq || res.request_id;
+    }
+    toast(`Import queued${byDrive.size > 1 ? ` (${byDrive.size} libraries)` : ""}` +
+      `${autosync ? " · auto-sync on" : ""} — processing in the background…`);
     closeSharePoint();
-    pollImportJob(res.request_id);
+    pollImportJob(firstReq);
   } catch (e) {
     if (e.status === 401) handleSpErr(e);
     else toast("Import failed: " + e.message, true);
