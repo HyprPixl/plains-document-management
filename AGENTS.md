@@ -121,4 +121,22 @@ stdout — there is no error Delta table, by design, to match the sibling apps):
 **Logging gotcha:** the databricks SDK configures the **root logger on import**, so
 `logging.basicConfig(...)` is a silent no-op (your format is ignored). Attach a handler to your
 named logger directly with `propagate=False` — don't rely on `basicConfig`.
+
+## Time benchmarks / profiling (Phase 1 item DONE — commit 840ea9b)
+
+Instrumentation + a bench harness; the real baseline numbers are captured **on deploy** (needs the
+live warehouse + SSO), not offline.
+
+- `db.py`: `query()` is wrapped with `perf_counter`; any statement slower than `config.SLOW_QUERY_MS`
+  (env, default 1000ms; also in `app.yaml`) logs at WARNING via the `doc_hub.db` logger —
+  `slow query duration_ms=… sql=<snippet>` — same stdout format/`propagate=False` as app/job.
+  `execute()` routes through `query()`, so it's covered. **Return contract unchanged** (tests green).
+- `app.py`: `before_request` stamps `g.req_started`; `after_request` logs one INFO line per request,
+  `request complete — request_id=… method=… route=… user=… status=… duration_ms=…`.
+- `bench/bench.py`: stdlib-only (urllib) client-side latency bench for the hot endpoints
+  (`/api/stats`, `/api/documents`, `/api/search`, `/api/documents/<id>`). p50/p95/max over
+  configurable `-n`, `--base-url` (defaults to prod), bearer token via `--token`/`DOC_HUB_BENCH_TOKEN`
+  or raw `--header` (Databricks Apps SSO). Timestamped JSON+md land in `bench/results/` (gitignored).
+  **Run-on-deploy:** `DOC_HUB_BENCH_TOKEN=<tok> python bench/bench.py -n 30 --label pre-lakebase`.
+  Full instructions in `bench/README.md`. These are the baselines Phase 2/3 are measured against.
 </content>
