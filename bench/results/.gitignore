@@ -1,0 +1,4 @@
+# Bench output is generated on deploy — keep the dir, ignore the runs.
+*.json
+*.md
+!.gitignore

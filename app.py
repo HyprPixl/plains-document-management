@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import time
 import traceback
 import uuid
 
@@ -46,6 +47,7 @@ def _req_ctx() -> str:
 @app.before_request
 def _assign_request_id():
     g.request_id = "r_" + uuid.uuid4().hex[:12]
+    g.req_started = time.perf_counter()  # per-request wall-time baseline (see _log_response)
     # Best-effort user identity for logs; never let header parsing break the request.
     try:
         g.user_email = current_user()
@@ -55,6 +57,10 @@ def _assign_request_id():
 
 @app.after_request
 def _log_response(resp):
+    # Per-request timing: one INFO line per request with total wall-time, so hot endpoints
+    # can be profiled from the app log alongside db.py's slow-query lines (Phase 1 benches).
+    dur_ms = (time.perf_counter() - g.req_started) * 1000 if hasattr(g, "req_started") else -1
+    app.logger.info(f"request complete — {_req_ctx()} status={resp.status_code} duration_ms={dur_ms:.0f}")
     # Log every 4xx/5xx (not just 500s) so client errors are visible too. 5xx paths that
     # raised are already logged by the error handler; this catches handler-returned codes.
     if resp.status_code >= 400:

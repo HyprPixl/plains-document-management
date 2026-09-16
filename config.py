@@ -12,6 +12,11 @@ SQL_WAREHOUSE_ID = os.getenv("SQL_WAREHOUSE_ID", "4d7f25b1bd5fddf1")
 # (pattern from contract-explorer / contracts-ver). LOG_LEVEL tunes verbosity.
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
+# Per-statement timing in db.py logs any warehouse call slower than this (ms) at WARNING,
+# so slow queries surface in the app/job log. Baseline knob for the Phase 2/3 optimization
+# work — tune down to catch more, up to quiet a known-slow path.
+SLOW_QUERY_MS = int(os.getenv("SLOW_QUERY_MS", "1000"))
+
 # ai_query (batch inference) doesn't support the newest sonnet-5/opus-5 endpoints yet;
 # sonnet-4-5 is the current model that works with ai_query batch calls.
 EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "databricks-claude-sonnet-4-5")

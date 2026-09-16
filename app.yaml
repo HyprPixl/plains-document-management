@@ -12,6 +12,9 @@ env:
   # Structured logs go to stdout (captured by the Databricks App log). Raise to DEBUG to trace.
   - name: LOG_LEVEL
     value: "INFO"
+  # db.py logs any warehouse statement slower than this (ms) at WARNING — Phase 1 profiling.
+  - name: SLOW_QUERY_MS
+    value: "1000"
   - name: EXTRACT_MODEL
     value: "databricks-claude-sonnet-4-5"
   - name: PROMPT_VERSION
