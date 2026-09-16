@@ -55,9 +55,11 @@ function setSurface(name) {
   $$(".surface-tab").forEach((b) => b.classList.toggle("active", b.dataset.surface === name));
   $("#surface-manage").hidden = name !== "manage";
   $("#surface-explore").hidden = name !== "explore";
+  $("#surface-fields").hidden = name !== "fields";
   const path = "/" + name;
   if (location.pathname !== path) history.replaceState({}, "", path);
   if (name === "manage") loadManage();
+  else if (name === "fields") loadFieldDefs();
   else loadExploreFilters();
 }
 
@@ -70,6 +72,7 @@ async function init() {
   wireClassifyModal();
   wireExplore();
   wireSharePoint();
+  wireFields();
 
   // Paint the shell (with loading placeholders) immediately so the page never sits blank
   // while the warehouse resumes. Identity + taxonomy load in parallel and fill in after.
@@ -86,6 +89,7 @@ async function init() {
     const [me, tax] = await Promise.all([api("/api/me"), api("/api/taxonomy")]);
     state.me = me; state.taxonomy = tax;
     $("#userChip").textContent = me.email + (me.is_admin ? " · admin" : "");
+    $("#fieldsTab").hidden = !me.is_admin;  // Fields admin is for admins only
     if (state.surface === "explore") loadExploreFilters();  // refill filters now taxonomy is in
   } catch (e) { toast("Load failed: " + e.message, true); }
 }
@@ -400,10 +404,38 @@ function renderClassify(body, data) {
   body.append(el("div", { class: "section-label" }, "Tags"));
   body.append(renderTags(d.doc_id, data.tags || []));
 
+  // Preview of what extraction will pull for the chosen type — updates as the type changes.
+  const preview = el("div", { class: "extract-preview" });
+  body.append(el("div", { class: "section-label" }, "Fields to be extracted"), preview);
+  const loadPreview = async () => {
+    const dt = typeSel.value;
+    if (!dt) { preview.replaceChildren(el("div", { class: "muted small" },
+      "Pick a document type to see the fields that will be extracted.")); return; }
+    preview.replaceChildren(el("div", { class: "muted small" }, "Loading fields…"));
+    try {
+      const defs = await api("/api/field-defs?document_type=" + encodeURIComponent(dt));
+      renderExtractPreview(preview, defs);
+    } catch (e) { preview.replaceChildren(el("div", { class: "muted small" }, "Could not load fields.")); }
+  };
+  typeSel.addEventListener("change", loadPreview);
+  loadPreview();
+
   $("#drawerFoot").replaceChildren(
     el("button", { class: "btn primary",
       onclick: () => classifyOne(d.doc_id, typeSel.value || null, deptSel.value || null) },
       "Classify & queue extraction"));
+}
+function renderExtractPreview(container, defs) {
+  container.replaceChildren();
+  if (!defs.length) { container.append(el("div", { class: "muted small" }, "No fields defined.")); return; }
+  defs.forEach((f) => {
+    container.append(el("div", { class: "extract-field" },
+      el("div", { class: "ef-head" },
+        el("span", { class: "ef-label" }, f.label + (f.required_for_verify ? " *" : "")),
+        el("span", { class: "ef-type" }, f.data_type)),
+      f.extraction_prompt_hint
+        ? el("div", { class: "ef-hint muted small" }, f.extraction_prompt_hint) : null));
+  });
 }
 async function classifyOne(id, dt, dept) {
   if (!dt && !dept) { toast("Pick at least a type or department", true); return; }
@@ -832,6 +864,105 @@ async function pollImportJob(reqId, tries = 0) {
   } catch (e) { /* transient; keep polling */ }
   // Back off from 2s toward 10s; give up surfacing progress after ~10 min (work continues server-side).
   if (tries < 120) setTimeout(() => pollImportJob(reqId, tries + 1), Math.min(2000 + tries * 500, 10000));
+}
+
+// ─────────────────────────────────────────────── FIELDS (admin) ──
+const fieldState = { docTypes: [], editing: null };
+const TYPE_LABELS = { text: "Text", long_text: "Long text", date: "Date", currency: "Currency",
+  number: "Number", picklist: "Picklist", multi: "Multi-value", summary: "Summary" };
+
+function wireFields() {
+  $("#fieldAddBtn").addEventListener("click", () => openFieldModal(null));
+  $("#ffCancel").addEventListener("click", () => ($("#fieldScrim").hidden = true));
+  $("#ffSave").addEventListener("click", saveFieldDef);
+}
+
+async function loadFieldDefs() {
+  const list = $("#fieldDefsList");
+  list.replaceChildren(el("div", { class: "muted small" }, "Loading fields…"));
+  try {
+    const { fields, doc_types } = await api("/api/field-defs/all");
+    fieldState.docTypes = doc_types || [];
+    // Group by applies_to; "common" first, then each doc type in taxonomy order.
+    const groups = new Map([["common", []]]);
+    (doc_types || []).forEach((t) => groups.set(t, []));
+    fields.forEach((f) => { if (!groups.has(f.applies_to)) groups.set(f.applies_to, []); groups.get(f.applies_to).push(f); });
+    list.replaceChildren();
+    for (const [applies, defs] of groups) {
+      const title = applies === "common" ? "Common (all documents)" : applies;
+      const grp = el("div", { class: "fielddefs-group" }, el("h3", {}, title));
+      if (!defs.length) grp.append(el("div", { class: "muted small" }, "No specific fields — uses the common fields."));
+      defs.forEach((f) => grp.append(fieldDefRow(f)));
+      list.append(grp);
+    }
+  } catch (e) {
+    list.replaceChildren(el("div", { class: "muted small" },
+      e.status === 403 ? "Admin access required." : "Could not load fields: " + e.message));
+  }
+}
+
+function fieldDefRow(f) {
+  const meta = [`key: ${f.field_key}`, TYPE_LABELS[f.data_type] || f.data_type,
+    f.required_for_verify ? "required" : null].filter(Boolean).join(" · ");
+  return el("div", { class: "fielddef-row" },
+    el("div", { class: "fielddef-main" },
+      el("div", { class: "fielddef-name" }, f.label + (f.required_for_verify ? " *" : "")),
+      el("div", { class: "fielddef-meta" }, meta),
+      f.extraction_prompt_hint ? el("div", { class: "fielddef-hint" }, f.extraction_prompt_hint) : null),
+    el("div", { class: "fielddef-actions" },
+      el("button", { class: "btn small", onclick: () => openFieldModal(f) }, "Edit"),
+      el("button", { class: "btn small danger", onclick: () => deleteFieldDef(f) }, "Remove")));
+}
+
+function openFieldModal(f) {
+  fieldState.editing = f;
+  $("#fieldModalTitle").textContent = f ? "Edit field" : "Add field";
+  const applies = $("#ffApplies");
+  applies.replaceChildren(el("option", { value: "common" }, "Common (all documents)"));
+  fieldState.docTypes.forEach((t) => applies.append(el("option", { value: t }, t)));
+  applies.value = f ? f.applies_to : "common";
+  $("#ffKey").value = f ? f.field_key : "";
+  $("#ffKey").disabled = !!f;  // key is the identity; don't rename in place
+  $("#ffLabel").value = f ? f.label : "";
+  $("#ffType").value = f ? f.data_type : "text";
+  $("#ffHint").value = f ? (f.extraction_prompt_hint || "") : "";
+  $("#ffOptions").value = f ? (f.picklist_source || "") : "";
+  $("#ffRequired").checked = f ? !!f.required_for_verify : false;
+  $("#fieldScrim").hidden = false;
+}
+
+async function saveFieldDef() {
+  const key = $("#ffKey").value.trim();
+  const label = $("#ffLabel").value.trim();
+  if (!label) { toast("Label is required", true); return; }
+  const body = {
+    label, applies_to: $("#ffApplies").value, data_type: $("#ffType").value,
+    extraction_prompt_hint: $("#ffHint").value.trim() || null,
+    picklist_source: $("#ffType").value === "picklist" ? ($("#ffOptions").value.trim() || null) : null,
+    required_for_verify: $("#ffRequired").checked,
+  };
+  try {
+    if (fieldState.editing) {
+      await api("/api/field-defs/" + encodeURIComponent(fieldState.editing.field_key),
+        { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    } else {
+      if (!key) { toast("Field key is required", true); return; }
+      body.field_key = key;
+      await api("/api/field-defs", { method: "POST",
+        headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    }
+    $("#fieldScrim").hidden = true;
+    toast("Field saved");
+    loadFieldDefs();
+  } catch (e) { toast("Failed: " + e.message, true); }
+}
+
+async function deleteFieldDef(f) {
+  if (!confirm(`Remove the "${f.label}" field? Documents already extracted keep their values.`)) return;
+  try {
+    await api("/api/field-defs/" + encodeURIComponent(f.field_key), { method: "DELETE" });
+    toast("Field removed"); loadFieldDefs();
+  } catch (e) { toast("Failed: " + e.message, true); }
 }
 
 document.addEventListener("DOMContentLoaded", init);

@@ -269,6 +269,31 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #cfe0f5; border-c
 .tag-x { border: none; background: none; cursor: pointer; color: var(--muted);
   font-size: 11px; line-height: 1; padding: 0; }
 .tag-x:hover { color: var(--warn); }
+/* ── Extraction field preview (classify panel) ── */
+.extract-preview { display: flex; flex-direction: column; gap: 8px; }
+.extract-field { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--bg); }
+.ef-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ef-label { font-weight: 600; font-size: 13px; }
+.ef-type { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .3px; }
+.ef-hint { margin-top: 3px; }
+
+/* ── Fields admin screen ── */
+.fielddefs-group { margin-bottom: 22px; }
+.fielddefs-group h3 { font-size: 15px; margin: 0 0 4px; }
+.fielddef-row { display: flex; align-items: flex-start; gap: 12px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; background: var(--panel); }
+.fielddef-main { flex: 1; min-width: 0; }
+.fielddef-name { font-weight: 600; }
+.fielddef-meta { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.fielddef-hint { font-size: 13px; color: var(--ink); margin-top: 5px; }
+.fielddef-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.field-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.field-form-grid .full { grid-column: 1 / -1; }
+.field-form-grid label { display: block; font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+.field-form-grid input, .field-form-grid select, .field-form-grid textarea { width: 100%; }
+.field-check { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }
+.field-check input { width: auto; }
+
 .loc { display: inline-block; max-width: 260px; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; vertical-align: bottom; }
 .rc-path { margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

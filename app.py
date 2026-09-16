@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import uuid
 
 from flask import Flask, Response, jsonify, request, send_file, render_template
@@ -104,13 +105,96 @@ def api_field_defs():
     where += ")"
     rows = query(
         f"SELECT field_key, label, data_type, applies_to, picklist_source, "
-        f"required_for_verify, sort_order FROM {config.FIELD_DEFS} WHERE {where} "
+        f"extraction_prompt_hint, required_for_verify, sort_order FROM {config.FIELD_DEFS} WHERE {where} "
         f"ORDER BY (applies_to = 'common') DESC, sort_order"
     )
     for r in rows:
         if r.get("picklist_source") and "|" in str(r["picklist_source"]):
             r["options"] = str(r["picklist_source"]).split("|")
     return jsonify(rows)
+
+
+# ──────────────────────────────────────────────── field-def management (admin) ──
+
+@app.get("/api/field-defs/all")
+def api_field_defs_all():
+    """Every active field def, grouped by what it applies to — for the Fields admin screen."""
+    rows = query(
+        f"SELECT field_key, label, data_type, applies_to, picklist_source, "
+        f"extraction_prompt_hint, required_for_verify, sort_order FROM {config.FIELD_DEFS} "
+        f"WHERE active = true ORDER BY (applies_to = 'common') DESC, applies_to, sort_order"
+    )
+    doc_types = [r["value"] for r in query(
+        f"SELECT value FROM {config.TAXONOMY} WHERE category = 'document_type' AND active = true "
+        f"ORDER BY sort_order")]
+    return jsonify(fields=rows, doc_types=doc_types)
+
+
+def _require_admin(email):
+    is_admin, _, _ = get_perms(email)
+    return is_admin
+
+
+@app.post("/api/field-defs")
+def api_field_def_create():
+    email = current_user()
+    if not _require_admin(email):
+        return jsonify(error="forbidden"), 403
+    b = request.get_json(force=True)
+    key = (b.get("field_key") or "").strip()
+    label = (b.get("label") or "").strip()
+    applies_to = (b.get("applies_to") or "common").strip()
+    if not key or not label:
+        return jsonify(error="field_key and label required"), 400
+    if not re.fullmatch(r"[a-z0-9_]+", key):
+        return jsonify(error="field_key must be lowercase letters, numbers, and underscores"), 400
+    exists = query(f"SELECT 1 FROM {config.FIELD_DEFS} WHERE field_key = {lit(key)} AND active = true LIMIT 1")
+    if exists:
+        return jsonify(error="a field with that key already exists"), 409
+    order = b.get("sort_order")
+    if order is None:
+        mx = query(f"SELECT max(sort_order) AS m FROM {config.FIELD_DEFS} "
+                   f"WHERE applies_to = {lit(applies_to)} AND active = true")
+        order = int((mx[0].get("m") or 0)) + 1 if mx else 1
+    execute(
+        f"INSERT INTO {config.FIELD_DEFS} (field_key, label, data_type, applies_to, picklist_source, "
+        f"extraction_prompt_hint, required_for_verify, sort_order, active, created_by, updated_at) VALUES ("
+        f"{lit(key)}, {lit(label)}, {lit(b.get('data_type') or 'text')}, {lit(applies_to)}, "
+        f"{lit(b.get('picklist_source'))}, {lit(b.get('extraction_prompt_hint'))}, "
+        f"{lit(bool(b.get('required_for_verify')))}, {int(order)}, true, {lit(email)}, current_timestamp())"
+    )
+    _audit(email, "field_def_create", key, b)
+    return jsonify(ok=True, field_key=key)
+
+
+@app.put("/api/field-defs/<field_key>")
+def api_field_def_update(field_key):
+    email = current_user()
+    if not _require_admin(email):
+        return jsonify(error="forbidden"), 403
+    b = request.get_json(force=True)
+    sets = ["updated_at = current_timestamp()"]
+    for col in ("label", "data_type", "applies_to", "picklist_source", "extraction_prompt_hint"):
+        if col in b:
+            sets.append(f"{col} = {lit(b[col])}")
+    if "required_for_verify" in b:
+        sets.append(f"required_for_verify = {lit(bool(b['required_for_verify']))}")
+    if "sort_order" in b and b["sort_order"] is not None:
+        sets.append(f"sort_order = {int(b['sort_order'])}")
+    execute(f"UPDATE {config.FIELD_DEFS} SET {', '.join(sets)} WHERE field_key = {lit(field_key)}")
+    _audit(email, "field_def_update", field_key, b)
+    return jsonify(ok=True)
+
+
+@app.delete("/api/field-defs/<field_key>")
+def api_field_def_delete(field_key):
+    email = current_user()
+    if not _require_admin(email):
+        return jsonify(error="forbidden"), 403
+    execute(f"UPDATE {config.FIELD_DEFS} SET active = false, updated_at = current_timestamp() "
+            f"WHERE field_key = {lit(field_key)}")
+    _audit(email, "field_def_delete", field_key, None)
+    return jsonify(ok=True)
 
 
 # ──────────────────────────────────────────────────────────── upload + dedup ──
