@@ -2,7 +2,7 @@
 
 Living checklist for building Document Hub. See `SPEC.md` for the design.
 
-## ▶ Model revision — SharePoint as the spine (2026-09-16) — PLANNED
+## ▶ Model revision — SharePoint as the spine (2026-09-16) — IN PROGRESS
 
 Supersedes the Business-Unit-centric model in SPEC §6/§14. Decisions locked with the user:
 
@@ -39,14 +39,18 @@ Supersedes the Business-Unit-centric model in SPEC §6/§14. Decisions locked wi
 
 ### Work breakdown
 **Not blocked — can build now (read side + tags + path search + site-scoped read perms):**
-- [ ] Schema: add doc SP-location columns, `document_tags`, swap `permissions` column, drop BU
-      taxonomy rows.
-- [ ] Import: capture + store `sp_site_id/name`, `sp_drive_id`, `sp_path`, `sp_web_url` on every
-      registered doc (both queued import and delegated sync). Backfill existing docs from
-      `source_ref` via Graph (site + path resolution).
-- [ ] Permissions: `perms_where` on `sp_site_id`; site-membership capture on connect/refresh.
-- [ ] Explore: path breadcrumb facet + path in full-text search; remove BU facet.
-- [ ] Tags: add/remove UI on a doc; "has tag" filter; drop BU picker from classify/upload.
+- [x] Schema: add doc SP-location columns, `document_tags`, swap `permissions` column
+      (`allowed_site`), drop BU taxonomy rows. (applied via MCP)
+- [x] Import: capture + store `sp_site_id/name`, `sp_drive_id`, `sp_path`, `sp_web_url` on every
+      registered doc (both queued import and delegated sync). — code done (ef76b17)
+  - [ ] Backfill existing docs' SP-location from `source_ref` (drive_id/item_id) via Graph
+        (needs a delegated token; run on the job/databricks).
+- [x] Permissions: `perms_where` on `sp_site_id`; `/api/me` returns `allowed_sites`. (ef76b17)
+  - [ ] Site-membership capture into `permissions.allowed_site` on connect/refresh (perms_where
+        depends on it; inert today since only caleb=ADMIN).
+- [x] Explore: path in full-text search + path prefix filter; BU facet removed. (ef76b17)
+- [x] Tags: add/remove UI in drawer; "has tag" filter in Explore; BU picker dropped from
+      classify + SharePoint import. (ef76b17)
 
 **Blocked on write scopes (upload → SharePoint):**
 - [ ] **External:** expand delegated scopes to `Files.ReadWrite.All` / `Sites.ReadWrite.All` →
