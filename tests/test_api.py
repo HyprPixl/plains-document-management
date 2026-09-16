@@ -165,6 +165,58 @@ def test_documents_no_perms_sees_nothing(client, fake_db):
     assert any("1=1 AND 1=0" in s for s in fake_db.queried_matching("LIMIT 500"))
 
 
+# ── per-request permission caching (BASELINE.md: perms_where fired 2-3x/page) ─
+def test_perms_lookup_issued_once_per_request(client, fake_db):
+    """PIN: /api/stats calls perms_where twice, but the single-row permission lookup
+    must hit the warehouse exactly once — memoized on flask.g for the request's life."""
+    fake_db.responder = route([(PERMS, FULL)], default=[])
+    r = client.get("/api/stats")
+    assert r.status_code == 200
+    assert len(fake_db.queried_matching(PERMS)) == 1
+
+
+def test_perms_cache_does_not_leak_between_requests(client, fake_db):
+    """Each request re-resolves perms (g is per-request) — two requests, two lookups."""
+    fake_db.responder = route([(PERMS, FULL)], default=[])
+    client.get("/api/stats")
+    client.get("/api/stats")
+    assert len(fake_db.queried_matching(PERMS)) == 2
+
+
+# ── single-document endpoint (fewer round-trips, same JSON shape) ─────────────
+def test_document_fetches_fields_and_defs_in_one_join(client, fake_db):
+    """PIN: defs + this doc's field values come back in a single LEFT JOIN (one fewer
+    warehouse round-trip), and the JSON shape the drawer expects is unchanged."""
+    DOCS = __import__("config").DOCUMENTS
+    FIELDS = __import__("config").DOCUMENT_FIELDS
+    doc_row = {"doc_id": "d1", "document_type": "Invoice"}
+    def_row = {"field_key": "title", "label": "Title", "data_type": "string",
+               "picklist_source": "a|b", "required_for_verify": True, "applies_to": "common",
+               "sort_order": 1, "proposed_value": "AI val", "confirmed_value": None,
+               "source_provenance": "ai"}
+    fake_db.responder = route([
+        ("SELECT * FROM " + DOCS, [doc_row]),
+        ("LEFT JOIN", [def_row]),
+        ("l.relationship", []),
+        ("SELECT tag", [{"tag": "alpha"}]),
+    ], default=[])
+    r = client.get("/api/documents/d1")
+    assert r.status_code == 200
+    body = r.get_json()
+    # JSON shape unchanged: document / fields / links / tags
+    assert body["document"] == doc_row
+    assert body["tags"] == ["alpha"]
+    fld = body["fields"][0]
+    assert fld["field_key"] == "title"
+    assert fld["proposed_value"] == "AI val"          # value carried by the JOIN, not a 2nd query
+    assert fld["confirmed_value"] is None
+    assert fld["source_provenance"] == "ai"
+    assert fld["options"] == ["a", "b"]               # picklist still split
+    # document_fields is touched exactly once, and only via the JOIN (no standalone fetch)
+    dfq = fake_db.queried_matching(FIELDS)
+    assert len(dfq) == 1 and "LEFT JOIN" in dfq[0]
+
+
 # ── field-def CRUD ───────────────────────────────────────────────────────────
 def test_field_def_create_happy_path(client, fake_db):
     fake_db.responder = route([

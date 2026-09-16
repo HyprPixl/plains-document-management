@@ -102,18 +102,39 @@ def get_perms(email: str):
 
     Access is scoped to the SharePoint *sites* a user can reach (site-level mirror). FULL /
     ADMIN see everything; otherwise a user sees docs whose sp_site_id is in allowed_sites.
+
+    The permission row is a single-row warehouse lookup that costs ~1.2s of fixed
+    Statement Execution API latency (see bench/BASELINE.md), yet perms_where() runs it 2-3x
+    per page. Memoize the result on flask.g so it's fetched **once per request** and reused;
+    g is per-request scope, so nothing leaks between requests. Outside a request context
+    (some unit tests call this directly) we skip the cache and query straight through.
     """
+    key = (email or "").lower()
+    try:
+        cache = g._perms_cache
+    except (RuntimeError, AttributeError):
+        try:
+            cache = g._perms_cache = {}
+        except RuntimeError:
+            cache = None  # no request context — don't memoize
+    if cache is not None and key in cache:
+        return cache[key]
+
     rows = query(
         f"SELECT access_type, allowed_site FROM {config.PERMISSIONS} "
         f"WHERE lower(email) = {lit(email)}"
     )
     if not rows:
-        return (False, False, [])
-    types = {(r["access_type"] or "").upper() for r in rows}
-    is_admin = "ADMIN" in types
-    is_full = is_admin or "FULL" in types
-    allowed = [r["allowed_site"] for r in rows if r.get("allowed_site")]
-    return (is_admin, is_full, allowed)
+        result = (False, False, [])
+    else:
+        types = {(r["access_type"] or "").upper() for r in rows}
+        is_admin = "ADMIN" in types
+        is_full = is_admin or "FULL" in types
+        allowed = [r["allowed_site"] for r in rows if r.get("allowed_site")]
+        result = (is_admin, is_full, allowed)
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 def perms_where(email: str, col: str = "sp_site_id") -> str:
@@ -553,22 +574,22 @@ def api_document(doc_id):
     if not docs:
         return jsonify(error="not found"), 404
     doc = docs[0]
-    fields = query(
-        f"SELECT field_key, proposed_value, confirmed_value, source_provenance, confidence "
-        f"FROM {config.DOCUMENT_FIELDS} WHERE doc_id = {lit(doc_id)}"
-    )
+    # Field defs + this doc's field values in one round-trip: the drawer is driven by the
+    # defs list (each def carries its proposed/confirmed/provenance), so a LEFT JOIN of
+    # field_defs -> document_fields yields exactly what the Python merge used to build from
+    # two serial queries — one fewer Statement Execution round-trip (see bench/BASELINE.md).
     defs = query(
-        f"SELECT field_key, label, data_type, picklist_source, required_for_verify, applies_to, sort_order "
-        f"FROM {config.FIELD_DEFS} WHERE active = true AND "
-        f"(applies_to = 'common' OR applies_to = {lit(doc.get('document_type'))}) "
-        f"ORDER BY (applies_to='common') DESC, sort_order"
+        f"SELECT fd.field_key, fd.label, fd.data_type, fd.picklist_source, fd.required_for_verify, "
+        f"fd.applies_to, fd.sort_order, "
+        f"df.proposed_value, df.confirmed_value, df.source_provenance "
+        f"FROM {config.FIELD_DEFS} fd "
+        f"LEFT JOIN {config.DOCUMENT_FIELDS} df "
+        f"  ON df.field_key = fd.field_key AND df.doc_id = {lit(doc_id)} "
+        f"WHERE fd.active = true AND "
+        f"(fd.applies_to = 'common' OR fd.applies_to = {lit(doc.get('document_type'))}) "
+        f"ORDER BY (fd.applies_to='common') DESC, fd.sort_order"
     )
-    fmap = {f["field_key"]: f for f in fields}
     for d in defs:
-        cur = fmap.get(d["field_key"], {})
-        d["proposed_value"] = cur.get("proposed_value")
-        d["confirmed_value"] = cur.get("confirmed_value")
-        d["source_provenance"] = cur.get("source_provenance")
         if d.get("picklist_source") and "|" in str(d["picklist_source"]):
             d["options"] = str(d["picklist_source"]).split("|")
     links = query(
