@@ -146,4 +146,75 @@ live warehouse + SSO), not offline.
   Triggered by the **"Run benchmark"** button in the admin Fields panel ("Modify fields" → header);
   renders the table + a Copy JSON affordance. Read-only (no writes/ai_query). This measures the
   warehouse round-trip the Lakebase migration is measured against, without CLI/token juggling.
+
+## Phase 2 — Lakebase migration (NEXT, not started — full brief for the fresh agent)
+
+**Goal:** kill the Statement-Execution round-trip tax (see `bench/BASELINE.md`: single-row
+permission lookup **~1300 ms**, fired 2–3×/page; 4-query document fetch **~1900 ms p50**). Lakebase
+is Databricks-managed Postgres (single-digit-ms round trips) → expected **10–100×** on the hot path.
+
+### What's already true (unblocks the work)
+- The app now has a **DB resource binding**: `Database plains-lakebase / databricks_postgres`,
+  permission **"Can connect and create"**, resource key `database`. On a Databricks App this injects
+  env `PGHOST / PGDATABASE / PGUSER / PGPORT` (and a `PGPASSWORD`) for the app SP.
+- Instance: `ep-flat-moon-ee1bjbvj.database.westus2.azuredatabricks.net`, DB `databricks_postgres`,
+  Postgres **17.11**. Probed live: app SP has CREATE rights.
+- ⚠️ **SHARED instance.** `dbx-deal-capture-app` owns this exact endpoint and writes `deals` /
+  `deal_log` etc. into `public`. **Document Hub MUST use its own `document_hub` schema** — never
+  touch `public`. `CREATE SCHEMA IF NOT EXISTS document_hub` on bootstrap.
+
+### Connection recipe (proven in sibling apps, in this workspace)
+- **Pattern A — `dbx-deal-capture-app/` (RECOMMENDED, same instance we're on):** `psycopg2-binary`
+  (no version pin). Reads `PGHOST/PGDATABASE/PGUSER/PGPORT` from env; **password = a freshly minted
+  OAuth token**, not a static secret. `_get_sp_token()` POSTs `{DATABRICKS_HOST}/oidc/v1/token` with
+  `grant_type=client_credentials, scope=all-apis`, HTTP-basic `(DATABRICKS_CLIENT_ID,
+  DATABRICKS_CLIENT_SECRET)` — all three are auto-injected to the app SP on a Databricks App. Caches
+  the token in a module dict + lock with a 60s early-refresh margin. Connect with
+  `psycopg2.connect(host,dbname,port,user,password=token,sslmode="require",connect_timeout=10)`,
+  `autocommit=True`. Thread-local single connection (`_tls`) wrapped so `.close()` is a **no-op**;
+  recreated on credential change / closed conn. Tables guarded by a `_tables_ready` flag +
+  `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`.
+- **Pattern B — `conman/` (simpler, different endpoint):** static `PG_USER`/`PG_PASSWORD` app
+  secrets, 55-min connection recycle (`_PG_CONN_TTL=3300`), retry-once-on-`OperationalError`. No
+  token minting. Simpler but needs provisioned secrets and doesn't rotate cleanly.
+- `contract-explorer` / `contracts-ver` / `plains-nexus` have **no Postgres** — warehouse only. Don't
+  look to them for a Lakebase pattern.
+- **Recommendation:** Pattern A. It matches the app we share the instance with, needs no new secrets
+  (uses the SP identity already present), and rotates tokens correctly for a long-running gunicorn
+  worker. (The injected `PGPASSWORD` is a viable shortcut but isn't refreshed in-process, so a
+  long-lived worker can see it expire — that's exactly why deal-capture mints its own.)
+
+### Build sequence (thin slice first — prove the win before a broad migration)
+1. **`lakebase.py`** — new module implementing Pattern A: `pg_query(sql, params)` /
+   `pg_execute(sql, params)` returning `list[dict]` (RealDictCursor), thread-local no-op-close conn,
+   token minting + cache, `SCHEMA = "document_hub"` bootstrap. **Add a `LAKEBASE_TOKEN` env override**
+   for the connection password so it can be tested locally with a transient personal token (the app's
+   real auth path mints its own). **Offline/local + tests: if `PGHOST` is unset, the module must be
+   inert** and callers fall back to the warehouse — the 97-test offline suite MUST stay green and the
+   modules must stay import-safe under `conftest`'s stubs.
+2. `requirements.txt` += `psycopg2-binary`; `app.yaml` declare the `database` resource
+   (`- name: ... valueFrom: database`) + any `LAKEBASE_*` / feature-flag envs. Confirm the exact
+   app.yaml resource syntax against `dbx-deal-capture-app/app.yaml`.
+3. **Thin slice = `permissions`** (biggest per-request win — it's on every page, 2–3×). Create
+   `document_hub.permissions`, **one-time backfill from the warehouse `permissions` table** if the PG
+   table is empty, then point `get_perms()` reads (in `app.py`, already `g`-cached) at Lakebase behind
+   a feature flag (`USE_LAKEBASE_PERMISSIONS`, default on when `PGHOST` present, else warehouse).
+   **Dual-write** permission changes (`sp.sync_user_sites`, any admin grant) to BOTH stores so
+   rollback stays safe and nothing else that reads the warehouse table breaks.
+4. Measure via the **"Run benchmark"** admin button / `POST /api/admin/bench` and compare to
+   `bench/BASELINE.md`. Only after the permission slice proves out, migrate `documents` +
+   `document_fields` reads the same way.
+
+### 🔒 Security constraint (non-negotiable)
+The user shared a **1-hour personal Postgres token** for transient probing only. It is a personal
+credential — **NEVER write it to any file, `app.yaml`, commit, or log.** The app's production auth is
+the SP DB-resource binding (Pattern A token minting), never a pasted token. Use `LAKEBASE_TOKEN` only
+as an ephemeral shell env for local probing, then discard.
+
+### Watch-outs
+- `psycopg2` uses real params (`%s`) — do NOT reuse `db.lit()` string-interpolation; use parameterized
+  queries. Postgres returns real types (no STRING-coercion gotcha), but JSON array columns still hold
+  `json.dumps`'d strings by our own convention (see gotcha #4).
+- Keep the warehouse `db.py` path intact during migration — Lakebase is additive/behind a flag until
+  each slice is proven. Don't rip out warehouse reads.
 </content>
