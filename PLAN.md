@@ -2,6 +2,64 @@
 
 Living checklist for building Document Hub. See `SPEC.md` for the design.
 
+## ▶ Model revision — SharePoint as the spine (2026-09-16) — PLANNED
+
+Supersedes the Business-Unit-centric model in SPEC §6/§14. Decisions locked with the user:
+
+1. **Drop Business Unit** entirely (facet + permission scope). Already removed `Engineering`
+   from BU (now a Department); the rest of the BU dimension goes too.
+2. **Every document lives at a SharePoint location.** Imported docs already do; **uploads now
+   write back to a SharePoint destination** (chosen at upload, or a configured default) before
+   registering. One rule, no exceptions: a doc = bytes at a SharePoint site/library/folder.
+3. **Permissions mirror SharePoint at the *site* level.** You can see a doc in the app iff you
+   can access the SharePoint **site** it lives in. (Library/folder grain is a later phase.)
+4. **Source path is first-class:** store the human-readable site/library/folder path per doc and
+   make it searchable + a breadcrumb filter in Explore.
+5. **Custom grouping = freeform tags** (many per doc, ad hoc) — the flexible replacement for BU.
+
+### Schema deltas
+- `documents`: add `sp_site_id`, `sp_site_name`, `sp_drive_id` (library), `sp_path`
+  (human folder path incl. filename), `sp_web_url` (link back). `source_ref` keeps
+  `drive_id/item_id`; these make site/path first-class + queryable. Retire `business_unit`
+  (stop writing it; drop the column in a later cleanup).
+- New `document_tags` (`doc_id`, `tag`, `created_by`, `created_at`) — one row per tag; filter
+  is "has tag X". Simple to index and multi-select.
+- `permissions`: replace `allowed_business_unit` → `allowed_site_id` (keep `FULL`/`ADMIN`).
+- `taxonomy`: delete the `business_unit` rows (Department + Document Type remain).
+
+### Permission model (site-scoped)
+- `perms_where()` scopes every Explore/Manage query on `sp_site_id` instead of `business_unit`;
+  `FULL`/`ADMIN` unrestricted.
+- **How we learn a user's sites (the elegant part):** a user's *own* delegated browse already
+  reveals exactly which sites they can access (`sp.list_sites` returns only visible sites). On
+  connect + on a refresh cadence, capture that set into `permissions` as `allowed_site_id` rows.
+  No manual grant table to maintain; it mirrors SharePoint by construction.
+- App-uploaded docs inherit the ACL of the site they're written to (uploader must have write
+  access there, enforced by the delegated write).
+
+### Work breakdown
+**Not blocked — can build now (read side + tags + path search + site-scoped read perms):**
+- [ ] Schema: add doc SP-location columns, `document_tags`, swap `permissions` column, drop BU
+      taxonomy rows.
+- [ ] Import: capture + store `sp_site_id/name`, `sp_drive_id`, `sp_path`, `sp_web_url` on every
+      registered doc (both queued import and delegated sync). Backfill existing docs from
+      `source_ref` via Graph (site + path resolution).
+- [ ] Permissions: `perms_where` on `sp_site_id`; site-membership capture on connect/refresh.
+- [ ] Explore: path breadcrumb facet + path in full-text search; remove BU facet.
+- [ ] Tags: add/remove UI on a doc; "has tag" filter; drop BU picker from classify/upload.
+
+**Blocked on write scopes (upload → SharePoint):**
+- [ ] **External:** expand delegated scopes to `Files.ReadWrite.All` / `Sites.ReadWrite.All` →
+      **admin re-consent** on plains-nexus + users reconnect. (Same class of blocker as the
+      redirect-URI registration.)
+- [ ] Upload flow: destination picker (reuse the SharePoint browser modal) or configured default
+      drop location; Graph upload of bytes; then register with the SP location.
+
+### Sequencing note
+Build the not-blocked slice first (it stands alone and makes the app coherent without BU). The
+upload-write-back piece lands after write-scope consent — until then, uploads can be disabled or
+kept local with a "destination required" notice.
+
 ## Databricks backend — DONE (2026-09-15)
 
 Created in `product_dev.document_hub` (warehouse `4d7f25b1bd5fddf1`):
@@ -112,6 +170,33 @@ plains-nexus app registration (no new secret to provision).
       Unpause the job (or run-now) once there are classified docs or armed syncs to process.
       Re-enable `sources.land_records` + re-add `--sweep` only if a full connected-source
       pull is ever wanted.
+
+## Bulk SharePoint import moved off the web request — DONE (code) (2026-09-15)
+
+Symptom: importing ~50 docs from SharePoint classified a few then died — gunicorn
+`WORKER TIMEOUT` (`--timeout 120`) aborted the worker mid-batch. Root cause: the
+`/api/sharepoint/import` route downloaded + registered every selected file inline
+(Graph download + 3 warehouse round trips each, serial) inside the request. Fix keeps
+the doctrine "heavy work off the web app":
+
+- [x] New `import_jobs` queue table (created in `product_dev.document_hub`).
+- [x] `sharepoint.enqueue_import()` / `import_job_status()` / `recent_import_jobs()`.
+- [x] Route now enqueues + returns `{request_id, queued}` instantly; new
+      `GET /api/sharepoint/import/<id>` status endpoint.
+- [x] `processing/job.py` `process_imports()` + `_run_import()`: lease-claimed (like
+      `sync_delegated`), walks folders, downloads + registers with progress counters,
+      SHA-256 dedup → re-entrant/resumable. Wired into `run_once` (runs every pass).
+- [x] Frontend enqueues then polls status (`pollImportJob`), refreshing the Manage queue
+      as docs land.
+- [x] App best-effort triggers a job run on enqueue (`_trigger_processing_run`,
+      `PROCESSING_JOB_ID=607689951574858` in `app.yaml`) so imports don't wait for the
+      (paused) schedule.
+- [x] App SP granted **Can manage and run** on job `document-hub-processing` (resource
+      key `job`) — the enqueue auto-trigger now fires instead of no-op'ing.
+- [ ] **User: redeploy the app** from latest `main` (carries this fix) and **run-now /
+      unpause** the job to drain the queue.
+- [ ] End-to-end: queue a ~50-doc import → confirm it completes off-request and docs
+      appear in the Manage queue.
 
 ## What can be tested now vs. later
 

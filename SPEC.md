@@ -334,26 +334,31 @@ they select the extraction schema), and **AI-extracted fields** (everything else
 
 ### 6.1 Preset categories (human-selected, stored on `documents`)
 
+> **Superseded (2026-09-16):** Business Unit is dropped; org grouping is now **freeform tags**
+> and documents are organized by their **SharePoint location** (searchable path). See
+> "Model revision — SharePoint as the spine" in `PLAN.md`. Department + Document Type remain.
+
 Chosen to match Plains (midstream oil & gas) and general document-management norms.
 All three are editable option sets in the `taxonomy` table.
 
-1. **Business Unit** — *who owns it.* e.g. `Crude Oil`, `NGL`, `Canada`, `Corporate`,
-   `Transportation`, `Facilities`, `Engineering`. (Aligns with `contract-explorer`'s
-   BU-based model.)
+1. **Business Unit** — *who owns it* (the line of business / asset side). e.g. `Crude Oil`,
+   `NGL`, `Canada`, `Corporate`, `Transportation`, `Facilities`. (Aligns with
+   `contract-explorer`'s BU-based model.) *Engineering is a **Department**, not a BU — it's a
+   function that supports every business unit.*
 2. **Document Type** — *what it is.* **This is the schema driver.** Starter set:
    `Contract / Agreement`, `Amendment`, `Invoice`, `Purchase Order`,
    `Land / Right-of-Way`, `Permit / Regulatory`, `Inspection / Integrity Report`,
    `Financial Statement`, `Insurance / Certificate`, `HR / Personnel`,
    `Policy / Procedure`, `Correspondence`, `Project (Engineering)`, `Other`.
 
-   Some Document Types are **specific to a Business Unit** (e.g. `Project (Engineering)`
-   belongs under the **Engineering** BU). The taxonomy supports an optional
-   `business_unit` scope on a Document Type so the type list can filter by the selected BU,
-   while field schemas remain keyed on Document Type in `field_defs`.
-3. **Department / Function** — *who works it.* `Commercial`, `Operations`, `Land`,
-   `Legal`, `Finance`, `Accounting`, `HSE`, `HR`, `IS` (Information Services),
-   `Regulatory`. (Finance and Accounting are **separate**; the IT department is called
-   **IS**.)
+   The taxonomy supports an optional `business_unit` scope on a Document Type so the type
+   list can filter by the selected BU, while field schemas remain keyed on Document Type in
+   `field_defs`. (`Project (Engineering)` is a document *type* — its name reflects the
+   Engineering **Department**, and it is not BU-scoped.)
+3. **Department / Function** — *who works it* (the internal team). `Commercial`,
+   `Operations`, `Land`, `Legal`, `Finance`, `Accounting`, `HSE`, `HR`, `IS`
+   (Information Services), `Regulatory`, `Engineering`. (Finance and Accounting are
+   **separate**; the IT department is called **IS**.)
 
 **Sensitivity is an optional field, not a preset.** `Public / Internal / Confidential /
 Restricted`, defined per Document Type in `field_defs` (AI can suggest per 6.2, human
@@ -710,6 +715,10 @@ The mirror is a claim-based worker over a `mirror` queue (per §4A):
 ---
 
 ## 14. Permissions
+
+> **Revised (2026-09-16):** v1 scope is now the **SharePoint site** a doc lives in (`allowed_site_id`),
+> mirrored by capturing each user's visible sites from their delegated browse — not a manual
+> `allowed_business_unit` table. See "Model revision — SharePoint as the spine" in `PLAN.md`.
 
 Goal: **mirror SharePoint permissions where possible**, degrade gracefully where not.
 
