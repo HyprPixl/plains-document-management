@@ -129,8 +129,12 @@ def get_perms(email: str):
     if config.USE_LAKEBASE_PERMISSIONS and lakebase.enabled():
         try:
             rows = lakebase.read_permissions(email)
-        except Exception:
-            app.logger.warning(f"lakebase perms read failed, falling back to warehouse — {_req_ctx()}")
+        except Exception as e:
+            try:
+                ctx = _req_ctx()
+            except Exception:
+                ctx = "no-request-context"
+            app.logger.warning(f"lakebase perms read failed ({e!r}), falling back to warehouse — {ctx}")
             rows = None
     if rows is None:
         rows = query(
