@@ -8,7 +8,7 @@ FQ = f"{CATALOG}.{SCHEMA}"  # fully-qualified schema prefix
 DOCS_VOLUME = os.getenv("DOCS_VOLUME", f"/Volumes/{CATALOG}/{SCHEMA}/docs")
 SQL_WAREHOUSE_ID = os.getenv("SQL_WAREHOUSE_ID", "4d7f25b1bd5fddf1")
 
-EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "databricks-claude-sonnet-4")
+EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "databricks-claude-sonnet-5")
 PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v1")
 
 # Processing job / external services (used by processing/*, not the web app)
