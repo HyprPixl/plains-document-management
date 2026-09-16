@@ -326,6 +326,15 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #cfe0f5; border-c
 .field-check { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }
 .field-check input { width: auto; }
 
+.bench-result { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px;
+  margin-bottom: 18px; background: var(--panel); }
+.bench-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.bench-table { width: 100%; border-collapse: collapse; margin-bottom: 6px; }
+.bench-table th { text-align: right; font-size: 12px; color: var(--muted); padding: 4px 10px; border-bottom: 1px solid var(--line); }
+.bench-table th:first-child { text-align: left; }
+.bench-table td { text-align: right; font-size: 13px; padding: 5px 10px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.bench-table td:first-child { text-align: left; font-weight: 600; }
+
 .loc { display: inline-block; max-width: 260px; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; vertical-align: bottom; }
 .rc-path { margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

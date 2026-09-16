@@ -13,6 +13,7 @@ import re
 import time
 import traceback
 import uuid
+from datetime import datetime, timezone
 
 from flask import Flask, Response, g, jsonify, request, send_file, render_template
 from werkzeug.exceptions import HTTPException
@@ -259,6 +260,156 @@ def api_field_def_delete(field_key):
             f"WHERE field_key = {lit(field_key)}")
     _audit(email, "field_def_delete", field_key, None)
     return jsonify(ok=True)
+
+
+# ─────────────────────────────────────────── admin: warehouse latency bench ──
+# Server-side companion to bench/bench.py. The client script times the HTTP round-trip
+# from outside; this endpoint times the *warehouse* round-trip in-process — the number
+# ROADMAP Phase 2 (Lakebase) is measured against — so a baseline can be captured by an
+# admin clicking a button (no CLI / SSO token juggling).
+
+def _pct(samples, p):
+    """Nearest-rank percentile (p in 0..100) — same method as bench/bench.py."""
+    if not samples:
+        return 0.0
+    s = sorted(samples)
+    k = max(0, min(len(s) - 1, int(round((p / 100) * len(s) + 0.5)) - 1))
+    return s[k]
+
+
+def _bench_summary(samples):
+    """p50/p95/max/mean/n (ms) for one operation's timing samples."""
+    return {
+        "n": len(samples),
+        "p50": round(_pct(samples, 50), 1) if samples else None,
+        "p95": round(_pct(samples, 95), 1) if samples else None,
+        "max": round(max(samples), 1) if samples else None,
+        "mean": round(sum(samples) / len(samples), 1) if samples else None,
+    }
+
+
+def _deploy_commit():
+    """Best-effort short git/deploy SHA to tag a bench run; None if unavailable."""
+    for env in ("DATABRICKS_GIT_COMMIT", "GIT_COMMIT", "SOURCE_VERSION"):
+        v = os.getenv(env)
+        if v:
+            return v[:12]
+    try:
+        import subprocess
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
+                             text=True, timeout=2, cwd=os.path.dirname(os.path.abspath(__file__)))
+        return out.stdout.strip() or None if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+@app.post("/api/admin/bench")
+def api_admin_bench():
+    """Admin-only server-side latency baseline for the hot warehouse paths.
+
+    Runs, in-process, N iterations of the read-only queries the hot endpoints issue
+    (documents list, stats, search, single-document fetch) and times each db round-trip with
+    perf_counter. Returns per-operation {p50,p95,max,mean,n} in ms plus an overall wall-time.
+    Read-only only — no writes, no ai_query, no mutations. Queries run with the caller's own
+    perms_where scope so they mirror the real request path (an admin caller is unrestricted —
+    the widest/heaviest read, which is the honest worst case to baseline).
+    """
+    email = current_user()
+    if not _require_admin(email):
+        return jsonify(error="forbidden"), 403
+    body = request.get_json(silent=True) or {}
+    try:                                    # cap N so a click can't hammer the warehouse
+        n = int(request.args.get("n") or body.get("n") or 20)
+    except (TypeError, ValueError):
+        n = 20
+    n = max(1, min(n, 100))
+    label = request.args.get("label") or body.get("label") or ""
+
+    where = "1=1" + perms_where(email)
+    pw = perms_where(email, "d.sp_site_id")
+
+    # Each op reproduces the warehouse work of one hot endpoint (see api_documents / api_stats /
+    # api_search / api_document). Read-only mirrors — keep in sync if those queries change.
+    def op_documents():
+        query(
+            f"SELECT doc_id, original_filename, document_type, department, sp_site_name, sp_path, "
+            f"sp_web_url, mime_type, derived_pdf_path, "
+            f"classification_status, extraction_status, verification_status, mirror_status, "
+            f"source_id, batch_id, created_at FROM {config.DOCUMENTS} WHERE {where} "
+            f"ORDER BY created_at DESC LIMIT 500"
+        )
+
+    def op_stats():
+        query(f"SELECT verification_status AS s, count(*) AS n FROM {config.DOCUMENTS} "
+              f"WHERE {where} AND classification_status = 'classified' GROUP BY verification_status")
+        query(f"SELECT count(*) AS n FROM {config.DOCUMENTS} "
+              f"WHERE classification_status = 'unclassified' {perms_where(email)}")
+
+    def op_search():
+        ql = lit("%contract%")           # representative term, like bench/bench.py's default
+        query(
+            f"SELECT d.doc_id, d.original_filename, d.document_type, d.department, "
+            f"d.sp_site_name, d.sp_path, d.sp_web_url, d.mime_type, d.derived_pdf_path, "
+            f"coalesce(f_title.confirmed_value, f_title.proposed_value) AS title, "
+            f"coalesce(f_sum.confirmed_value, f_sum.proposed_value) AS summary, d.created_at "
+            f"FROM {config.DOCUMENTS} d "
+            f"LEFT JOIN {config.DOCUMENT_FIELDS} f_title ON f_title.doc_id = d.doc_id AND f_title.field_key = 'title' "
+            f"LEFT JOIN {config.DOCUMENT_FIELDS} f_sum ON f_sum.doc_id = d.doc_id AND f_sum.field_key = 'summary' "
+            f"LEFT JOIN (SELECT doc_id, concat_ws(' ', collect_list(text)) AS body "
+            f"FROM {config.DOCUMENT_TEXT} GROUP BY doc_id) tx ON tx.doc_id = d.doc_id "
+            f"WHERE verification_status = 'verified'{pw} "
+            f"AND (lower(d.original_filename) LIKE {ql} "
+            f"OR lower(coalesce(d.sp_path, '')) LIKE {ql} "
+            f"OR lower(coalesce(f_title.confirmed_value, f_title.proposed_value, '')) LIKE {ql} "
+            f"OR lower(coalesce(f_sum.confirmed_value, f_sum.proposed_value, '')) LIKE {ql} "
+            f"OR lower(coalesce(tx.body, '')) LIKE {ql}) "
+            f"ORDER BY d.created_at DESC LIMIT 200"
+        )
+
+    # Discover a real doc_id for the single-document fetch, like bench/bench.py does.
+    disc = query(f"SELECT doc_id FROM {config.DOCUMENTS} WHERE {where} "
+                 f"ORDER BY created_at DESC LIMIT 1")
+    doc_id = disc[0]["doc_id"] if disc else None
+
+    def op_document():
+        docs = query(f"SELECT * FROM {config.DOCUMENTS} WHERE doc_id = {lit(doc_id)}")
+        dtype = docs[0].get("document_type") if docs else None
+        query(f"SELECT field_key, proposed_value, confirmed_value, source_provenance, confidence "
+              f"FROM {config.DOCUMENT_FIELDS} WHERE doc_id = {lit(doc_id)}")
+        query(f"SELECT field_key, label, data_type, picklist_source, required_for_verify, applies_to, sort_order "
+              f"FROM {config.FIELD_DEFS} WHERE active = true AND "
+              f"(applies_to = 'common' OR applies_to = {lit(dtype)}) "
+              f"ORDER BY (applies_to='common') DESC, sort_order")
+        query(f"SELECT tag FROM {config.DOCUMENT_TAGS} WHERE doc_id = {lit(doc_id)} ORDER BY tag")
+
+    ops = [("documents", op_documents), ("stats", op_stats), ("search", op_search)]
+    if doc_id:
+        ops.append(("document", op_document))
+
+    wall0 = time.perf_counter()
+    results = {}
+    for name, fn in ops:
+        samples = []
+        for _ in range(n):
+            t0 = time.perf_counter()
+            fn()
+            samples.append((time.perf_counter() - t0) * 1000)
+        results[name] = _bench_summary(samples)
+    wall_ms = round((time.perf_counter() - wall0) * 1000, 1)
+
+    report = {
+        "label": label,
+        "n": n,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "commit": _deploy_commit(),
+        "scope": "caller",              # queries use the caller's perms_where (admin = unrestricted)
+        "doc_id_benched": doc_id,
+        "wall_ms": wall_ms,
+        "operations": results,
+    }
+    summ = " ".join(f"{k}:p50={v['p50']}/p95={v['p95']}" for k, v in results.items())
+    app.logger.info(f"admin bench — {_req_ctx()} n={n} label={label!r} wall_ms={wall_ms} {summ}")
+    return jsonify(report)
 
 
 # ──────────────────────────────────────────────────────────── upload + dedup ──

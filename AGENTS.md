@@ -139,4 +139,11 @@ live warehouse + SSO), not offline.
   or raw `--header` (Databricks Apps SSO). Timestamped JSON+md land in `bench/results/` (gitignored).
   **Run-on-deploy:** `DOC_HUB_BENCH_TOKEN=<tok> python bench/bench.py -n 30 --label pre-lakebase`.
   Full instructions in `bench/README.md`. These are the baselines Phase 2/3 are measured against.
+- `POST /api/admin/bench` (admin-gated, same `_require_admin` as field-def CRUD): the **server-side**
+  companion — times the hot-path warehouse queries (documents/stats/search/single-doc) in-process
+  over `n` samples (default 20, capped 100) and returns per-op `{p50,p95,max,mean,n}` + wall-time +
+  UTC timestamp + commit. Queries run with the caller's `perms_where` scope (admin = unrestricted).
+  Triggered by the **"Run benchmark"** button in the admin Fields panel ("Modify fields" → header);
+  renders the table + a Copy JSON affordance. Read-only (no writes/ai_query). This measures the
+  warehouse round-trip the Lakebase migration is measured against, without CLI/token juggling.
 </content>
