@@ -72,8 +72,12 @@ Front-loaded because Phases 2–5 all depend on it. No user-facing changes; pure
 
 ## Phase 2 — Data layer: Lakebase + scale + permissions — 🎯 the core efficiency goal
 
-- **Lakebase (Databricks Postgres OLTP) backend** (req: *add a lakebase backend to increase
-  efficiency*). Move hot transactional reads/writes — `documents`, `document_fields`,
+> **Status (2026-09-17):** Lakebase backend + permissions cutover + **full `document_*` cutover are
+> LIVE** (see AGENTS.md → "Phase 2 — Lakebase migration"). Permission read `/api/me` ~1,300 ms → 5 ms
+> warm (~260×). Remaining in this phase: **multi-user scale** (connection pooling / load test) and
+> **nexus-style permissions** (richer model). 🔒 One follow-up: rotate the SP OAuth secret.
+
+- **Lakebase (Databricks Postgres OLTP) backend** — ✅ DONE. Move hot transactional reads/writes — `documents`, `document_fields`,
   `document_tags`, `document_links`, `sp_sessions`, `import_jobs`, `sharepoint_syncs`, `job_state` —
   onto Lakebase, where a query is a Postgres round-trip (single-digit ms) instead of a Statement
   Execution API call (hundreds of ms). Keep the SQL warehouse for what it's good at: `ai_query`

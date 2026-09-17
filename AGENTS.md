@@ -85,7 +85,7 @@ databricks jobs run-now 607689951574858
 
 ## Tests (Phase 1 item DONE — commit fb3485a)
 
-`tests/` is a pytest suite, **91 tests, fully offline** (`pytest` from repo root; `pytest.ini` sets
+`tests/` is a pytest suite, **112 tests, fully offline** (`pytest` from repo root; `pytest.ini` sets
 `pythonpath=.`). Dev deps in `requirements-dev.txt`; CI in `.github/workflows/tests.yml` runs on
 push/PR — **keep main green.** Tiers: pure-unit (`test_unit.py`, `test_db.py`), API with a mocked
 `db` (`test_api.py`), processing (`test_processing.py`). `tests/conftest.py` holds the shared
@@ -147,10 +147,10 @@ live warehouse + SSO), not offline.
   renders the table + a Copy JSON affordance. Read-only (no writes/ai_query). This measures the
   warehouse round-trip the Lakebase migration is measured against, without CLI/token juggling.
 
-## Phase 2 — Lakebase migration (permissions cutover LIVE; documents cutover BUILT, flag OFF)
+## Phase 2 — Lakebase migration (permissions cutover LIVE; documents cutover LIVE)
 
-**Status (thin slice shipped):** `lakebase.py` (Pattern A) + the `permissions` read cutover
-are in. Offline suite green (103 tests). What exists now:
+**Status:** `lakebase.py` (Pattern A) + the `permissions` read cutover + the full `document_*`
+cutover are LIVE. Offline suite green (112 tests). What exists now:
 
 - **`lakebase.py`** — Pattern A: `pg_query`/`pg_execute` (params, RealDictCursor), thread-local
   no-op-close conn, SP-token minting + cache (`LAKEBASE_TOKEN` env override for local probing —
@@ -176,7 +176,18 @@ EXISTS` isn't atomic across sessions, so `_bootstrap` swallows benign concurrent
 one-time dedup + UNIQUE index + backfill run under a `pg_advisory_lock`, and writes use
 `ON CONFLICT DO NOTHING`. Don't regress that.
 
-**Document family FULL cutover — BUILT, flag OFF (commit `0c615d6`).** The whole `document_*`
+**Document family FULL cutover — LIVE (flipped 2026-09-17, commit `a718318`).** `USE_LAKEBASE_DOCUMENTS=true`
+is now set in BOTH `app.yaml` (deployed, resolved_commit `a7183187`) AND the job's `spark_env_vars`.
+Validated end-to-end: cutover run `558225007906501`/task `837641056755139` → **SUCCESS** — job
+authenticated to Lakebase as the SP (`lakebase check OK`, `current_database=databricks_postgres`), the
+5 `document_*` tables auto-created on first touch (`Lakebase document_hub document_* tables ready`), and
+the drain completed (`processed 0 doc(s)` — queue was empty; the 3 existing docs re-land on the next
+sweep/re-upload, per "delete current data, don't worry about backfill"). Rollback = flag `false` in both
+places (warehouse path untouched). 🔒 **STILL TODO: rotate the SP OAuth secret** (printed to a terminal
+during setup) — see the rotation steps below; the app/job read it fresh from scope `document-hub` each
+run, so rotation is put-secret + proxy-delete + one validation run, no redeploy.
+
+The whole `document_*`
 family (documents / document_fields / document_text / document_tags / document_links) is wired to
 Lakebase for **reads AND writes** behind `USE_LAKEBASE_DOCUMENTS` (default **off**). It's a full
 cutover, not a dual-write copy: no warehouse mirror of these tables, no backfill (user's call — only
@@ -232,86 +243,34 @@ API that doesn't apply. So the only headless-job path is OIDC client-credentials
 `ai_query` extraction stays on the warehouse regardless (it's fed OCR text inline, not read from a
 table).
 
-**To flip the cutover ON (not yet done):** set `USE_LAKEBASE_DOCUMENTS=true` in BOTH `app.yaml` (push
-+ deploy the app) AND the job's `spark_env_vars` (`databricks jobs update`). First touch auto-creates
-the 5 tables (advisory-lock DDL, no backfill); the 3 existing docs re-land via the next SharePoint
-sweep or re-upload. Rollback = set the flag `false` in both places (warehouse path is untouched).
-🔒 The SP OAuth secret was printed to a terminal during setup — **rotate it** (create a fresh one,
-update the scope, `service-principal-secrets-proxy delete` the old id) once satisfied.
+**Cutover is ON (done 2026-09-17).** For reference, the flip was: `USE_LAKEBASE_DOCUMENTS=true` in BOTH
+`app.yaml` (push + deploy the app) AND the job's `spark_env_vars` (`databricks jobs update`). Rollback =
+set the flag `false` in both places (warehouse path is untouched).
 
-**Suite:** 108 tests, still fully offline/green.
+🔒 **Pending: rotate the SP OAuth secret** (it was printed to a terminal during setup). Steps:
+1. `databricks service-principal-secrets-proxy create 143845247881551 -o json` → fresh `secret`.
+2. `databricks secrets put-secret document-hub sp-oauth-secret --string-value <NEW_SECRET>`.
+3. `databricks service-principal-secrets-proxy delete 143845247881551 a6786ee1239531cf3ad569992798e57c96161d3848b4a1f9c877f3d06ae6cf57` (revoke the exposed id).
+4. `databricks jobs run-now 607689951574858 --python-params '--check-lakebase'` (or the admin bench) to confirm the new secret works. No redeploy — creds are read fresh from scope `document-hub` each run.
+
+**Suite:** 112 tests, still fully offline/green.
 
 **Consider next:** cache-busting `permissions` op in the admin bench (the perm win doesn't show
 there — its one lookup is `g`-cached outside the timed loops).
 
-### Original brief (kept for context)
-
-**Goal:** kill the Statement-Execution round-trip tax (see `bench/BASELINE.md`: single-row
-permission lookup **~1300 ms**, fired 2–3×/page; 4-query document fetch **~1900 ms p50**). Lakebase
-is Databricks-managed Postgres (single-digit-ms round trips) → expected **10–100×** on the hot path.
-
-### What's already true (unblocks the work)
-- The app now has a **DB resource binding**: `Database plains-lakebase / databricks_postgres`,
-  permission **"Can connect and create"**, resource key `database`. On a Databricks App this injects
-  env `PGHOST / PGDATABASE / PGUSER / PGPORT` (and a `PGPASSWORD`) for the app SP.
-- Instance: `ep-flat-moon-ee1bjbvj.database.westus2.azuredatabricks.net`, DB `databricks_postgres`,
-  Postgres **17.11**. Probed live: app SP has CREATE rights.
-- ⚠️ **SHARED instance.** `dbx-deal-capture-app` owns this exact endpoint and writes `deals` /
-  `deal_log` etc. into `public`. **Document Hub MUST use its own `document_hub` schema** — never
-  touch `public`. `CREATE SCHEMA IF NOT EXISTS document_hub` on bootstrap.
-
-### Connection recipe (proven in sibling apps, in this workspace)
-- **Pattern A — `dbx-deal-capture-app/` (RECOMMENDED, same instance we're on):** `psycopg2-binary`
-  (no version pin). Reads `PGHOST/PGDATABASE/PGUSER/PGPORT` from env; **password = a freshly minted
-  OAuth token**, not a static secret. `_get_sp_token()` POSTs `{DATABRICKS_HOST}/oidc/v1/token` with
-  `grant_type=client_credentials, scope=all-apis`, HTTP-basic `(DATABRICKS_CLIENT_ID,
-  DATABRICKS_CLIENT_SECRET)` — all three are auto-injected to the app SP on a Databricks App. Caches
-  the token in a module dict + lock with a 60s early-refresh margin. Connect with
-  `psycopg2.connect(host,dbname,port,user,password=token,sslmode="require",connect_timeout=10)`,
-  `autocommit=True`. Thread-local single connection (`_tls`) wrapped so `.close()` is a **no-op**;
-  recreated on credential change / closed conn. Tables guarded by a `_tables_ready` flag +
-  `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`.
-- **Pattern B — `conman/` (simpler, different endpoint):** static `PG_USER`/`PG_PASSWORD` app
-  secrets, 55-min connection recycle (`_PG_CONN_TTL=3300`), retry-once-on-`OperationalError`. No
-  token minting. Simpler but needs provisioned secrets and doesn't rotate cleanly.
-- `contract-explorer` / `contracts-ver` / `plains-nexus` have **no Postgres** — warehouse only. Don't
-  look to them for a Lakebase pattern.
-- **Recommendation:** Pattern A. It matches the app we share the instance with, needs no new secrets
-  (uses the SP identity already present), and rotates tokens correctly for a long-running gunicorn
-  worker. (The injected `PGPASSWORD` is a viable shortcut but isn't refreshed in-process, so a
-  long-lived worker can see it expire — that's exactly why deal-capture mints its own.)
-
-### Build sequence (thin slice first — prove the win before a broad migration)
-1. **`lakebase.py`** — new module implementing Pattern A: `pg_query(sql, params)` /
-   `pg_execute(sql, params)` returning `list[dict]` (RealDictCursor), thread-local no-op-close conn,
-   token minting + cache, `SCHEMA = "document_hub"` bootstrap. **Add a `LAKEBASE_TOKEN` env override**
-   for the connection password so it can be tested locally with a transient personal token (the app's
-   real auth path mints its own). **Offline/local + tests: if `PGHOST` is unset, the module must be
-   inert** and callers fall back to the warehouse — the 97-test offline suite MUST stay green and the
-   modules must stay import-safe under `conftest`'s stubs.
-2. `requirements.txt` += `psycopg2-binary`; `app.yaml` declare the `database` resource
-   (`- name: ... valueFrom: database`) + any `LAKEBASE_*` / feature-flag envs. Confirm the exact
-   app.yaml resource syntax against `dbx-deal-capture-app/app.yaml`.
-3. **Thin slice = `permissions`** (biggest per-request win — it's on every page, 2–3×). Create
-   `document_hub.permissions`, **one-time backfill from the warehouse `permissions` table** if the PG
-   table is empty, then point `get_perms()` reads (in `app.py`, already `g`-cached) at Lakebase behind
-   a feature flag (`USE_LAKEBASE_PERMISSIONS`, default on when `PGHOST` present, else warehouse).
-   **Dual-write** permission changes (`sp.sync_user_sites`, any admin grant) to BOTH stores so
-   rollback stays safe and nothing else that reads the warehouse table breaks.
-4. Measure via the **"Run benchmark"** admin button / `POST /api/admin/bench` and compare to
-   `bench/BASELINE.md`. Only after the permission slice proves out, migrate `documents` +
-   `document_fields` reads the same way.
-
-### 🔒 Security constraint (non-negotiable)
-The user shared a **1-hour personal Postgres token** for transient probing only. It is a personal
-credential — **NEVER write it to any file, `app.yaml`, commit, or log.** The app's production auth is
-the SP DB-resource binding (Pattern A token minting), never a pasted token. Use `LAKEBASE_TOKEN` only
-as an ephemeral shell env for local probing, then discard.
-
-### Watch-outs
-- `psycopg2` uses real params (`%s`) — do NOT reuse `db.lit()` string-interpolation; use parameterized
-  queries. Postgres returns real types (no STRING-coercion gotcha), but JSON array columns still hold
-  `json.dumps`'d strings by our own convention (see gotcha #4).
-- Keep the warehouse `db.py` path intact during migration — Lakebase is additive/behind a flag until
-  each slice is proven. Don't rip out warehouse reads.
+### Durable facts + watch-outs
+- ⚠️ **SHARED instance.** `dbx-deal-capture-app` owns endpoint `ep-flat-moon-ee1bjbvj` (Postgres 17,
+  DB `databricks_postgres`) and writes into `public`. **Document Hub lives ONLY in its own
+  `document_hub` schema** — never touch `public`.
+- **Connection = Pattern A** (mirrors deal-capture): `psycopg2-binary`, password is a **freshly minted
+  OAuth token** (not a static secret), thread-local no-op-close conn, token cached with early-refresh.
+  The **autoscale** instance requires an OAuth JWT — the app SP's injected `DATABRICKS_CLIENT_ID/SECRET`
+  mint it via `{host}/oidc/v1/token`; the injected `PGPASSWORD` is not refreshed in-process so a
+  long-lived worker would see it expire. `LAKEBASE_TOKEN` env is a local-probe override only (ephemeral,
+  never persisted).
+- `psycopg2` uses real params (`%s`) — do NOT reuse `db.lit()` string-interpolation. Postgres returns
+  real types (no STRING-coercion gotcha), but JSON array columns still hold `json.dumps`'d strings by
+  our own convention (see gotcha #4).
+- Keep the warehouse `db.py` path intact — the Lakebase cutovers are flag-guarded rollbacks, not
+  rip-outs. `ai_query` extraction stays on the warehouse regardless (fed OCR text inline).
 </content>
