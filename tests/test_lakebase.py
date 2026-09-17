@@ -76,6 +76,31 @@ def test_get_perms_falls_back_to_warehouse_on_lakebase_error(bind_db, monkeypatc
     assert len(fake.queried_matching("access_type, allowed_site")) == 1
 
 
+# ══ Credential resolution — App (OIDC) vs Job (SDK ambient) ══════════════════
+def test_password_prefers_local_token_override(monkeypatch):
+    monkeypatch.setenv("LAKEBASE_TOKEN", "personal-probe-tok")
+    assert lakebase._password() == "personal-probe-tok"  # never reaches minting paths
+
+
+def test_password_falls_back_to_sdk_credential_for_the_job(monkeypatch):
+    # The processing job has no OIDC client-creds env → _get_sp_token() is None; the SDK
+    # ambient path must serve the credential (before the stale PGPASSWORD shortcut).
+    monkeypatch.delenv("LAKEBASE_TOKEN", raising=False)
+    monkeypatch.setenv("PGPASSWORD", "stale-injected")
+    monkeypatch.setattr(lakebase, "_get_sp_token", lambda: None)
+    monkeypatch.setattr(lakebase, "_get_sdk_credential", lambda: "sdk-minted-tok")
+    assert lakebase._password() == "sdk-minted-tok"
+
+
+def test_password_uses_oidc_token_when_available(monkeypatch):
+    # The App path: client-creds present → OIDC token wins, SDK path not consulted.
+    monkeypatch.delenv("LAKEBASE_TOKEN", raising=False)
+    monkeypatch.setattr(lakebase, "_get_sp_token", lambda: "oidc-sp-tok")
+    monkeypatch.setattr(lakebase, "_get_sdk_credential",
+                        lambda: (_ for _ in ()).throw(AssertionError("SDK path should not run")))
+    assert lakebase._password() == "oidc-sp-tok"
+
+
 # ══ Document family — full cutover routing (USE_LAKEBASE_DOCUMENTS) ═══════════
 def test_docs_enabled_requires_both_enabled_and_flag(monkeypatch):
     import config

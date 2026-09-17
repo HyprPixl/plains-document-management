@@ -99,18 +99,53 @@ def _get_sp_token():
             return None
 
 
+def _get_sdk_credential():
+    """Mint a Lakebase credential via the Databricks SDK using *ambient* auth.
+
+    This is the path for the **processing job**: a Databricks Job running as the app SP
+    (or any identity) authenticates the SDK ambiently, but — unlike an App — is NOT given
+    `DATABRICKS_CLIENT_ID/SECRET` env, so `_get_sp_token()` can't mint via OIDC. The SDK's
+    `generate_database_credential` returns a short-lived token for the run-as identity
+    (which must hold a Postgres role on the instance). Cached in the same dict/lock as the
+    OIDC token. Returns None when the SDK/instance is unavailable (→ inert, warehouse path).
+    """
+    instance = os.getenv("LAKEBASE_INSTANCE", "plains-lakebase")
+    with _token_lock:
+        if _token_cache.get("token") and time.monotonic() < _token_cache.get("expires_at", 0) - 60:
+            return _token_cache["token"]
+        try:
+            import uuid
+            from databricks.sdk import WorkspaceClient
+            cred = WorkspaceClient().database.generate_database_credential(
+                request_id=str(uuid.uuid4()), instance_names=[instance]
+            )
+            _token_cache["token"] = cred.token
+            # SDK creds are ~1h; refresh a minute early like the OIDC path.
+            _token_cache["expires_at"] = time.monotonic() + 3600
+            return cred.token
+        except Exception as e:
+            logger.error(f"SDK Lakebase credential fetch failed: {e}")
+            return None
+
+
 def _password() -> str | None:
     """Resolve the connection password, most-preferred first.
 
     1. `LAKEBASE_TOKEN` — ephemeral local-probing override (a personal token). Never
        persisted anywhere; discarded when the shell env goes away.
-    2. A freshly minted SP OAuth token — the production path (rotates in-process).
-    3. The injected `PGPASSWORD` — last-resort shortcut (not refreshed, can expire).
+    2. A freshly minted SP OAuth token — the App production path (OIDC client-credentials,
+       rotates in-process). Needs `DATABRICKS_CLIENT_ID/SECRET` (auto-injected on Apps).
+    3. An SDK-minted credential via ambient auth — the **Job** path (Apps-only client-creds
+       env is absent there); works for the SP or user the job runs as.
+    4. The injected `PGPASSWORD` — last-resort shortcut (not refreshed, can expire).
     """
     tok = os.getenv("LAKEBASE_TOKEN")
     if tok:
         return tok
     tok = _get_sp_token()
+    if tok:
+        return tok
+    tok = _get_sdk_credential()
     if tok:
         return tok
     return os.getenv("PGPASSWORD")
