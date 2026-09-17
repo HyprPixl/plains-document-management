@@ -201,16 +201,43 @@ every call site, so the flag is an instant rollback.
   branch on `docs_enabled()`. `upsert_proposed_field` preserves human provenance via
   `coalesce(document_fields.source_provenance,'ai')`.
 
-**⚠️ BLOCKER before flipping `USE_LAKEBASE_DOCUMENTS=true` (this is the "obvious reason" the flag is
-off).** The processing job (`worker.py` → `processing/job.py`) is a **separate Databricks Job**, not
-the web app — it does **not** get the `database` resource binding, so no `PGHOST/PGUSER/PGPORT`
-(+`PGPASSWORD`) is injected there. Flip the flag on while the job can't reach Lakebase and you split
-the brain: the app writes new docs to Lakebase while the job drains an empty warehouse (nothing gets
-OCR'd/extracted). **Prerequisite the user owns:** give the job its own Lakebase connectivity —
-either bind the `database` resource on the job, or set `LAKEBASE_HOST/DB/SCHEMA` + ensure the job's
-SP can mint the OAuth token (`DATABRICKS_HOST/CLIENT_ID/CLIENT_SECRET` for Pattern A). Only after the
-job can read+write Lakebase should both `app.yaml` and the job env set the flag `true`. `ai_query`
-extraction stays on the warehouse regardless (it's fed OCR text inline, not read from a table).
+**Job → Lakebase connectivity: WIRED + VALIDATED (2026-09-17).** This was the blocker before flipping
+`USE_LAKEBASE_DOCUMENTS=true`: the processing job (`worker.py` → `processing/job.py`) is a **separate
+Databricks Job**, not the web app — it does **not** get the `database` resource binding, so no
+`PGHOST/PGUSER/PGPORT` is injected. Flip the flag while the job can't reach Lakebase and you split the
+brain (app writes Lakebase, job drains an empty warehouse). Resolved as follows — and note the
+**autoscale** wrinkle: our Lakebase (`ep-flat-moon`, `projects/plains-lakebase`, owned by Caleb) is an
+**autoscale** instance, so it needs an **OAuth JWT** as the Postgres password. A job's ambient token
+is a PAT (rejected: "not a valid JWT"), and `generate_database_credential` is a *provisioned*-instance
+API that doesn't apply. So the only headless-job path is OIDC client-credentials with the app SP's
+`client_id`+`secret`:
+
+- Created an OAuth secret for the app SP (`app id 532acbc1-b288-4dd3-9a2d-6896d76706b1`, SCIM id
+  `143845247881551`) via `databricks service-principal-secrets-proxy create`; stored `client_id` +
+  `secret` in Databricks-backed scope **`document-hub`** (keys `sp-client-id`, `sp-oauth-secret`).
+- Job `607689951574858` (partial `databricks jobs update`, so its paused periodic trigger survived):
+  added lib `psycopg2-binary` + `spark_env_vars` `PGHOST/PGPORT/PGDATABASE/PGUSER=<SP app id>/
+  LAKEBASE_SCHEMA=document_hub/LAKEBASE_OIDC_HOST=https://adb-1979327425712808.8.azuredatabricks.net/
+  LAKEBASE_CLIENT_ID={{secrets/document-hub/sp-client-id}}/LAKEBASE_CLIENT_SECRET={{secrets/
+  document-hub/sp-oauth-secret}}`. **`run_as` stays Caleb** — the Postgres identity is decoupled from
+  the job's Databricks identity, so no SP re-grants for secrets/git/warehouse/volume were needed.
+- `_get_sp_token()` prefers **`LAKEBASE_*`-prefixed** creds over `DATABRICKS_*` precisely so setting
+  them on the job does NOT trip the databricks-sdk default-auth chain into re-identifying the whole job
+  as the SP (which would break its run-as-user SharePoint/DI/volume calls). Don't rename these back.
+- Validate anytime with `worker.py --check-lakebase` (non-destructive `SELECT 1`; probe-only, exits) —
+  also runs passively at startup once `lakebase.enabled()`. Proven green: run `182572589457336`
+  logged `lakebase check OK`. (Gotcha baked into the fix: a bare `sys.exit(0)` raises `SystemExit`,
+  which the spark_python_task executor flags as FAILED — the probe returns cleanly on success instead.)
+
+`ai_query` extraction stays on the warehouse regardless (it's fed OCR text inline, not read from a
+table).
+
+**To flip the cutover ON (not yet done):** set `USE_LAKEBASE_DOCUMENTS=true` in BOTH `app.yaml` (push
++ deploy the app) AND the job's `spark_env_vars` (`databricks jobs update`). First touch auto-creates
+the 5 tables (advisory-lock DDL, no backfill); the 3 existing docs re-land via the next SharePoint
+sweep or re-upload. Rollback = set the flag `false` in both places (warehouse path is untouched).
+🔒 The SP OAuth secret was printed to a terminal during setup — **rotate it** (create a fresh one,
+update the scope, `service-principal-secrets-proxy delete` the old id) once satisfied.
 
 **Suite:** 108 tests, still fully offline/green.
 
