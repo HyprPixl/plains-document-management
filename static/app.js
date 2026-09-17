@@ -250,10 +250,16 @@ async function uploadFiles(fileList) {
     const res = await api("/api/upload", { method: "POST", body: fd });
     box.replaceChildren(...res.results.map((r) => {
       const isNew = r.status === "new";
+      // For a duplicate, surface the existing doc's state so the reviewer sees the free
+      // reuse (SPEC §9): an identical, already-verified doc means this upload inherits the
+      // OCR/text, extracted fields, and confirmed values at zero cost.
+      const reuse = r.existing_status === "verified"
+        ? " · already verified — reused for free"
+        : " · already extracted — reused";
       return el("div", { class: "up-item " + (isNew ? "new" : "dup") },
         el("span", { class: "tag" }, isNew ? "NEW" : "DUPLICATE"),
         el("span", {}, r.filename),
-        isNew ? "" : el("span", { class: "muted" }, `— already stored as "${r.existing_name}"`));
+        isNew ? "" : el("span", { class: "muted" }, `— already stored as "${r.existing_name}"${reuse}`));
     }));
     toast(`${res.results.filter((r) => r.status === "new").length} new, ` +
       `${res.results.filter((r) => r.status === "duplicate").length} duplicate`);

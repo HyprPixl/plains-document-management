@@ -922,3 +922,69 @@ def commit_extraction_retry(doc_id: str, attempts: int, message: str, backoff_se
         "WHERE doc_id = %s",
         (attempts, message, backoff_secs, doc_id),
     )
+
+
+# ─────────────────────────────────── free reuse of identical documents (§9) ──
+# A byte-identical document that was already OCR'd + extracted (and maybe verified) is a
+# finished copy of the same work. Rather than re-pay OCR + ai_query for the duplicate, copy
+# the twin's text layer, derived-PDF pointer, and field values — and, when the twin is
+# human-verified, land the duplicate verified too. Same-byte duplicates arise legitimately
+# from the connector paths (a file filed under two SharePoint locations → two doc rows).
+
+def find_processed_twin(doc_id: str, content_sha256: str, document_type, sig_prefix: str):
+    """A sibling document — identical bytes, same document_type, already fully extracted
+    under the current prompt/schema — whose derived artifacts + field values this doc can
+    copy for free (SPEC §9). Prefers a *verified* twin (so the copy can land verified),
+    else the most recently updated. Returns the twin row or None."""
+    _ensure_documents_ready()
+    if not content_sha256:
+        return None
+    rows = pg_query(
+        "SELECT doc_id, derived_pdf_path, text_source, page_count, extraction_sig, "
+        "verification_status, verified_by "
+        f"FROM {DOCUMENTS} WHERE content_sha256 = %s AND doc_id <> %s "
+        "AND extraction_status = 'done' AND document_type IS NOT DISTINCT FROM %s "
+        "AND extraction_sig LIKE %s "
+        "ORDER BY (verification_status = 'verified') DESC, updated_at DESC LIMIT 1",
+        (content_sha256, doc_id, document_type, sig_prefix + ":%"),
+    )
+    return rows[0] if rows else None
+
+
+def copy_from_twin(doc_id: str, twin: dict) -> None:
+    """Copy a processed twin's text layer, derived-PDF metadata, and field values onto this
+    doc, and — when the twin is verified — land this doc verified too (SPEC §9). The derived
+    searchable PDF is a sha-keyed volume artifact already shared, so only the pointer is
+    copied, not bytes. Field provenance is preserved verbatim; existing rows on this doc
+    (e.g. preset/SharePoint metadata set at ingest) are never clobbered."""
+    _ensure_documents_ready()
+    twin_id = twin["doc_id"]
+    # Text layer: replace this doc's rows with a copy of the twin's (idempotent per doc).
+    pg_execute(f"DELETE FROM {DOCUMENT_TEXT} WHERE doc_id = %s", (doc_id,))
+    pg_execute(
+        f"INSERT INTO {DOCUMENT_TEXT} (doc_id, page, text, bbox, updated_at) "
+        f"SELECT %s, page, text, bbox, now() FROM {DOCUMENT_TEXT} WHERE doc_id = %s",
+        (doc_id, twin_id),
+    )
+    # Field values: proposed + confirmed copied verbatim; ON CONFLICT DO NOTHING preserves
+    # any value this doc already carries.
+    pg_execute(
+        f"INSERT INTO {DOCUMENT_FIELDS} "
+        "(doc_id, field_key, proposed_value, confirmed_value, confidence, source_provenance, updated_at) "
+        "SELECT %s, field_key, proposed_value, confirmed_value, confidence, source_provenance, now() "
+        f"FROM {DOCUMENT_FIELDS} WHERE doc_id = %s ON CONFLICT DO NOTHING",
+        (doc_id, twin_id),
+    )
+    # Extraction metadata → done (reuses the twin's derived PDF, text_source, and sig).
+    commit_extraction_done(
+        doc_id, twin.get("derived_pdf_path"), twin.get("text_source"),
+        int(twin.get("page_count") or 0), twin.get("extraction_sig") or "")
+    # The identical bytes were already human-verified → this doc lands verified for free
+    # (re-mirrored to its own SharePoint location).
+    if twin.get("verification_status") == "verified":
+        pg_execute(
+            f"UPDATE {DOCUMENTS} SET verification_status = 'verified', verified_by = %s, "
+            "verified_at = now(), mirror_status = 'not_mirrored', updated_at = now() "
+            "WHERE doc_id = %s",
+            (twin.get("verified_by"), doc_id),
+        )

@@ -99,7 +99,7 @@ Run after Phase 2 so we optimize the *final* architecture, and after Phase 1 so 
   Kill N+1 round-trips (e.g. `api_document` issues four sequential queries — batch them); cache
   taxonomy and field-defs (they change rarely) instead of re-querying per request; trim redundant
   work in hot loops. Guided by the Phase 1 benchmarks.
-- **Free reuse of results for identical documents** (req: *if an identical doc is uploaded and
+- **Free reuse of results for identical documents** — ✅ DONE (2026-09-17). (req: *if an identical doc is uploaded and
   extraction has run — or better, it's verified — copy those for free*). Everything is already
   keyed on `content_sha256`, so on a duplicate upload we copy the original's OCR/text layer,
   derived searchable PDF, and AI-extracted field values instead of re-paying — and **when the
@@ -162,6 +162,6 @@ Depends on the fast data layer (2), the viewer and permissions (4), and tested f
 | O | Chat in Explore like contract-explorer | 5 |
 | P | Select docs → open in plains-nexus | 5 |
 | Q | "Open enclosing folder in SharePoint" | 4 |
-| R | Copy extraction/verified results free for identical docs | 3 |
+| R | Copy extraction/verified results free for identical docs | 3 ✅ |
 </content>
 </invoke>

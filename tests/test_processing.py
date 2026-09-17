@@ -192,6 +192,77 @@ def test_run_import_expands_folders(fake_db, bind_db, monkeypatch):
     assert any("total_files = 2" in s for s in fake_db.executed_matching("UPDATE"))
 
 
+# ── free reuse of identical documents (SPEC §9) ──────────────────────────────
+def _dup_doc(**kw):
+    d = {"doc_id": "d2", "content_sha256": "sha-1", "volume_path": "/v/d2.pdf",
+         "original_filename": "dup.pdf", "document_type": "Invoice", "attempt_count": 0}
+    d.update(kw)
+    return d
+
+
+def _twin(**kw):
+    t = {"doc_id": "d1", "derived_pdf_path": "/v/sha-1.searchable.pdf", "text_source": "native",
+         "page_count": 3, "extraction_sig": "v1:native",
+         "verification_status": "needs_review", "verified_by": None}
+    t.update(kw)
+    return t
+
+
+def test_find_twin_filters_by_sha_type_and_prompt_version(fake_db, bind_db):
+    bind_db(fake_db, job)
+    fake_db.responder = route([("content_sha256 =", [{"doc_id": "d1"}])], default=[])
+    assert job._find_twin(_dup_doc()) == {"doc_id": "d1"}
+    q = fake_db.queried_matching("content_sha256 =")[0]
+    assert "extraction_status = 'done'" in q        # only finished twins
+    assert "document_type <=>" in q                 # null-safe same-type match
+    assert "extraction_sig LIKE" in q and "v1:" in q  # current prompt/schema only
+    assert "doc_id <> " in q                         # never itself
+
+
+def test_find_twin_none_without_sha(fake_db, bind_db):
+    bind_db(fake_db, job)
+    assert job._find_twin(_dup_doc(content_sha256=None)) is None
+    assert fake_db.queries == []                     # short-circuits, no lookup
+
+
+def test_process_doc_reuses_twin_and_skips_ocr(fake_db, bind_db, monkeypatch):
+    bind_db(fake_db, job)
+    fake_db.responder = route([("content_sha256 =", [_twin()])], default=[])
+    monkeypatch.setattr(job.ocr, "process",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("OCR must be skipped")))
+    job.process_doc(_dup_doc())
+    # Text + fields copied; doc marked done; NOT verified (twin wasn't verified).
+    assert fake_db.executed_matching("INSERT INTO product_dev.document_hub.document_text")
+    assert fake_db.executed_matching("MERGE INTO product_dev.document_hub.document_fields")
+    done = fake_db.executed_matching("extraction_status = 'done'")
+    assert done and "verification_status = 'verified'" not in done[0]
+
+
+def test_process_doc_lands_verified_from_verified_twin(fake_db, bind_db, monkeypatch):
+    bind_db(fake_db, job)
+    fake_db.responder = route(
+        [("content_sha256 =", [_twin(verification_status="verified", verified_by="u@x.com")])],
+        default=[])
+    monkeypatch.setattr(job.ocr, "process",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("OCR must be skipped")))
+    job.process_doc(_dup_doc())
+    done = fake_db.executed_matching("extraction_status = 'done'")
+    assert done and "verification_status = 'verified'" in done[0] and "u@x.com" in done[0]
+    assert "mirror_status = 'not_mirrored'" in done[0]  # re-mirror to its own SP location
+
+
+def test_process_doc_no_twin_runs_normal_ocr(fake_db, bind_db, monkeypatch):
+    bind_db(fake_db, job)
+    fake_db.responder = route([("content_sha256 =", [])], default=[])  # no twin
+    ocr_called = {}
+    monkeypatch.setattr(job, "_read_volume", lambda p: b"bytes")
+    monkeypatch.setattr(job.ocr, "process", lambda data, name: ocr_called.setdefault("hit", True) or
+                        {"searchable_pdf": None, "pages": [], "text_source": "native", "page_count": 0})
+    monkeypatch.setattr(job.extract, "extract_fields", lambda *a, **k: {})
+    job.process_doc(_dup_doc())
+    assert ocr_called.get("hit")                     # fell through to real extraction
+
+
 def test_process_imports_claims_with_lease_guard(fake_db, bind_db, monkeypatch):
     bind_db(fake_db, job)
     import sharepoint as sp

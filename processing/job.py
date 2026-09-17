@@ -394,10 +394,83 @@ def _extend_lease(doc_id: str) -> None:
 
 # ───────────────────────────────────────────────────── process one doc ──
 
+def _find_twin(doc: dict) -> dict | None:
+    """A byte-identical sibling this doc can copy finished work from, or None (SPEC §9)."""
+    sha = doc.get("content_sha256")
+    if not sha:
+        return None
+    sig_prefix = config.PROMPT_VERSION
+    if lakebase.docs_enabled():
+        return lakebase.find_processed_twin(doc["doc_id"], sha, doc.get("document_type"), sig_prefix)
+    rows = query(
+        f"SELECT doc_id, derived_pdf_path, text_source, page_count, extraction_sig, "
+        f"verification_status, verified_by FROM {config.DOCUMENTS} "
+        f"WHERE content_sha256 = {lit(sha)} AND doc_id <> {lit(doc['doc_id'])} "
+        f"AND extraction_status = 'done' AND document_type <=> {lit(doc.get('document_type'))} "
+        f"AND extraction_sig LIKE {lit(sig_prefix + ':%')} "
+        f"ORDER BY (verification_status = 'verified') DESC, updated_at DESC LIMIT 1"
+    )
+    return rows[0] if rows else None
+
+
+def _reuse_from_twin(doc: dict, twin: dict) -> None:
+    """Copy the twin's text/derived-PDF/fields (and verified status) onto this doc — no OCR,
+    no ai_query. The searchable PDF is a sha-keyed volume artifact already on disk, shared."""
+    doc_id = doc["doc_id"]
+    if lakebase.docs_enabled():
+        lakebase.copy_from_twin(doc_id, twin)
+    else:
+        _copy_from_twin_warehouse(doc_id, twin)
+    verified = twin.get("verification_status") == "verified"
+    logger.info("doc_id=%s stage=process_doc reused from twin=%s%s",
+                doc_id, twin["doc_id"], " (landed verified)" if verified else "")
+    print(f"  ♻ {doc_id} reused from {twin['doc_id']}{' → verified' if verified else ''}")
+
+
+def _copy_from_twin_warehouse(doc_id: str, twin: dict) -> None:
+    twin_id = twin["doc_id"]
+    execute(f"DELETE FROM {config.DOCUMENT_TEXT} WHERE doc_id = {lit(doc_id)}")
+    execute(
+        f"INSERT INTO {config.DOCUMENT_TEXT} (doc_id, page, text, updated_at) "
+        f"SELECT {lit(doc_id)}, page, text, current_timestamp() "
+        f"FROM {config.DOCUMENT_TEXT} WHERE doc_id = {lit(twin_id)}"
+    )
+    # Copy only field keys this doc lacks (never clobber preset/SharePoint metadata).
+    execute(
+        f"MERGE INTO {config.DOCUMENT_FIELDS} t "
+        f"USING (SELECT {lit(doc_id)} AS doc_id, field_key, proposed_value, confirmed_value, "
+        f"       confidence, source_provenance FROM {config.DOCUMENT_FIELDS} "
+        f"       WHERE doc_id = {lit(twin_id)}) s "
+        f"ON t.doc_id = s.doc_id AND t.field_key = s.field_key "
+        f"WHEN NOT MATCHED THEN INSERT (doc_id, field_key, proposed_value, confirmed_value, "
+        f"  confidence, source_provenance, updated_at) "
+        f"VALUES (s.doc_id, s.field_key, s.proposed_value, s.confirmed_value, s.confidence, "
+        f"  s.source_provenance, current_timestamp())"
+    )
+    sets = (
+        f"extraction_status = 'done', derived_pdf_path = {lit(twin.get('derived_pdf_path'))}, "
+        f"text_source = {lit(twin.get('text_source'))}, page_count = {int(twin.get('page_count') or 0)}, "
+        f"extraction_sig = {lit(twin.get('extraction_sig'))}, error_message = NULL, "
+        f"claimed_by = NULL, claim_expires_at = NULL, updated_at = current_timestamp()"
+    )
+    if twin.get("verification_status") == "verified":
+        sets += (
+            f", verification_status = 'verified', verified_by = {lit(twin.get('verified_by'))}, "
+            f"verified_at = current_timestamp(), mirror_status = 'not_mirrored'"
+        )
+    execute(f"UPDATE {config.DOCUMENTS} SET {sets} WHERE doc_id = {lit(doc_id)}")
+
+
 def process_doc(doc: dict) -> None:
     doc_id = doc["doc_id"]
     try:
         _extend_lease(doc_id)
+        # Free reuse: if a byte-identical sibling is already processed, copy its results
+        # instead of re-paying OCR + extraction (SPEC §9).
+        twin = _find_twin(doc)
+        if twin:
+            _reuse_from_twin(doc, twin)
+            return
         data = _read_volume(doc["volume_path"])
         res = ocr.process(data, doc["original_filename"] or "file.pdf")
 

@@ -78,10 +78,18 @@ databricks jobs run-now 607689951574858
 8. **Permissions are site-scoped.** `perms_where()` filters every Manage/Explore query by
    `sp_site_id` (`FULL`/`ADMIN` unrestricted). A user's accessible sites are learned from their own
    delegated browse (`sp.sync_user_sites`), not a manual grant table.
-9. **Identical bytes = free reuse (SPEC §9/§10.3).** Everything is keyed on `content_sha256`. A
-   duplicate upload should reuse cached OCR/text + derived PDF + AI fields, and — when the original
-   is `verified` — copy its `confirmed_value`s so the dup lands already-verified. (Roadmap item R;
-   confirm the ingest path actually takes this shortcut end-to-end.)
+9. **Identical bytes = free reuse (SPEC §9/§10.3) — IMPLEMENTED (roadmap item R).** Everything is
+   keyed on `content_sha256`. Two layers: (a) `extraction_cache` (keyed sha+prompt_version+type)
+   already made the `ai_query` free on a re-run; (b) `process_doc` now short-circuits on a **twin** —
+   `lakebase.find_processed_twin()` / the warehouse `_find_twin()` look for another doc with identical
+   bytes, same `document_type`, `extraction_status='done'` under the current `PROMPT_VERSION` — and
+   `copy_from_twin()` copies its text layer, derived-PDF pointer, and field values (provenance
+   preserved) instead of re-OCR'ing. When the twin is `verified`, the dup lands `verified` too
+   (`verified_by` copied, `mirror_status='not_mirrored'` so it re-mirrors to its own SP location).
+   Same-byte dups arise legitimately from connectors (one file under two SharePoint locations → two
+   rows). In-app upload dedup still returns the existing doc (no second row); the upload UI surfaces
+   the reuse ("already verified — reused for free"). The searchable PDF is a sha-keyed volume artifact
+   already shared, so only the pointer is copied, never bytes.
 
 ## Tests (Phase 1 item DONE — commit fb3485a)
 
