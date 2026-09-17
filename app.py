@@ -165,6 +165,14 @@ def perms_where(email: str, col: str = "sp_site_id") -> str:
     return f" AND {col} IN ({vals}) "
 
 
+def perms_sites(email: str):
+    """Site scope as data for the Lakebase document reads (parameterized, not a SQL
+    fragment). Returns None for full/admin (unrestricted), else the allowed-sites list
+    (possibly empty → see nothing) — the same three-way scope perms_where() encodes."""
+    _is_admin, is_full, allowed = get_perms(email)
+    return None if is_full else allowed
+
+
 # ─────────────────────────────────────────────────────────────────────── pages ──
 
 @app.route("/")
@@ -365,10 +373,16 @@ def api_admin_bench():
 
     where = "1=1" + perms_where(email)
     pw = perms_where(email, "d.sp_site_id")
+    lake = lakebase.docs_enabled()
+    sites = perms_sites(email) if lake else None
 
-    # Each op reproduces the warehouse work of one hot endpoint (see api_documents / api_stats /
+    # Each op reproduces the work of one hot endpoint (see api_documents / api_stats /
     # api_search / api_document). Read-only mirrors — keep in sync if those queries change.
+    # When the document cutover is on, each op hits Lakebase so the numbers measure the new store.
     def op_documents():
+        if lake:
+            lakebase.list_documents(sites)
+            return
         query(
             f"SELECT doc_id, original_filename, document_type, department, sp_site_name, sp_path, "
             f"sp_web_url, mime_type, derived_pdf_path, "
@@ -378,12 +392,18 @@ def api_admin_bench():
         )
 
     def op_stats():
+        if lake:
+            lakebase.stats(sites)
+            return
         query(f"SELECT verification_status AS s, count(*) AS n FROM {config.DOCUMENTS} "
               f"WHERE {where} AND classification_status = 'classified' GROUP BY verification_status")
         query(f"SELECT count(*) AS n FROM {config.DOCUMENTS} "
               f"WHERE classification_status = 'unclassified' {perms_where(email)}")
 
     def op_search():
+        if lake:
+            lakebase.search(sites, "contract")
+            return
         ql = lit("%contract%")           # representative term, like bench/bench.py's default
         query(
             f"SELECT d.doc_id, d.original_filename, d.document_type, d.department, "
@@ -405,11 +425,25 @@ def api_admin_bench():
         )
 
     # Discover a real doc_id for the single-document fetch, like bench/bench.py does.
-    disc = query(f"SELECT doc_id FROM {config.DOCUMENTS} WHERE {where} "
-                 f"ORDER BY created_at DESC LIMIT 1")
-    doc_id = disc[0]["doc_id"] if disc else None
+    if lake:
+        _disc = lakebase.list_documents(sites)
+        doc_id = _disc[0]["doc_id"] if _disc else None
+    else:
+        disc = query(f"SELECT doc_id FROM {config.DOCUMENTS} WHERE {where} "
+                     f"ORDER BY created_at DESC LIMIT 1")
+        doc_id = disc[0]["doc_id"] if disc else None
 
     def op_document():
+        if lake:
+            doc = lakebase.get_document(doc_id)
+            dtype = doc.get("document_type") if doc else None
+            lakebase.get_field_values(doc_id)
+            query(f"SELECT field_key, label, data_type, picklist_source, required_for_verify, applies_to, sort_order "
+                  f"FROM {config.FIELD_DEFS} WHERE active = true AND "
+                  f"(applies_to = 'common' OR applies_to = {lit(dtype)}) "
+                  f"ORDER BY (applies_to='common') DESC, sort_order")
+            lakebase.get_tags(doc_id)
+            return
         docs = query(f"SELECT * FROM {config.DOCUMENTS} WHERE doc_id = {lit(doc_id)}")
         dtype = docs[0].get("document_type") if docs else None
         query(f"SELECT field_key, proposed_value, confirmed_value, source_provenance, confidence "
@@ -475,6 +509,8 @@ def api_documents():
     email = current_user()
     status = request.args.get("verification_status")
     cstatus = request.args.get("classification_status")
+    if lakebase.docs_enabled():
+        return jsonify(lakebase.list_documents(perms_sites(email), status, cstatus))
     where = "1=1" + perms_where(email)
     if status:
         # A doc only enters the review pipeline once it's classified; unclassified docs stay
@@ -495,15 +531,18 @@ def api_documents():
 @app.get("/api/stats")
 def api_stats():
     email = current_user()
-    where = "1=1" + perms_where(email)
-    rows = query(
-        f"SELECT verification_status AS s, count(*) AS n FROM {config.DOCUMENTS} "
-        f"WHERE {where} AND classification_status = 'classified' GROUP BY verification_status"
-    )
-    unclassified = query(
-        f"SELECT count(*) AS n FROM {config.DOCUMENTS} "
-        f"WHERE classification_status = 'unclassified' {perms_where(email)}"
-    )
+    if lakebase.docs_enabled():
+        rows, unclassified = lakebase.stats(perms_sites(email))
+    else:
+        where = "1=1" + perms_where(email)
+        rows = query(
+            f"SELECT verification_status AS s, count(*) AS n FROM {config.DOCUMENTS} "
+            f"WHERE {where} AND classification_status = 'classified' GROUP BY verification_status"
+        )
+        unclassified = query(
+            f"SELECT count(*) AS n FROM {config.DOCUMENTS} "
+            f"WHERE classification_status = 'unclassified' {perms_where(email)}"
+        )
     return jsonify(by_status={r["s"]: int(r["n"]) for r in rows},
                    unclassified=int(unclassified[0]["n"]) if unclassified else 0)
 
@@ -518,13 +557,16 @@ def api_classify():
     dept = body.get("department")
     if not ids:
         return jsonify(error="no doc_ids"), 400
-    id_list = ",".join(lit(i) for i in ids)
-    sets = [f"classification_status = 'classified'", "updated_at = current_timestamp()"]
-    if dt is not None:
-        sets.append(f"document_type = {lit(dt)}")
-    if dept is not None:
-        sets.append(f"department = {lit(dept)}")
-    execute(f"UPDATE {config.DOCUMENTS} SET {', '.join(sets)} WHERE doc_id IN ({id_list})")
+    if lakebase.docs_enabled():
+        lakebase.classify(ids, dt, dept)
+    else:
+        id_list = ",".join(lit(i) for i in ids)
+        sets = [f"classification_status = 'classified'", "updated_at = current_timestamp()"]
+        if dt is not None:
+            sets.append(f"document_type = {lit(dt)}")
+        if dept is not None:
+            sets.append(f"department = {lit(dept)}")
+        execute(f"UPDATE {config.DOCUMENTS} SET {', '.join(sets)} WHERE doc_id IN ({id_list})")
     _audit(email, "classify", f"{len(ids)} docs", body)
     return jsonify(updated=len(ids))
 
@@ -536,12 +578,15 @@ def api_enqueue():
     ids = request.get_json(force=True).get("doc_ids", [])
     if not ids:
         return jsonify(error="no doc_ids"), 400
-    id_list = ",".join(lit(i) for i in ids)
-    execute(
-        f"UPDATE {config.DOCUMENTS} SET extraction_status = 'pending', "
-        f"next_attempt_at = NULL, updated_at = current_timestamp() "
-        f"WHERE doc_id IN ({id_list}) AND classification_status = 'classified'"
-    )
+    if lakebase.docs_enabled():
+        lakebase.enqueue(ids)
+    else:
+        id_list = ",".join(lit(i) for i in ids)
+        execute(
+            f"UPDATE {config.DOCUMENTS} SET extraction_status = 'pending', "
+            f"next_attempt_at = NULL, updated_at = current_timestamp() "
+            f"WHERE doc_id IN ({id_list}) AND classification_status = 'classified'"
+        )
     _trigger_processing_run()  # kick the job now so extraction doesn't wait for the schedule
     _audit(email, "enqueue", f"{len(ids)} docs", None)
     return jsonify(enqueued=len(ids))
@@ -552,6 +597,8 @@ def api_enqueue():
 @app.get("/api/tags")
 def api_tags():
     """Distinct tags across the corpus (facet / autocomplete)."""
+    if lakebase.docs_enabled():
+        return jsonify(lakebase.tag_facets())
     rows = query(
         f"SELECT tag, count(*) AS n FROM {config.DOCUMENT_TAGS} "
         f"GROUP BY tag ORDER BY n DESC, tag LIMIT 500"
@@ -565,6 +612,11 @@ def api_add_tag(doc_id):
     tag = (request.get_json(force=True).get("tag") or "").strip()
     if not tag:
         return jsonify(error="tag required"), 400
+    if lakebase.docs_enabled():
+        if not lakebase.tag_exists(doc_id, tag):
+            lakebase.add_tag(doc_id, tag, email)
+            _audit(email, "tag_add", doc_id, {"tag": tag})
+        return jsonify(ok=True, tag=tag)
     # Idempotent: only insert if the (doc, tag) pair isn't already present.
     exists = query(
         f"SELECT 1 FROM {config.DOCUMENT_TAGS} WHERE doc_id = {lit(doc_id)} AND tag = {lit(tag)} LIMIT 1")
@@ -579,14 +631,41 @@ def api_add_tag(doc_id):
 @app.delete("/api/documents/<doc_id>/tags/<path:tag>")
 def api_remove_tag(doc_id, tag):
     email = current_user()
-    execute(
-        f"DELETE FROM {config.DOCUMENT_TAGS} WHERE doc_id = {lit(doc_id)} AND tag = {lit(tag)}")
+    if lakebase.docs_enabled():
+        lakebase.remove_tag(doc_id, tag)
+    else:
+        execute(
+            f"DELETE FROM {config.DOCUMENT_TAGS} WHERE doc_id = {lit(doc_id)} AND tag = {lit(tag)}")
     _audit(email, "tag_remove", doc_id, {"tag": tag})
     return jsonify(ok=True)
 
 
 @app.get("/api/documents/<doc_id>")
 def api_document(doc_id):
+    if lakebase.docs_enabled():
+        doc = lakebase.get_document(doc_id)
+        if not doc:
+            return jsonify(error="not found"), 404
+        # field_defs lives on the warehouse; the doc's values on Lakebase — a cross-store
+        # join isn't possible, so read the defs (warehouse) and values (Lakebase) separately
+        # and merge by field_key in Python (both round-trips are cheap).
+        defs = query(
+            f"SELECT fd.field_key, fd.label, fd.data_type, fd.picklist_source, fd.required_for_verify, "
+            f"fd.applies_to, fd.sort_order FROM {config.FIELD_DEFS} fd "
+            f"WHERE fd.active = true AND "
+            f"(fd.applies_to = 'common' OR fd.applies_to = {lit(doc.get('document_type'))}) "
+            f"ORDER BY (fd.applies_to='common') DESC, fd.sort_order"
+        )
+        vals = {r["field_key"]: r for r in lakebase.get_field_values(doc_id)}
+        for d in defs:
+            v = vals.get(d["field_key"], {})
+            d["proposed_value"] = v.get("proposed_value")
+            d["confirmed_value"] = v.get("confirmed_value")
+            d["source_provenance"] = v.get("source_provenance")
+            if d.get("picklist_source") and "|" in str(d["picklist_source"]):
+                d["options"] = str(d["picklist_source"]).split("|")
+        return jsonify(document=doc, fields=defs,
+                       links=lakebase.get_links(doc_id), tags=lakebase.get_tags(doc_id))
     docs = query(f"SELECT * FROM {config.DOCUMENTS} WHERE doc_id = {lit(doc_id)}")
     if not docs:
         return jsonify(error="not found"), 404
@@ -627,16 +706,19 @@ def api_save_fields(doc_id):
     email = current_user()
     values = request.get_json(force=True).get("values", {})
     for key, val in values.items():
-        execute(
-            f"MERGE INTO {config.DOCUMENT_FIELDS} t "
-            f"USING (SELECT {lit(doc_id)} AS doc_id, {lit(key)} AS field_key) s "
-            f"ON t.doc_id = s.doc_id AND t.field_key = s.field_key "
-            f"WHEN MATCHED THEN UPDATE SET confirmed_value = {lit(val)}, "
-            f"  source_provenance = 'human', updated_at = current_timestamp(), updated_by = {lit(email)} "
-            f"WHEN NOT MATCHED THEN INSERT (doc_id, field_key, confirmed_value, source_provenance, "
-            f"  updated_at, updated_by) VALUES ({lit(doc_id)}, {lit(key)}, {lit(val)}, 'human', "
-            f"  current_timestamp(), {lit(email)})"
-        )
+        if lakebase.docs_enabled():
+            lakebase.save_field(doc_id, key, val, email)
+        else:
+            execute(
+                f"MERGE INTO {config.DOCUMENT_FIELDS} t "
+                f"USING (SELECT {lit(doc_id)} AS doc_id, {lit(key)} AS field_key) s "
+                f"ON t.doc_id = s.doc_id AND t.field_key = s.field_key "
+                f"WHEN MATCHED THEN UPDATE SET confirmed_value = {lit(val)}, "
+                f"  source_provenance = 'human', updated_at = current_timestamp(), updated_by = {lit(email)} "
+                f"WHEN NOT MATCHED THEN INSERT (doc_id, field_key, confirmed_value, source_provenance, "
+                f"  updated_at, updated_by) VALUES ({lit(doc_id)}, {lit(key)}, {lit(val)}, 'human', "
+                f"  current_timestamp(), {lit(email)})"
+            )
     return jsonify(saved=len(values))
 
 
@@ -644,11 +726,17 @@ def api_save_fields(doc_id):
 def api_verify(doc_id):
     """Verify a document. Enforces required fields + amendment parent link."""
     email = current_user()
-    docs = query(f"SELECT document_type FROM {config.DOCUMENTS} WHERE doc_id = {lit(doc_id)}")
-    if not docs:
-        return jsonify(error="not found"), 404
-    dtype = docs[0].get("document_type")
-    # required fields present?
+    lake = lakebase.docs_enabled()
+    if lake:
+        dtype = lakebase.document_type(doc_id)
+        if not lakebase.document_exists(doc_id):
+            return jsonify(error="not found"), 404
+    else:
+        docs = query(f"SELECT document_type FROM {config.DOCUMENTS} WHERE doc_id = {lit(doc_id)}")
+        if not docs:
+            return jsonify(error="not found"), 404
+        dtype = docs[0].get("document_type")
+    # required fields present? (field_defs is warehouse-resident in either mode)
     req = query(
         f"SELECT fd.field_key FROM {config.FIELD_DEFS} fd "
         f"WHERE fd.active = true AND fd.required_for_verify = true AND "
@@ -656,26 +744,32 @@ def api_verify(doc_id):
     )
     # A required field is satisfied by a human-confirmed value OR an unedited AI proposal —
     # the reviewer sees the suggested value in the drawer and vouches for it by verifying.
-    have = {r["field_key"]: r for r in query(
-        f"SELECT field_key FROM {config.DOCUMENT_FIELDS} "
-        f"WHERE doc_id = {lit(doc_id)} AND coalesce(confirmed_value, proposed_value) IS NOT NULL "
-        f"AND coalesce(confirmed_value, proposed_value) <> ''")}
+    if lake:
+        have = lakebase.satisfied_field_keys(doc_id)
+    else:
+        have = {r["field_key"] for r in query(
+            f"SELECT field_key FROM {config.DOCUMENT_FIELDS} "
+            f"WHERE doc_id = {lit(doc_id)} AND coalesce(confirmed_value, proposed_value) IS NOT NULL "
+            f"AND coalesce(confirmed_value, proposed_value) <> ''")}
     missing = [r["field_key"] for r in req if r["field_key"] not in have]
     if missing:
         return jsonify(error="missing_required", fields=missing), 400
     # amendments require a parent contract link
     if dtype == "Amendment":
-        pl = query(
+        has_parent = (lakebase.has_amendment_parent(doc_id) if lake else bool(query(
             f"SELECT 1 FROM {config.DOCUMENT_LINKS} WHERE child_doc_id = {lit(doc_id)} "
-            f"AND relationship = 'amendment_of' LIMIT 1")
-        if not pl:
+            f"AND relationship = 'amendment_of' LIMIT 1")))
+        if not has_parent:
             return jsonify(error="amendment_needs_parent"), 400
-    execute(
-        f"UPDATE {config.DOCUMENTS} SET verification_status = 'verified', "
-        f"verified_by = {lit(email)}, verified_at = current_timestamp(), "
-        f"mirror_status = 'not_mirrored', updated_at = current_timestamp() "
-        f"WHERE doc_id = {lit(doc_id)}"
-    )
+    if lake:
+        lakebase.verify(doc_id, email)
+    else:
+        execute(
+            f"UPDATE {config.DOCUMENTS} SET verification_status = 'verified', "
+            f"verified_by = {lit(email)}, verified_at = current_timestamp(), "
+            f"mirror_status = 'not_mirrored', updated_at = current_timestamp() "
+            f"WHERE doc_id = {lit(doc_id)}"
+        )
     _audit(email, "verify", doc_id, None)
     return jsonify(verified=True)
 
@@ -683,10 +777,13 @@ def api_verify(doc_id):
 @app.post("/api/documents/<doc_id>/unverify")
 def api_unverify(doc_id):
     email = current_user()
-    execute(
-        f"UPDATE {config.DOCUMENTS} SET verification_status = 'needs_review', "
-        f"updated_at = current_timestamp() WHERE doc_id = {lit(doc_id)}"
-    )
+    if lakebase.docs_enabled():
+        lakebase.unverify(doc_id)
+    else:
+        execute(
+            f"UPDATE {config.DOCUMENTS} SET verification_status = 'needs_review', "
+            f"updated_at = current_timestamp() WHERE doc_id = {lit(doc_id)}"
+        )
     _audit(email, "unverify", doc_id, None)
     return jsonify(unverified=True)
 
@@ -700,13 +797,16 @@ def api_link():
     parent, child, rel = b.get("parent_doc_id"), b.get("child_doc_id"), b.get("relationship", "related")
     if not parent or not child or parent == child:
         return jsonify(error="bad link"), 400
-    execute(
-        f"MERGE INTO {config.DOCUMENT_LINKS} t "
-        f"USING (SELECT {lit(parent)} AS p, {lit(child)} AS c, {lit(rel)} AS r) s "
-        f"ON t.parent_doc_id = s.p AND t.child_doc_id = s.c AND t.relationship = s.r "
-        f"WHEN NOT MATCHED THEN INSERT (parent_doc_id, child_doc_id, relationship, created_by, created_at) "
-        f"VALUES (s.p, s.c, s.r, {lit(email)}, current_timestamp())"
-    )
+    if lakebase.docs_enabled():
+        lakebase.add_link(parent, child, rel, email)
+    else:
+        execute(
+            f"MERGE INTO {config.DOCUMENT_LINKS} t "
+            f"USING (SELECT {lit(parent)} AS p, {lit(child)} AS c, {lit(rel)} AS r) s "
+            f"ON t.parent_doc_id = s.p AND t.child_doc_id = s.c AND t.relationship = s.r "
+            f"WHEN NOT MATCHED THEN INSERT (parent_doc_id, child_doc_id, relationship, created_by, created_at) "
+            f"VALUES (s.p, s.c, s.r, {lit(email)}, current_timestamp())"
+        )
     return jsonify(linked=True)
 
 
@@ -720,6 +820,8 @@ def api_search():
     dept = request.args.get("department")
     path = request.args.get("path")  # prefix filter on the SharePoint path
     tag = request.args.get("tag")
+    if lakebase.docs_enabled():
+        return jsonify(lakebase.search(perms_sites(email), q, dt, dept, path, tag))
     where = "verification_status = 'verified'" + perms_where(email, "d.sp_site_id")
     if dt:
         where += f" AND d.document_type = {lit(dt)}"
@@ -762,12 +864,17 @@ def api_download():
     """Stream a file from the volume (searchable PDF preferred, else original)."""
     doc_id = request.args.get("doc_id")
     which = request.args.get("which", "derived")
-    docs = query(
-        f"SELECT volume_path, derived_pdf_path, original_filename, mime_type "
-        f"FROM {config.DOCUMENTS} WHERE doc_id = {lit(doc_id)}")
-    if not docs:
-        return jsonify(error="not found"), 404
-    d = docs[0]
+    if lakebase.docs_enabled():
+        d = lakebase.get_document(doc_id)
+        if not d:
+            return jsonify(error="not found"), 404
+    else:
+        docs = query(
+            f"SELECT volume_path, derived_pdf_path, original_filename, mime_type "
+            f"FROM {config.DOCUMENTS} WHERE doc_id = {lit(doc_id)}")
+        if not docs:
+            return jsonify(error="not found"), 404
+        d = docs[0]
     path = d.get("derived_pdf_path") if which == "derived" and d.get("derived_pdf_path") else d["volume_path"]
     resp = _w.files.download(path)
     data = resp.contents.read()

@@ -74,3 +74,84 @@ def test_get_perms_falls_back_to_warehouse_on_lakebase_error(bind_db, monkeypatc
         is_admin, is_full, allowed = app_module.get_perms("u@x.com")
     assert is_admin is True  # warehouse fallback served the read
     assert len(fake.queried_matching("access_type, allowed_site")) == 1
+
+
+# ══ Document family — full cutover routing (USE_LAKEBASE_DOCUMENTS) ═══════════
+def test_docs_enabled_requires_both_enabled_and_flag(monkeypatch):
+    import config
+    monkeypatch.setattr(lakebase, "enabled", lambda: True)
+    monkeypatch.setattr(config, "USE_LAKEBASE_DOCUMENTS", False)
+    assert lakebase.docs_enabled() is False          # live but flag off → warehouse
+    monkeypatch.setattr(config, "USE_LAKEBASE_DOCUMENTS", True)
+    assert lakebase.docs_enabled() is True
+    monkeypatch.setattr(lakebase, "enabled", lambda: False)
+    assert lakebase.docs_enabled() is False           # flag on but not live → inert
+
+
+def test_api_documents_reads_lakebase_not_warehouse_when_enabled(client, fake_db, monkeypatch):
+    import app as app_module
+    from conftest import route
+    fake_db.responder = route([("access_type, allowed_site", [{"access_type": "FULL", "allowed_site": None}])])
+    monkeypatch.setattr(app_module.lakebase, "docs_enabled", lambda: True)
+    canned = [{"doc_id": "d9", "original_filename": "x.pdf"}]
+    monkeypatch.setattr(app_module.lakebase, "list_documents", lambda *a, **k: canned)
+    r = client.get("/api/documents")
+    assert r.status_code == 200 and r.get_json() == canned
+    # The warehouse documents SELECT must NOT have run (permissions read may still).
+    assert fake_db.queried_matching("FROM product_dev.document_hub.documents") == []
+
+
+def test_api_documents_uses_warehouse_when_disabled(client, fake_db, monkeypatch):
+    import app as app_module
+    from conftest import route
+    fake_db.responder = route([("access_type, allowed_site", [{"access_type": "FULL", "allowed_site": None}])],
+                              default=[])
+    monkeypatch.setattr(app_module.lakebase, "docs_enabled", lambda: False)
+    r = client.get("/api/documents")
+    assert r.status_code == 200
+    assert len(fake_db.queried_matching("FROM product_dev.document_hub.documents")) == 1
+
+
+def test_api_classify_writes_lakebase_when_enabled(client, fake_db, monkeypatch):
+    import app as app_module
+    from conftest import route
+    fake_db.responder = route([("access_type, allowed_site", [{"access_type": "FULL", "allowed_site": None}])])
+    monkeypatch.setattr(app_module.lakebase, "docs_enabled", lambda: True)
+    calls = []
+    monkeypatch.setattr(app_module.lakebase, "classify",
+                        lambda ids, dt, dept: calls.append((ids, dt, dept)))
+    r = client.post("/api/documents/classify",
+                    json={"doc_ids": ["d1", "d2"], "document_type": "Invoice", "department": "AP"})
+    assert r.status_code == 200 and r.get_json() == {"updated": 2}
+    assert calls == [(["d1", "d2"], "Invoice", "AP")]
+    assert fake_db.executed_matching("UPDATE product_dev.document_hub.documents") == []  # warehouse untouched
+
+
+def test_api_document_merges_warehouse_defs_with_lakebase_values(client, fake_db, monkeypatch):
+    import app as app_module
+    from conftest import route
+    # field_defs is warehouse-resident; document + values come from Lakebase.
+    defs = [{"field_key": "title", "label": "Title", "data_type": "string",
+             "picklist_source": None, "required_for_verify": True,
+             "applies_to": "common", "sort_order": 1}]
+    fake_db.responder = route([("access_type, allowed_site", [{"access_type": "FULL", "allowed_site": None}]),
+                               ("field_defs", defs)])
+    monkeypatch.setattr(app_module.lakebase, "docs_enabled", lambda: True)
+    monkeypatch.setattr(app_module.lakebase, "get_document",
+                        lambda doc_id: {"doc_id": doc_id, "document_type": "Invoice"})
+    monkeypatch.setattr(app_module.lakebase, "get_field_values",
+                        lambda doc_id: [{"field_key": "title", "proposed_value": "AI title",
+                                         "confirmed_value": "Human title", "source_provenance": "human",
+                                         "confidence": None}])
+    monkeypatch.setattr(app_module.lakebase, "get_links", lambda doc_id: [])
+    monkeypatch.setattr(app_module.lakebase, "get_tags", lambda doc_id: ["t1"])
+    r = client.get("/api/documents/d1")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["document"]["doc_id"] == "d1"
+    assert body["tags"] == ["t1"]
+    fld = body["fields"][0]
+    assert fld["field_key"] == "title"
+    assert fld["confirmed_value"] == "Human title" and fld["proposed_value"] == "AI title"
+    # No cross-store join was attempted against the warehouse document_fields.
+    assert fake_db.queried_matching("document_fields") == []

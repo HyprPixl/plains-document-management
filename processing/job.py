@@ -30,6 +30,7 @@ from databricks.sdk import WorkspaceClient
 
 import config
 import ingest
+import lakebase
 import sharepoint as sp
 from db import query, execute, lit
 from . import graph, ocr, extract
@@ -87,33 +88,45 @@ def sweep_sharepoint() -> int:
         for item in graph.list_files(drive_id, folder, exts=(".pdf",)):
             # Skip if we already have this exact source item (by source_ref).
             ref = f"{drive_id}/{item['item_id']}"
-            existing = query(
-                f"SELECT doc_id FROM {config.DOCUMENTS} WHERE source_ref = {lit(ref)} LIMIT 1")
-            if existing:
+            lake = lakebase.docs_enabled()
+            if lake:
+                if lakebase.find_by_source_ref(ref):
+                    continue
+            elif query(
+                    f"SELECT doc_id FROM {config.DOCUMENTS} WHERE source_ref = {lit(ref)} LIMIT 1"):
                 continue
             data = graph.download(drive_id, item["item_id"])
             sha = _sha256(data)
-            dup = query(
-                f"SELECT doc_id FROM {config.DOCUMENTS} WHERE content_sha256 = {lit(sha)} LIMIT 1")
+            dup = lakebase.find_by_sha(sha) if lake else query(
+                f"SELECT doc_id, volume_path FROM {config.DOCUMENTS} WHERE content_sha256 = {lit(sha)} LIMIT 1")
             doc_id = "d_" + uuid.uuid4().hex
             vpath = f"{config.DOCS_VOLUME}/sharepoint/{src['source_id']}/{sha}.pdf"
             if not dup:
                 _write_volume(vpath, data)
             else:
-                vpath = query(
-                    f"SELECT volume_path FROM {config.DOCUMENTS} WHERE content_sha256 = {lit(sha)} LIMIT 1"
-                )[0]["volume_path"]
-            execute(
-                f"INSERT INTO {config.DOCUMENTS} "
-                f"(doc_id, content_sha256, volume_path, original_filename, mime_type, size_bytes, "
-                f" source_id, source_ref, classification_status, extraction_status, verification_status, "
-                f" mirror_status, attempt_count, file_modified_at, created_at, created_by, updated_at) "
-                f"VALUES ({lit(doc_id)}, {lit(sha)}, {lit(vpath)}, {lit(item['name'])}, "
-                f"{lit(item.get('mime') or 'application/pdf')}, {item.get('size', 0)}, "
-                f"{lit(src['source_id'])}, {lit(ref)}, 'unclassified', 'pending', 'needs_review', "
-                f"'not_mirrored', 0, {lit(item.get('modified'))}, current_timestamp(), 'sweep', "
-                f"current_timestamp())"
-            )
+                vpath = dup[0]["volume_path"]
+            if lake:
+                lakebase.insert_document(
+                    doc_id=doc_id, content_sha256=sha, volume_path=vpath,
+                    original_filename=item["name"],
+                    mime_type=item.get("mime") or "application/pdf", size_bytes=item.get("size", 0),
+                    source_id=src["source_id"], source_ref=ref, classification_status="unclassified",
+                    extraction_status="pending", verification_status="needs_review",
+                    mirror_status="not_mirrored", attempt_count=0,
+                    file_modified_at=item.get("modified"), created_by="sweep",
+                )
+            else:
+                execute(
+                    f"INSERT INTO {config.DOCUMENTS} "
+                    f"(doc_id, content_sha256, volume_path, original_filename, mime_type, size_bytes, "
+                    f" source_id, source_ref, classification_status, extraction_status, verification_status, "
+                    f" mirror_status, attempt_count, file_modified_at, created_at, created_by, updated_at) "
+                    f"VALUES ({lit(doc_id)}, {lit(sha)}, {lit(vpath)}, {lit(item['name'])}, "
+                    f"{lit(item.get('mime') or 'application/pdf')}, {item.get('size', 0)}, "
+                    f"{lit(src['source_id'])}, {lit(ref)}, 'unclassified', 'pending', 'needs_review', "
+                    f"'not_mirrored', 0, {lit(item.get('modified'))}, current_timestamp(), 'sweep', "
+                    f"current_timestamp())"
+                )
             registered += 1
     _heartbeat("sweep", info=f"registered={registered}")
     return registered
@@ -338,6 +351,8 @@ def _iso_from_epoch(epoch) -> str | None:
 
 def claim_batch(n: int) -> list[dict]:
     """Claim up to n pending, unleased/expired docs for this worker. Concurrency-safe."""
+    if lakebase.docs_enabled():
+        return lakebase.claim_batch(WORKER_ID, n, config.MAX_ATTEMPTS, config.CLAIM_LEASE_SECONDS)
     candidates = query(
         f"SELECT doc_id FROM {config.DOCUMENTS} WHERE extraction_status = 'pending' "
         f"AND classification_status = 'classified' "
@@ -366,6 +381,9 @@ def claim_batch(n: int) -> list[dict]:
 
 
 def _extend_lease(doc_id: str) -> None:
+    if lakebase.docs_enabled():
+        lakebase.extend_lease(doc_id, WORKER_ID, config.CLAIM_LEASE_SECONDS)
+        return
     execute(
         f"UPDATE {config.DOCUMENTS} SET "
         f"claim_expires_at = current_timestamp() + INTERVAL {config.CLAIM_LEASE_SECONDS} SECONDS, "
@@ -400,6 +418,19 @@ def process_doc(doc: dict) -> None:
 
 
 def _commit_success(doc_id, derived_path, res, proposed) -> None:
+    lake = lakebase.docs_enabled()
+    sig = f"{config.PROMPT_VERSION}:{res['text_source']}"
+    if lake:
+        # Text: replace this doc's rows atomically (delete-then-insert is idempotent per doc).
+        lakebase.replace_text(doc_id, res["pages"])
+        # Proposed fields: upsert so we never clobber a human's confirmed_value.
+        for key, val in (proposed or {}).items():
+            sval = None if val is None else (val if isinstance(val, str) else json.dumps(val))
+            lakebase.upsert_proposed_field(doc_id, key, sval)
+        lakebase.commit_extraction_done(
+            doc_id, derived_path, res["text_source"], int(res["page_count"]), sig)
+        print(f"  ✓ {doc_id} ({res['text_source']}, {res['page_count']}p, {len(proposed or {})} fields)")
+        return
     # Text: replace this doc's rows atomically (delete-then-insert is idempotent per doc).
     execute(f"DELETE FROM {config.DOCUMENT_TEXT} WHERE doc_id = {lit(doc_id)}")
     for p in res["pages"]:
@@ -420,7 +451,6 @@ def _commit_success(doc_id, derived_path, res, proposed) -> None:
             f"WHEN NOT MATCHED THEN INSERT (doc_id, field_key, proposed_value, source_provenance, updated_at) "
             f"VALUES ({lit(doc_id)}, {lit(key)}, {lit(sval)}, 'ai', current_timestamp())"
         )
-    sig = f"{config.PROMPT_VERSION}:{res['text_source']}"
     execute(
         f"UPDATE {config.DOCUMENTS} SET extraction_status = 'done', "
         f"derived_pdf_path = {lit(derived_path)}, text_source = {lit(res['text_source'])}, "
@@ -435,22 +465,29 @@ def _commit_failure(doc, exc) -> None:
     doc_id = doc["doc_id"]
     attempts = (doc.get("attempt_count") or 0) + 1
     msg = f"{type(exc).__name__}: {exc}"[:1000]
+    lake = lakebase.docs_enabled()
     if attempts >= config.MAX_ATTEMPTS:
-        execute(
-            f"UPDATE {config.DOCUMENTS} SET extraction_status = 'failed', attempt_count = {attempts}, "
-            f"error_message = {lit(msg)}, claimed_by = NULL, claim_expires_at = NULL, "
-            f"updated_at = current_timestamp() WHERE doc_id = {lit(doc_id)}"
-        )
+        if lake:
+            lakebase.commit_extraction_failed(doc_id, attempts, msg)
+        else:
+            execute(
+                f"UPDATE {config.DOCUMENTS} SET extraction_status = 'failed', attempt_count = {attempts}, "
+                f"error_message = {lit(msg)}, claimed_by = NULL, claim_expires_at = NULL, "
+                f"updated_at = current_timestamp() WHERE doc_id = {lit(doc_id)}"
+            )
         logger.error("doc_id=%s stage=process_doc FAILED permanently after %d attempts: %s\n%s",
                      doc_id, attempts, msg, traceback.format_exc())
     else:
         backoff = BACKOFF_BASE * (2 ** (attempts - 1))
-        execute(
-            f"UPDATE {config.DOCUMENTS} SET extraction_status = 'pending', attempt_count = {attempts}, "
-            f"error_message = {lit(msg)}, claimed_by = NULL, claim_expires_at = NULL, "
-            f"next_attempt_at = current_timestamp() + INTERVAL {backoff} SECONDS, "
-            f"updated_at = current_timestamp() WHERE doc_id = {lit(doc_id)}"
-        )
+        if lake:
+            lakebase.commit_extraction_retry(doc_id, attempts, msg, backoff)
+        else:
+            execute(
+                f"UPDATE {config.DOCUMENTS} SET extraction_status = 'pending', attempt_count = {attempts}, "
+                f"error_message = {lit(msg)}, claimed_by = NULL, claim_expires_at = NULL, "
+                f"next_attempt_at = current_timestamp() + INTERVAL {backoff} SECONDS, "
+                f"updated_at = current_timestamp() WHERE doc_id = {lit(doc_id)}"
+            )
         logger.warning("doc_id=%s stage=process_doc retry %d/%d in %ds: %s\n%s",
                        doc_id, attempts, config.MAX_ATTEMPTS, backoff, msg, traceback.format_exc())
 

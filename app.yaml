@@ -67,3 +67,10 @@ env:
   # back to the warehouse instantly. (Defaults on when PGHOST is bound even if unset.)
   - name: USE_LAKEBASE_PERMISSIONS
     value: "true"
+  # FULL cutover of the document_* family (documents/fields/text/tags/links) to Lakebase —
+  # reads AND writes, no warehouse copy. Kept 'false' until the processing job (worker.py) is
+  # given its own Lakebase connectivity: the job is separate compute with no `database`
+  # resource binding, and flipping this on before it can reach Lakebase breaks processing
+  # (the app would write Lakebase while the job reads an empty warehouse). See AGENTS.md.
+  - name: USE_LAKEBASE_DOCUMENTS
+    value: "false"

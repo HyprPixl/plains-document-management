@@ -30,6 +30,14 @@ def _env_bool(name: str, default: bool) -> bool:
 
 USE_LAKEBASE_PERMISSIONS = _env_bool("USE_LAKEBASE_PERMISSIONS", default=bool(os.getenv("PGHOST")))
 
+# USE_LAKEBASE_DOCUMENTS is a FULL cutover of the document_* family (documents,
+# document_fields, document_text, document_tags, document_links) to Lakebase — reads
+# AND writes, no warehouse copy. It defaults OFF (explicit opt-in), NOT on-when-bound
+# like permissions: the processing job (worker.py) is separate compute that must be
+# given Lakebase credentials first, else flipping this on breaks processing (the app
+# would write Lakebase while the job reads an empty warehouse). See lakebase.py + AGENTS.md.
+USE_LAKEBASE_DOCUMENTS = _env_bool("USE_LAKEBASE_DOCUMENTS", default=False)
+
 # ai_query (batch inference) doesn't support the newest sonnet-5/opus-5 endpoints yet;
 # sonnet-4-5 is the current model that works with ai_query batch calls.
 EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "databricks-claude-sonnet-4-5")

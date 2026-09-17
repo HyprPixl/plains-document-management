@@ -336,3 +336,549 @@ def mirror_user_sites(email: str, site_ids: list[str]) -> None:
             )
     except Exception as e:
         logger.warning(f"lakebase mirror_user_sites failed (warehouse write stands): {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Document family — FULL cutover behind config.USE_LAKEBASE_DOCUMENTS
+# ══════════════════════════════════════════════════════════════════════════
+# Unlike permissions (dual-write + warehouse fallback), the document_* tables move
+# wholesale to Lakebase: reads AND writes, no warehouse copy. The five tables inter-join
+# inside single statements (search joins document_text; related-docs joins document_links;
+# explore filters document_tags) and Postgres can't join across the warehouse boundary, so
+# they must live together. field_defs / taxonomy / extraction_cache stay on the warehouse
+# (config + ai_query cache); ai_query itself is a pure warehouse function fed text inline.
+#
+# All values are passed as %s parameters (never lit()-interpolated) — OCR text and field
+# values are arbitrary, and Spark vs Postgres escape backslashes differently.
+
+DOCUMENTS = f"{SCHEMA}.documents"
+DOCUMENT_FIELDS = f"{SCHEMA}.document_fields"
+DOCUMENT_TEXT = f"{SCHEMA}.document_text"
+DOCUMENT_TAGS = f"{SCHEMA}.document_tags"
+DOCUMENT_LINKS = f"{SCHEMA}.document_links"
+
+_DOCS_LOCK_KEY = 918273646  # distinct from the permissions backfill lock
+
+
+def docs_enabled() -> bool:
+    """True when Lakebase is live AND the document cutover flag is on."""
+    return enabled() and config.USE_LAKEBASE_DOCUMENTS
+
+
+# ─────────────────────────────────────────────── document DDL / bootstrap ──
+_docs_ready = False
+_docs_lock = threading.Lock()
+
+_DOCS_DDL = (
+    f"CREATE TABLE IF NOT EXISTS {DOCUMENTS} ("
+    "  doc_id                TEXT PRIMARY KEY,"
+    "  content_sha256        TEXT,"
+    "  volume_path           TEXT,"
+    "  derived_pdf_path      TEXT,"
+    "  text_source           TEXT,"
+    "  original_filename     TEXT,"
+    "  mime_type             TEXT,"
+    "  size_bytes            BIGINT,"
+    "  page_count            INTEGER,"
+    "  source_id             TEXT,"
+    "  source_ref            TEXT,"
+    "  batch_id              TEXT,"
+    "  business_unit         TEXT,"
+    "  document_type         TEXT,"
+    "  department            TEXT,"
+    "  classification_status TEXT,"
+    "  extraction_status     TEXT,"
+    "  verification_status   TEXT,"
+    "  mirror_status         TEXT,"
+    "  extraction_sig        TEXT,"
+    "  file_modified_at      TIMESTAMPTZ,"
+    "  claimed_by            TEXT,"
+    "  claim_expires_at      TIMESTAMPTZ,"
+    "  attempt_count         INTEGER,"
+    "  next_attempt_at       TIMESTAMPTZ,"
+    "  error_message         TEXT,"
+    "  created_at            TIMESTAMPTZ,"
+    "  created_by            TEXT,"
+    "  verified_at           TIMESTAMPTZ,"
+    "  verified_by           TEXT,"
+    "  updated_at            TIMESTAMPTZ,"
+    "  sp_site_id            TEXT,"
+    "  sp_site_name          TEXT,"
+    "  sp_drive_id           TEXT,"
+    "  sp_path               TEXT,"
+    "  sp_web_url            TEXT"
+    ")",
+    f"CREATE INDEX IF NOT EXISTS documents_sha_idx     ON {DOCUMENTS} (content_sha256)",
+    f"CREATE INDEX IF NOT EXISTS documents_srcref_idx  ON {DOCUMENTS} (source_ref)",
+    f"CREATE INDEX IF NOT EXISTS documents_ext_idx     ON {DOCUMENTS} (extraction_status)",
+    f"CREATE INDEX IF NOT EXISTS documents_site_idx    ON {DOCUMENTS} (sp_site_id)",
+    f"CREATE INDEX IF NOT EXISTS documents_created_idx ON {DOCUMENTS} (created_at DESC)",
+    f"CREATE TABLE IF NOT EXISTS {DOCUMENT_FIELDS} ("
+    "  doc_id            TEXT NOT NULL,"
+    "  field_key         TEXT NOT NULL,"
+    "  proposed_value    TEXT,"
+    "  confirmed_value   TEXT,"
+    "  confidence        DOUBLE PRECISION,"
+    "  source_provenance TEXT,"
+    "  updated_at        TIMESTAMPTZ,"
+    "  updated_by        TEXT,"
+    "  PRIMARY KEY (doc_id, field_key)"
+    ")",
+    f"CREATE TABLE IF NOT EXISTS {DOCUMENT_TEXT} ("
+    "  doc_id     TEXT NOT NULL,"
+    "  page       INTEGER NOT NULL,"
+    "  text       TEXT,"
+    "  bbox       TEXT,"
+    "  updated_at TIMESTAMPTZ,"
+    "  PRIMARY KEY (doc_id, page)"
+    ")",
+    f"CREATE TABLE IF NOT EXISTS {DOCUMENT_TAGS} ("
+    "  doc_id     TEXT NOT NULL,"
+    "  tag        TEXT NOT NULL,"
+    "  created_by TEXT,"
+    "  created_at TIMESTAMPTZ,"
+    "  PRIMARY KEY (doc_id, tag)"
+    ")",
+    f"CREATE TABLE IF NOT EXISTS {DOCUMENT_LINKS} ("
+    "  parent_doc_id TEXT NOT NULL,"
+    "  child_doc_id  TEXT NOT NULL,"
+    "  relationship  TEXT NOT NULL,"
+    "  created_by    TEXT,"
+    "  created_at    TIMESTAMPTZ,"
+    "  PRIMARY KEY (parent_doc_id, child_doc_id, relationship)"
+    ")",
+)
+
+
+def _ensure_documents_ready():
+    """Create the document_* tables once per worker, serialized across the 4 gunicorn
+    workers by a Postgres advisory lock (CREATE ... IF NOT EXISTS isn't atomic across
+    sessions — same concurrent-DDL hazard the permissions bootstrap handles). No backfill:
+    the cutover starts from an empty store by design (the tiny warehouse corpus is dropped)."""
+    global _docs_ready
+    if _docs_ready:
+        return
+    with _docs_lock:
+        if _docs_ready:
+            return
+        conn = _connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(%s)", (_DOCS_LOCK_KEY,))
+            try:
+                for stmt in _DOCS_DDL:
+                    try:
+                        cur.execute(stmt)
+                    except Exception as e:
+                        if not _benign_ddl_error(e):
+                            raise
+            finally:
+                cur.execute("SELECT pg_advisory_unlock(%s)", (_DOCS_LOCK_KEY,))
+        _docs_ready = True
+        logger.info("Lakebase document_hub document_* tables ready")
+
+
+def _sites_clause(sites, col: str = "sp_site_id"):
+    """Translate the app's site scope into a Postgres predicate + params.
+
+    `sites is None`  → unrestricted (FULL/ADMIN).  `sites == []` → see nothing.
+    Otherwise → `col = ANY(%s)` (psycopg2 adapts the list to a PG array).
+    """
+    if sites is None:
+        return "", []
+    if not sites:
+        return " AND 1=0", []
+    return f" AND {col} = ANY(%s)", [list(sites)]
+
+
+# ─────────────────────────────────────────────────────────── doc reads ──
+_DOC_LIST_COLS = (
+    "doc_id, original_filename, document_type, department, sp_site_name, sp_path, "
+    "sp_web_url, mime_type, derived_pdf_path, classification_status, extraction_status, "
+    "verification_status, mirror_status, source_id, batch_id, created_at"
+)
+
+
+def list_documents(sites, status: str | None = None, cstatus: str | None = None) -> list[dict]:
+    """Queue list — mirrors api_documents' warehouse query, site-scoped."""
+    _ensure_documents_ready()
+    clause, params = _sites_clause(sites)
+    where = "1=1" + clause
+    if status:
+        where += " AND verification_status = %s AND classification_status = 'classified'"
+        params.append(status)
+    if cstatus:
+        where += " AND classification_status = %s"
+        params.append(cstatus)
+    return pg_query(
+        f"SELECT {_DOC_LIST_COLS} FROM {DOCUMENTS} WHERE {where} "
+        f"ORDER BY created_at DESC LIMIT 500",
+        params,
+    )
+
+
+def stats(sites):
+    """Return (by_status_rows, unclassified_count) — mirrors api_stats."""
+    _ensure_documents_ready()
+    clause, params = _sites_clause(sites)
+    by = pg_query(
+        f"SELECT verification_status AS s, count(*) AS n FROM {DOCUMENTS} "
+        f"WHERE 1=1{clause} AND classification_status = 'classified' "
+        f"GROUP BY verification_status",
+        params,
+    )
+    clause2, params2 = _sites_clause(sites)
+    un = pg_query(
+        f"SELECT count(*) AS n FROM {DOCUMENTS} "
+        f"WHERE classification_status = 'unclassified'{clause2}",
+        params2,
+    )
+    return by, un
+
+
+_SEARCH_SELECT = (
+    "SELECT d.doc_id, d.original_filename, d.document_type, d.department, "
+    "d.sp_site_name, d.sp_path, d.sp_web_url, d.mime_type, d.derived_pdf_path, "
+    "coalesce(f_title.confirmed_value, f_title.proposed_value) AS title, "
+    "coalesce(f_sum.confirmed_value, f_sum.proposed_value) AS summary, d.created_at "
+    f"FROM {DOCUMENTS} d "
+    f"LEFT JOIN {DOCUMENT_FIELDS} f_title ON f_title.doc_id = d.doc_id AND f_title.field_key = 'title' "
+    f"LEFT JOIN {DOCUMENT_FIELDS} f_sum   ON f_sum.doc_id   = d.doc_id AND f_sum.field_key   = 'summary' "
+)
+
+
+def search(sites, q: str = "", document_type: str | None = None, department: str | None = None,
+           path: str | None = None, tag: str | None = None) -> list[dict]:
+    """Full search over verified docs — mirrors api_search (Spark concat_ws/collect_list
+    becomes Postgres string_agg; LIKE terms are ILIKE params).
+
+    Params are assembled in the SQL's textual %s order: the tag JOIN (which precedes WHERE)
+    binds first, then the WHERE site scope, filters, and free-text LIKEs.
+    """
+    _ensure_documents_ready()
+    site_clause, site_params = _sites_clause(sites, "d.sp_site_id")
+    params: list = []
+    join_txt = join_tag = ""
+    if tag:  # JOIN clause is textually before WHERE → its %s must bind first
+        join_tag = f"JOIN {DOCUMENT_TAGS} tg ON tg.doc_id = d.doc_id AND tg.tag = %s "
+        params.append(tag)
+    params += site_params
+    where = "d.verification_status = 'verified'" + site_clause
+    if document_type:
+        where += " AND d.document_type = %s"
+        params.append(document_type)
+    if department:
+        where += " AND d.department = %s"
+        params.append(department)
+    if path:
+        where += " AND lower(d.sp_path) LIKE %s"
+        params.append(path.lower() + "%")
+    if q:
+        join_txt = (
+            f"LEFT JOIN (SELECT doc_id, string_agg(text, ' ') AS body "
+            f"FROM {DOCUMENT_TEXT} GROUP BY doc_id) tx ON tx.doc_id = d.doc_id "
+        )
+        where += (
+            " AND (lower(d.original_filename) LIKE %s "
+            "OR lower(coalesce(d.sp_path, '')) LIKE %s "
+            "OR lower(coalesce(f_title.confirmed_value, f_title.proposed_value, '')) LIKE %s "
+            "OR lower(coalesce(f_sum.confirmed_value, f_sum.proposed_value, '')) LIKE %s "
+            "OR lower(coalesce(tx.body, '')) LIKE %s)"
+        )
+        params += [f"%{q.lower()}%"] * 5
+    return pg_query(
+        f"{_SEARCH_SELECT}{join_txt}{join_tag}WHERE {where} "
+        f"ORDER BY d.created_at DESC LIMIT 200",
+        params,
+    )
+
+
+def get_document(doc_id: str) -> dict | None:
+    _ensure_documents_ready()
+    rows = pg_query(f"SELECT * FROM {DOCUMENTS} WHERE doc_id = %s", (doc_id,))
+    return rows[0] if rows else None
+
+
+def get_field_values(doc_id: str) -> list[dict]:
+    """This doc's stored field rows (Lakebase). The drawer merges these against the
+    warehouse field_defs in Python — a cross-store join isn't possible, so the single
+    LEFT JOIN api_document used becomes two reads + a Python merge (both cheap here)."""
+    _ensure_documents_ready()
+    return pg_query(
+        "SELECT field_key, proposed_value, confirmed_value, source_provenance, confidence "
+        f"FROM {DOCUMENT_FIELDS} WHERE doc_id = %s",
+        (doc_id,),
+    )
+
+
+def get_tags(doc_id: str) -> list[str]:
+    _ensure_documents_ready()
+    return [r["tag"] for r in pg_query(
+        f"SELECT tag FROM {DOCUMENT_TAGS} WHERE doc_id = %s ORDER BY tag", (doc_id,))]
+
+
+def tag_facets() -> list[dict]:
+    _ensure_documents_ready()
+    return pg_query(
+        f"SELECT tag, count(*) AS n FROM {DOCUMENT_TAGS} "
+        f"GROUP BY tag ORDER BY n DESC, tag LIMIT 500"
+    )
+
+
+def get_links(doc_id: str) -> list[dict]:
+    _ensure_documents_ready()
+    return pg_query(
+        "SELECT l.relationship, l.child_doc_id, l.parent_doc_id, "
+        f"d.original_filename, d.document_type FROM {DOCUMENT_LINKS} l "
+        f"JOIN {DOCUMENTS} d ON d.doc_id = "
+        "  CASE WHEN l.parent_doc_id = %s THEN l.child_doc_id ELSE l.parent_doc_id END "
+        "WHERE l.parent_doc_id = %s OR l.child_doc_id = %s",
+        (doc_id, doc_id, doc_id),
+    )
+
+
+def document_type(doc_id: str) -> str | None:
+    _ensure_documents_ready()
+    rows = pg_query(f"SELECT document_type FROM {DOCUMENTS} WHERE doc_id = %s", (doc_id,))
+    return rows[0].get("document_type") if rows else None
+
+
+def document_exists(doc_id: str) -> bool:
+    _ensure_documents_ready()
+    return bool(pg_query(f"SELECT 1 FROM {DOCUMENTS} WHERE doc_id = %s LIMIT 1", (doc_id,)))
+
+
+def satisfied_field_keys(doc_id: str) -> set:
+    """Field keys with a non-empty confirmed OR proposed value (verify gate)."""
+    _ensure_documents_ready()
+    rows = pg_query(
+        f"SELECT field_key FROM {DOCUMENT_FIELDS} WHERE doc_id = %s "
+        "AND coalesce(confirmed_value, proposed_value) IS NOT NULL "
+        "AND coalesce(confirmed_value, proposed_value) <> ''",
+        (doc_id,),
+    )
+    return {r["field_key"] for r in rows}
+
+
+def has_amendment_parent(doc_id: str) -> bool:
+    _ensure_documents_ready()
+    return bool(pg_query(
+        f"SELECT 1 FROM {DOCUMENT_LINKS} WHERE child_doc_id = %s "
+        "AND relationship = 'amendment_of' LIMIT 1",
+        (doc_id,),
+    ))
+
+
+def find_by_sha(sha: str) -> list[dict]:
+    _ensure_documents_ready()
+    return pg_query(
+        "SELECT doc_id, original_filename, verification_status, volume_path "
+        f"FROM {DOCUMENTS} WHERE content_sha256 = %s LIMIT 1",
+        (sha,),
+    )
+
+
+def find_by_source_ref(ref: str) -> list[dict]:
+    _ensure_documents_ready()
+    return pg_query(f"SELECT doc_id FROM {DOCUMENTS} WHERE source_ref = %s LIMIT 1", (ref,))
+
+
+# ─────────────────────────────────────────────────────────── doc writes ──
+def insert_document(**cols) -> None:
+    """Insert one documents row. created_at/updated_at are stamped server-side (now());
+    any timestamp string params (e.g. file_modified_at) implicitly cast to timestamptz."""
+    _ensure_documents_ready()
+    cols.pop("created_at", None)
+    cols.pop("updated_at", None)
+    keys = [k for k in cols if cols[k] is not None]
+    collist = ", ".join(keys + ["created_at", "updated_at"])
+    placeholders = ", ".join(["%s"] * len(keys) + ["now()", "now()"])
+    pg_execute(
+        f"INSERT INTO {DOCUMENTS} ({collist}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",
+        [cols[k] for k in keys],
+    )
+
+
+def classify(doc_ids: list[str], document_type: str | None, department: str | None) -> None:
+    _ensure_documents_ready()
+    sets = ["classification_status = 'classified'", "updated_at = now()"]
+    params: list = []
+    if document_type is not None:
+        sets.append("document_type = %s")
+        params.append(document_type)
+    if department is not None:
+        sets.append("department = %s")
+        params.append(department)
+    params.append(list(doc_ids))
+    pg_execute(f"UPDATE {DOCUMENTS} SET {', '.join(sets)} WHERE doc_id = ANY(%s)", params)
+
+
+def enqueue(doc_ids: list[str]) -> None:
+    _ensure_documents_ready()
+    pg_execute(
+        f"UPDATE {DOCUMENTS} SET extraction_status = 'pending', next_attempt_at = NULL, "
+        "updated_at = now() WHERE doc_id = ANY(%s) AND classification_status = 'classified'",
+        (list(doc_ids),),
+    )
+
+
+def save_field(doc_id: str, field_key: str, value, email: str) -> None:
+    """Upsert a human-confirmed value (mirrors api_save_fields' MERGE)."""
+    _ensure_documents_ready()
+    pg_execute(
+        f"INSERT INTO {DOCUMENT_FIELDS} "
+        "(doc_id, field_key, confirmed_value, source_provenance, updated_at, updated_by) "
+        "VALUES (%s, %s, %s, 'human', now(), %s) "
+        "ON CONFLICT (doc_id, field_key) DO UPDATE SET "
+        "confirmed_value = EXCLUDED.confirmed_value, source_provenance = 'human', "
+        "updated_at = now(), updated_by = EXCLUDED.updated_by",
+        (doc_id, field_key, value, email),
+    )
+
+
+def verify(doc_id: str, email: str) -> None:
+    _ensure_documents_ready()
+    pg_execute(
+        f"UPDATE {DOCUMENTS} SET verification_status = 'verified', verified_by = %s, "
+        "verified_at = now(), mirror_status = 'not_mirrored', updated_at = now() "
+        "WHERE doc_id = %s",
+        (email, doc_id),
+    )
+
+
+def unverify(doc_id: str) -> None:
+    _ensure_documents_ready()
+    pg_execute(
+        f"UPDATE {DOCUMENTS} SET verification_status = 'needs_review', updated_at = now() "
+        "WHERE doc_id = %s",
+        (doc_id,),
+    )
+
+
+def tag_exists(doc_id: str, tag: str) -> bool:
+    _ensure_documents_ready()
+    return bool(pg_query(
+        f"SELECT 1 FROM {DOCUMENT_TAGS} WHERE doc_id = %s AND tag = %s LIMIT 1", (doc_id, tag)))
+
+
+def add_tag(doc_id: str, tag: str, email: str) -> None:
+    _ensure_documents_ready()
+    pg_execute(
+        f"INSERT INTO {DOCUMENT_TAGS} (doc_id, tag, created_by, created_at) "
+        "VALUES (%s, %s, %s, now()) ON CONFLICT DO NOTHING",
+        (doc_id, tag, email),
+    )
+
+
+def remove_tag(doc_id: str, tag: str) -> None:
+    _ensure_documents_ready()
+    pg_execute(f"DELETE FROM {DOCUMENT_TAGS} WHERE doc_id = %s AND tag = %s", (doc_id, tag))
+
+
+def add_link(parent: str, child: str, relationship: str, email: str) -> None:
+    _ensure_documents_ready()
+    pg_execute(
+        f"INSERT INTO {DOCUMENT_LINKS} "
+        "(parent_doc_id, child_doc_id, relationship, created_by, created_at) "
+        "VALUES (%s, %s, %s, %s, now()) ON CONFLICT DO NOTHING",
+        (parent, child, relationship, email),
+    )
+
+
+# ───────────────────────────────────────────── processing-job doc writes ──
+def claim_batch(worker_id: str, n: int, max_attempts: int, lease_secs: int) -> list[dict]:
+    """Claim up to n pending docs for this worker (mirrors job.claim_batch). Postgres
+    serializes the guarded UPDATE, so racing workers can't double-claim a row."""
+    _ensure_documents_ready()
+    candidates = pg_query(
+        f"SELECT doc_id FROM {DOCUMENTS} WHERE extraction_status = 'pending' "
+        "AND classification_status = 'classified' "
+        "AND (next_attempt_at IS NULL OR next_attempt_at <= now()) "
+        "AND (claim_expires_at IS NULL OR claim_expires_at <= now()) "
+        "AND attempt_count < %s ORDER BY created_at LIMIT %s",
+        (max_attempts, n),
+    )
+    if not candidates:
+        return []
+    ids = [c["doc_id"] for c in candidates]
+    pg_execute(
+        f"UPDATE {DOCUMENTS} SET claimed_by = %s, "
+        "claim_expires_at = now() + make_interval(secs => %s), "
+        "extraction_status = 'processing', updated_at = now() "
+        "WHERE doc_id = ANY(%s) AND extraction_status = 'pending' "
+        "AND (claim_expires_at IS NULL OR claim_expires_at <= now())",
+        (worker_id, lease_secs, ids),
+    )
+    return pg_query(
+        "SELECT doc_id, content_sha256, volume_path, original_filename, document_type, attempt_count "
+        f"FROM {DOCUMENTS} WHERE claimed_by = %s AND extraction_status = 'processing'",
+        (worker_id,),
+    )
+
+
+def extend_lease(doc_id: str, worker_id: str, lease_secs: int) -> None:
+    _ensure_documents_ready()
+    pg_execute(
+        f"UPDATE {DOCUMENTS} SET claim_expires_at = now() + make_interval(secs => %s), "
+        "updated_at = now() WHERE doc_id = %s AND claimed_by = %s",
+        (lease_secs, doc_id, worker_id),
+    )
+
+
+def replace_text(doc_id: str, pages: list[dict]) -> None:
+    """Replace this doc's page text atomically (delete-then-insert, idempotent per doc)."""
+    _ensure_documents_ready()
+    pg_execute(f"DELETE FROM {DOCUMENT_TEXT} WHERE doc_id = %s", (doc_id,))
+    for p in pages:
+        if (p.get("text") or "").strip():
+            pg_execute(
+                f"INSERT INTO {DOCUMENT_TEXT} (doc_id, page, text, updated_at) "
+                "VALUES (%s, %s, %s, now())",
+                (doc_id, int(p["page"]), p["text"]),
+            )
+
+
+def upsert_proposed_field(doc_id: str, field_key: str, value) -> None:
+    """AI-proposed value upsert — never clobbers an existing human confirmed_value or its
+    provenance (mirrors _commit_success' MERGE)."""
+    _ensure_documents_ready()
+    pg_execute(
+        f"INSERT INTO {DOCUMENT_FIELDS} "
+        "(doc_id, field_key, proposed_value, source_provenance, updated_at) "
+        "VALUES (%s, %s, %s, 'ai', now()) "
+        "ON CONFLICT (doc_id, field_key) DO UPDATE SET "
+        "proposed_value = EXCLUDED.proposed_value, "
+        f"source_provenance = coalesce({DOCUMENT_FIELDS}.source_provenance, 'ai'), "
+        "updated_at = now()",
+        (doc_id, field_key, value),
+    )
+
+
+def commit_extraction_done(doc_id: str, derived_path, text_source, page_count: int, sig: str) -> None:
+    _ensure_documents_ready()
+    pg_execute(
+        f"UPDATE {DOCUMENTS} SET extraction_status = 'done', derived_pdf_path = %s, "
+        "text_source = %s, page_count = %s, extraction_sig = %s, error_message = NULL, "
+        "claimed_by = NULL, claim_expires_at = NULL, updated_at = now() WHERE doc_id = %s",
+        (derived_path, text_source, page_count, sig, doc_id),
+    )
+
+
+def commit_extraction_failed(doc_id: str, attempts: int, message: str) -> None:
+    _ensure_documents_ready()
+    pg_execute(
+        f"UPDATE {DOCUMENTS} SET extraction_status = 'failed', attempt_count = %s, "
+        "error_message = %s, claimed_by = NULL, claim_expires_at = NULL, updated_at = now() "
+        "WHERE doc_id = %s",
+        (attempts, message, doc_id),
+    )
+
+
+def commit_extraction_retry(doc_id: str, attempts: int, message: str, backoff_secs: int) -> None:
+    _ensure_documents_ready()
+    pg_execute(
+        f"UPDATE {DOCUMENTS} SET extraction_status = 'pending', attempt_count = %s, "
+        "error_message = %s, claimed_by = NULL, claim_expires_at = NULL, "
+        "next_attempt_at = now() + make_interval(secs => %s), updated_at = now() "
+        "WHERE doc_id = %s",
+        (attempts, message, backoff_secs, doc_id),
+    )

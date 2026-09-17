@@ -14,6 +14,7 @@ import uuid
 from databricks.sdk import WorkspaceClient
 
 import config
+import lakebase
 from db import query, execute, lit
 
 _w = WorkspaceClient()
@@ -89,10 +90,13 @@ def register_bytes(
     otherwise it lands unclassified for the Manage queue.
     """
     sha = sha256(data)
-    existing = query(
-        f"SELECT doc_id, original_filename, verification_status FROM {config.DOCUMENTS} "
-        f"WHERE content_sha256 = {lit(sha)} LIMIT 1"
-    )
+    if lakebase.docs_enabled():
+        existing = lakebase.find_by_sha(sha)
+    else:
+        existing = query(
+            f"SELECT doc_id, original_filename, verification_status FROM {config.DOCUMENTS} "
+            f"WHERE content_sha256 = {lit(sha)} LIMIT 1"
+        )
     if existing:
         e = existing[0]
         return {"status": "duplicate", "filename": filename,
@@ -110,19 +114,32 @@ def register_bytes(
     classified = bool(business_unit or document_type)
     if not classified and not document_type:
         document_type = guess_document_type(filename, sp_path)
-    execute(
-        f"INSERT INTO {config.DOCUMENTS} "
-        f"(doc_id, content_sha256, volume_path, original_filename, mime_type, size_bytes, "
-        f" source_id, source_ref, batch_id, business_unit, document_type, department, "
-        f" sp_site_id, sp_site_name, sp_drive_id, sp_path, sp_web_url, "
-        f" classification_status, extraction_status, verification_status, mirror_status, "
-        f" attempt_count, file_modified_at, created_at, created_by, updated_at) "
-        f"VALUES ({lit(doc_id)}, {lit(sha)}, {lit(vpath)}, {lit(filename)}, {lit(mime)}, {len(data)}, "
-        f"{lit(source_id)}, {lit(source_ref)}, {lit(batch_id)}, {lit(business_unit)}, "
-        f"{lit(document_type)}, {lit(department)}, "
-        f"{lit(sp_site_id)}, {lit(sp_site_name)}, {lit(sp_drive_id)}, {lit(sp_path)}, {lit(sp_web_url)}, "
-        f"{lit('classified' if classified else 'unclassified')}, 'pending', 'needs_review', "
-        f"'not_mirrored', 0, {lit(file_modified_at)}, current_timestamp(), {lit(created_by)}, "
-        f"current_timestamp())"
-    )
+    cstatus = "classified" if classified else "unclassified"
+    if lakebase.docs_enabled():
+        lakebase.insert_document(
+            doc_id=doc_id, content_sha256=sha, volume_path=vpath, original_filename=filename,
+            mime_type=mime, size_bytes=len(data), source_id=source_id, source_ref=source_ref,
+            batch_id=batch_id, business_unit=business_unit, document_type=document_type,
+            department=department, sp_site_id=sp_site_id, sp_site_name=sp_site_name,
+            sp_drive_id=sp_drive_id, sp_path=sp_path, sp_web_url=sp_web_url,
+            classification_status=cstatus, extraction_status="pending",
+            verification_status="needs_review", mirror_status="not_mirrored",
+            attempt_count=0, file_modified_at=file_modified_at, created_by=created_by,
+        )
+    else:
+        execute(
+            f"INSERT INTO {config.DOCUMENTS} "
+            f"(doc_id, content_sha256, volume_path, original_filename, mime_type, size_bytes, "
+            f" source_id, source_ref, batch_id, business_unit, document_type, department, "
+            f" sp_site_id, sp_site_name, sp_drive_id, sp_path, sp_web_url, "
+            f" classification_status, extraction_status, verification_status, mirror_status, "
+            f" attempt_count, file_modified_at, created_at, created_by, updated_at) "
+            f"VALUES ({lit(doc_id)}, {lit(sha)}, {lit(vpath)}, {lit(filename)}, {lit(mime)}, {len(data)}, "
+            f"{lit(source_id)}, {lit(source_ref)}, {lit(batch_id)}, {lit(business_unit)}, "
+            f"{lit(document_type)}, {lit(department)}, "
+            f"{lit(sp_site_id)}, {lit(sp_site_name)}, {lit(sp_drive_id)}, {lit(sp_path)}, {lit(sp_web_url)}, "
+            f"{lit(cstatus)}, 'pending', 'needs_review', "
+            f"'not_mirrored', 0, {lit(file_modified_at)}, current_timestamp(), {lit(created_by)}, "
+            f"current_timestamp())"
+        )
     return {"status": "new", "doc_id": doc_id, "filename": filename}
