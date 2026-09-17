@@ -591,7 +591,12 @@ def main():
 
     print(f"Document Hub processing worker {WORKER_ID}")
     if args.check_lakebase:
-        sys.exit(check_lakebase())
+        # Return cleanly on success (a bare sys.exit(0) raises SystemExit, which the
+        # Databricks spark_python_task executor flags as a workload error); fail loudly only
+        # when the probe fails so the task result reflects real connectivity.
+        if check_lakebase() != 0:
+            raise SystemExit(1)
+        return
     # Passive reachability signal on every run once Lakebase creds are wired (flag-independent).
     if lakebase.enabled():
         check_lakebase()
