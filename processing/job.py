@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import socket
+import sys
 import time
 import traceback
 import uuid
@@ -559,6 +560,23 @@ def drain(do_sweep: bool = False, do_sync: bool = False, max_passes: int = 10000
     return total
 
 
+def check_lakebase() -> int:
+    """Probe Lakebase connectivity from the job compute (non-destructive SELECT 1) and log
+    the result. Returns 0 on success, 1 otherwise. Used to validate the job's own Lakebase
+    credentials/egress BEFORE the documents cutover flag (USE_LAKEBASE_DOCUMENTS) is flipped,
+    since with the flag off the job never otherwise touches Postgres."""
+    if not lakebase.enabled():
+        logger.warning("lakebase check: not enabled (PGHOST unset or psycopg2 missing) — skipping")
+        return 1
+    try:
+        rows = lakebase.pg_query("SELECT 1 AS ok, current_user, current_database()")
+        logger.info(f"lakebase check OK: {rows}")
+        return 0
+    except Exception as e:
+        logger.error(f"lakebase check FAILED: {e!r}")
+        return 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--loop", action="store_true", help="run continuously (near-real-time)")
@@ -566,10 +584,17 @@ def main():
     ap.add_argument("--once", action="store_true", help="single batch then exit")
     ap.add_argument("--sweep", action="store_true", help="include app-only SharePoint sweep")
     ap.add_argument("--sync", action="store_true", help="include delegated auto-sync")
+    ap.add_argument("--check-lakebase", action="store_true",
+                    help="probe Lakebase connectivity (SELECT 1) then exit — pre-cutover validation")
     ap.add_argument("--idle-sleep", type=int, default=30, help="seconds to sleep when idle in loop mode")
     args = ap.parse_args()
 
     print(f"Document Hub processing worker {WORKER_ID}")
+    if args.check_lakebase:
+        sys.exit(check_lakebase())
+    # Passive reachability signal on every run once Lakebase creds are wired (flag-independent).
+    if lakebase.enabled():
+        check_lakebase()
     if args.loop:
         last_sync = 0.0
         while True:
