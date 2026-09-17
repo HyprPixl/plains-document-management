@@ -92,6 +92,34 @@ def test_password_falls_back_to_sdk_credential_for_the_job(monkeypatch):
     assert lakebase._password() == "sdk-minted-tok"
 
 
+def test_sp_token_prefers_lakebase_prefixed_creds(monkeypatch):
+    # The job supplies LAKEBASE_CLIENT_ID/SECRET so the SDK default-auth chain does NOT
+    # pick up DATABRICKS_CLIENT_ID/SECRET and re-identify the whole job as the SP.
+    import lakebase as lb
+    lb._token_cache.clear()
+    monkeypatch.setenv("LAKEBASE_OIDC_HOST", "https://ws.example.net")
+    monkeypatch.setenv("LAKEBASE_CLIENT_ID", "sp-id")
+    monkeypatch.setenv("LAKEBASE_CLIENT_SECRET", "sp-secret")
+    monkeypatch.delenv("DATABRICKS_CLIENT_ID", raising=False)
+    monkeypatch.delenv("DATABRICKS_CLIENT_SECRET", raising=False)
+    captured = {}
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self): return {"access_token": "minted-jwt", "expires_in": 3600}
+
+    def _fake_post(url, data=None, auth=None, timeout=None):
+        captured["url"], captured["auth"] = url, auth
+        return _Resp()
+
+    import requests
+    monkeypatch.setattr(requests, "post", _fake_post)
+    assert lb._get_sp_token() == "minted-jwt"
+    assert captured["url"] == "https://ws.example.net/oidc/v1/token"
+    assert captured["auth"] == ("sp-id", "sp-secret")
+    lb._token_cache.clear()
+
+
 def test_password_uses_oidc_token_when_available(monkeypatch):
     # The App path: client-creds present → OIDC token wins, SDK path not consulted.
     monkeypatch.delenv("LAKEBASE_TOKEN", raising=False)

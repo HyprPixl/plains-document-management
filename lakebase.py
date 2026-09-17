@@ -74,11 +74,16 @@ def _get_sp_token():
     with _token_lock:
         if _token_cache.get("token") and time.monotonic() < _token_cache.get("expires_at", 0) - 60:
             return _token_cache["token"]
-        host = os.getenv("DATABRICKS_HOST", "").rstrip("/")
+        # Prefer LAKEBASE_*-prefixed creds so the processing job can supply the app SP's
+        # OAuth identity for Postgres WITHOUT the databricks-sdk default-auth chain picking
+        # up DATABRICKS_CLIENT_ID/SECRET and silently re-identifying the whole job as the SP
+        # (which would break its run-as-user SharePoint/DI/volume calls). On the App the
+        # DATABRICKS_* vars are the app SP's own and are the correct fallback.
+        host = (os.getenv("LAKEBASE_OIDC_HOST") or os.getenv("DATABRICKS_HOST", "")).rstrip("/")
         if host and not host.startswith("http"):
             host = "https://" + host
-        client_id = os.getenv("DATABRICKS_CLIENT_ID", "")
-        client_secret = os.getenv("DATABRICKS_CLIENT_SECRET", "")
+        client_id = os.getenv("LAKEBASE_CLIENT_ID") or os.getenv("DATABRICKS_CLIENT_ID", "")
+        client_secret = os.getenv("LAKEBASE_CLIENT_SECRET") or os.getenv("DATABRICKS_CLIENT_SECRET", "")
         if not (host and client_id and client_secret):
             return None
         try:
