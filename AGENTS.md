@@ -147,7 +147,7 @@ live warehouse + SSO), not offline.
   renders the table + a Copy JSON affordance. Read-only (no writes/ai_query). This measures the
   warehouse round-trip the Lakebase migration is measured against, without CLI/token juggling.
 
-## Phase 2 — Lakebase migration (thin slice BUILT — permissions cutover behind a flag)
+## Phase 2 — Lakebase migration (permissions cutover LIVE; documents cutover BUILT, flag OFF)
 
 **Status (thin slice shipped):** `lakebase.py` (Pattern A) + the `permissions` read cutover
 are in. Offline suite green (103 tests). What exists now:
@@ -176,10 +176,46 @@ EXISTS` isn't atomic across sessions, so `_bootstrap` swallows benign concurrent
 one-time dedup + UNIQUE index + backfill run under a `pg_advisory_lock`, and writes use
 `ON CONFLICT DO NOTHING`. Don't regress that.
 
-**Not yet done (next):** ⏳ migrate `documents` + `document_fields` (then `stats`/`search`) reads
-to Lakebase the same way — that's what moves the admin **"Run benchmark"** numbers (it times the
-warehouse queries; the permission win doesn't show there because its one lookup is `g`-cached
-outside the timed loops). Consider adding a cache-busting `permissions` op to that bench.
+**Document family FULL cutover — BUILT, flag OFF (commit `0c615d6`).** The whole `document_*`
+family (documents / document_fields / document_text / document_tags / document_links) is wired to
+Lakebase for **reads AND writes** behind `USE_LAKEBASE_DOCUMENTS` (default **off**). It's a full
+cutover, not a dual-write copy: no warehouse mirror of these tables, no backfill (user's call — only
+three docs in the system, "delete current data, don't worry about backfill"). Warehouse SQL stays in
+every call site, so the flag is an instant rollback.
+
+- **`lakebase.py`** document section: advisory-lock-serialized DDL (`_DOCS_LOCK_KEY`) for all 5
+  tables (Spark→Postgres types), `docs_enabled()` = `enabled() and USE_LAKEBASE_DOCUMENTS`,
+  `_sites_clause()` scope helper (None=unrestricted, []=`1=0`, else `= ANY(%s)`), and parameterized
+  read/write/job functions. Dialect conversions: `current_timestamp()`→`now()`,
+  `INTERVAL n SECONDS`→`make_interval(secs=>%s)`, Spark `MERGE`→`INSERT … ON CONFLICT`,
+  `concat_ws/collect_list`→`string_agg`, `IN (list)`→`= ANY(%s)`. **All document-family functions
+  are parameterized** (not `db.lit()`) — arbitrary OCR/field text + psycopg2's `%`-in-LIKE handling +
+  cross-dialect backslash escaping make interpolation unsafe here. `search()` assembles params in the
+  SQL's textual `%s` order (the tag JOIN precedes WHERE, so its param binds first).
+- **`app.py`**: `perms_sites(email)` helper (None for full/admin, else site list) feeds the Lakebase
+  scope. Every document call site got a `lakebase.docs_enabled()` branch:
+  documents/stats/classify/enqueue/tags/save_fields/verify/unverify/link/search/download/document +
+  `/api/admin/bench`. `api_document` can't cross-store join, so it reads **field_defs from the
+  warehouse**, values from Lakebase, and merges by `field_key` in Python.
+- **`ingest.py` / `processing/job.py`**: dedup + insert, and the job's claim/lease/commit paths,
+  branch on `docs_enabled()`. `upsert_proposed_field` preserves human provenance via
+  `coalesce(document_fields.source_provenance,'ai')`.
+
+**⚠️ BLOCKER before flipping `USE_LAKEBASE_DOCUMENTS=true` (this is the "obvious reason" the flag is
+off).** The processing job (`worker.py` → `processing/job.py`) is a **separate Databricks Job**, not
+the web app — it does **not** get the `database` resource binding, so no `PGHOST/PGUSER/PGPORT`
+(+`PGPASSWORD`) is injected there. Flip the flag on while the job can't reach Lakebase and you split
+the brain: the app writes new docs to Lakebase while the job drains an empty warehouse (nothing gets
+OCR'd/extracted). **Prerequisite the user owns:** give the job its own Lakebase connectivity —
+either bind the `database` resource on the job, or set `LAKEBASE_HOST/DB/SCHEMA` + ensure the job's
+SP can mint the OAuth token (`DATABRICKS_HOST/CLIENT_ID/CLIENT_SECRET` for Pattern A). Only after the
+job can read+write Lakebase should both `app.yaml` and the job env set the flag `true`. `ai_query`
+extraction stays on the warehouse regardless (it's fed OCR text inline, not read from a table).
+
+**Suite:** 108 tests, still fully offline/green.
+
+**Consider next:** cache-busting `permissions` op in the admin bench (the perm win doesn't show
+there — its one lookup is `g`-cached outside the timed loops).
 
 ### Original brief (kept for context)
 
