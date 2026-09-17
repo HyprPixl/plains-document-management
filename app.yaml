@@ -68,9 +68,10 @@ env:
   - name: USE_LAKEBASE_PERMISSIONS
     value: "true"
   # FULL cutover of the document_* family (documents/fields/text/tags/links) to Lakebase —
-  # reads AND writes, no warehouse copy. Kept 'false' until the processing job (worker.py) is
-  # given its own Lakebase connectivity: the job is separate compute with no `database`
-  # resource binding, and flipping this on before it can reach Lakebase breaks processing
-  # (the app would write Lakebase while the job reads an empty warehouse). See AGENTS.md.
+  # reads AND writes, no warehouse copy. Enabled 2026-09-17 after the processing job was given
+  # its own Lakebase connectivity (OIDC SP creds via {{secrets/document-hub/*}}, validated with
+  # `worker.py --check-lakebase`). The SAME flag must be set on the job's spark_env_vars — this
+  # value alone only cuts over the web app's reads/writes. Rollback: set 'false' here AND on the
+  # job, then push+deploy (the warehouse path is untouched). See AGENTS.md.
   - name: USE_LAKEBASE_DOCUMENTS
-    value: "false"
+    value: "true"
