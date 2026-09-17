@@ -120,6 +120,56 @@ def test_sp_token_prefers_lakebase_prefixed_creds(monkeypatch):
     lb._token_cache.clear()
 
 
+def test_pg_query_reconnects_and_retries_once_on_lost_connection(monkeypatch):
+    # A stale/idle-closed socket must not fail the request: pg_query reconnects and retries
+    # once. Second connection serves the rows (scale/reliability guard for long-lived workers).
+    import lakebase as lb
+    import psycopg2
+    calls = {"connect": 0, "reset": 0}
+
+    class _Cur:
+        def __init__(self, boom): self.boom = boom
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params):
+            if self.boom:
+                raise psycopg2.OperationalError("server closed the connection unexpectedly")
+        description = [("ok",)]
+        def fetchall(self): return [{"ok": 1}]
+
+    class _Conn:
+        def __init__(self, boom): self.boom = boom
+        def cursor(self, **k): return _Cur(self.boom)
+
+    def fake_connect():
+        calls["connect"] += 1
+        return _Conn(boom=(calls["connect"] == 1))  # first socket dead, second healthy
+
+    monkeypatch.setattr(lb, "_connect", fake_connect)
+    monkeypatch.setattr(lb, "_reset_conn", lambda: calls.__setitem__("reset", calls["reset"] + 1))
+    assert lb.pg_query("SELECT 1") == [{"ok": 1}]
+    assert calls["connect"] == 2 and calls["reset"] == 1  # reconnected exactly once
+
+
+def test_pg_query_gives_up_after_one_retry(monkeypatch):
+    import lakebase as lb
+    import psycopg2
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params):
+            raise psycopg2.OperationalError("still down")
+        description = None
+        def fetchall(self): return []
+
+    monkeypatch.setattr(lb, "_connect", lambda: type("C", (), {"cursor": lambda self, **k: _Cur()})())
+    monkeypatch.setattr(lb, "_reset_conn", lambda: None)
+    import pytest
+    with pytest.raises(psycopg2.OperationalError):
+        lb.pg_query("SELECT 1")
+
+
 def test_password_uses_oidc_token_when_available(monkeypatch):
     # The App path: client-creds present → OIDC token wins, SDK path not consulted.
     monkeypatch.delenv("LAKEBASE_TOKEN", raising=False)

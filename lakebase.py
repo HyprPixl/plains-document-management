@@ -204,6 +204,27 @@ def _connect():
     return _PooledConn(raw)
 
 
+def _reset_conn():
+    """Drop this thread's cached connection so the next `_connect()` opens a fresh one.
+    Called after a dropped/broken socket so a single stale connection doesn't fail a request."""
+    raw = getattr(_tls, "conn", None)
+    if raw is not None:
+        try:
+            raw.close()
+        except Exception:
+            pass
+    _tls.conn = None
+    _tls.conn_key = None
+
+
+# Errors that mean "the connection is gone" (server idle-closed it, network blip, failover) —
+# as opposed to a SQL error in the statement itself. Retrying these once, on a fresh connection,
+# turns a long-lived gunicorn worker's stale socket into a transparent reconnect instead of a
+# failed request. Empty when psycopg2 is absent (offline) — then nothing is caught, which is fine
+# since pg_query is never reached with Lakebase inert.
+_CONN_LOST = (psycopg2.OperationalError, psycopg2.InterfaceError) if psycopg2 else ()
+
+
 # ─────────────────────────────────────────────────────────── query API ──
 def _snippet(sql: str, limit: int = 200) -> str:
     flat = " ".join(sql.split())
@@ -211,15 +232,27 @@ def _snippet(sql: str, limit: int = 200) -> str:
 
 
 def pg_query(sql: str, params=None) -> list[dict]:
-    """Run a parameterized statement, return rows as list[dict] (RealDictCursor)."""
+    """Run a parameterized statement, return rows as list[dict] (RealDictCursor).
+
+    Retries once on a lost connection (reconnecting first). Our statements are idempotent
+    by design (guarded UPDATEs, ON CONFLICT writes, per-doc delete-then-insert — see §4A.3),
+    so a reconnect-retry is safe even for writes routed through here via pg_execute.
+    """
     t0 = time.perf_counter()
     try:
-        conn = _connect()
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, params or ())
-            if cur.description is None:
-                return []
-            return [dict(r) for r in cur.fetchall()]
+        for attempt in (0, 1):
+            try:
+                conn = _connect()
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(sql, params or ())
+                    if cur.description is None:
+                        return []
+                    return [dict(r) for r in cur.fetchall()]
+            except _CONN_LOST as e:
+                if attempt:  # already retried once — give up
+                    raise
+                logger.warning(f"pg connection lost ({type(e).__name__}); reconnecting, retrying once")
+                _reset_conn()
     finally:
         ms = (time.perf_counter() - t0) * 1000
         if ms >= config.SLOW_QUERY_MS:
