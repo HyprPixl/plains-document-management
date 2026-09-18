@@ -9,6 +9,8 @@ const state = {
   fieldsMode: false,
   selected: new Set(),
   currentDoc: null,
+  rowById: new Map(),   // doc_id → last-rendered table row, for instant drawer previews
+  classify: null,       // { ids: [...], idx } while walking selected docs through the drawer
 };
 
 // ─────────────────────────────────────────────── helpers ──
@@ -68,7 +70,6 @@ async function init() {
   wireUpload();
   wireQueueTabs();
   wireDrawer();
-  wireClassifyModal();
   wireExplore();
   wireSharePoint();
   wireFields();
@@ -182,8 +183,10 @@ async function loadDocs() {
   if (!tb.children.length) skeletonDocRows();
   const rows = await api(path);
   tb.replaceChildren();
+  state.rowById.clear();
   $("#docEmpty").hidden = rows.length > 0;
   for (const d of rows) {
+    state.rowById.set(d.doc_id, d);
     const cb = el("input", { type: "checkbox", "data-id": d.doc_id,
       onclick: (e) => { e.stopPropagation();
         e.target.checked ? state.selected.add(d.doc_id) : state.selected.delete(d.doc_id);
@@ -268,11 +271,7 @@ async function uploadFiles(fileList) {
   } catch (e) { toast("Upload failed: " + e.message, true); box.replaceChildren(); }
 }
 
-// ─────────────────────────────────────────────── CLASSIFY MODAL ──
-function wireClassifyModal() {
-  $("#classifyCancel").addEventListener("click", () => ($("#classifyScrim").hidden = true));
-  $("#classifyApply").addEventListener("click", applyClassify);
-}
+// ─────────────────────────────────────────────── CLASSIFY WALKTHROUGH ──
 function fillSelect(sel, cat, placeholder) {
   sel.replaceChildren(el("option", { value: "" }, placeholder));
   (state.taxonomy[cat] || []).forEach((o) => sel.append(el("option", { value: o.value }, o.label)));
@@ -282,27 +281,43 @@ function fillTypeSelect(sel) {
   (state.taxonomy.document_type || [])
     .forEach((o) => sel.append(el("option", { value: o.value }, o.label)));
 }
+// "Classify selected…" opens the selected docs in the normal detail drawer, one at a time —
+// each gets the same per-doc classify panel (prefilled type/dept guess + field preview) as
+// opening a single doc. The first loads immediately; the rest lazy-load as you step through.
 function openClassify() {
-  fillTypeSelect($("#clType"));
-  fillSelect($("#clDept"), "department", "— none —");
-  $("#classifyCount").textContent = `${state.selected.size} document(s) selected`;
-  $("#classifyScrim").hidden = false;
+  const ids = [...state.selected];
+  if (!ids.length) return;
+  state.classify = { ids, idx: 0 };
+  openClassifyAt(0);
 }
-async function applyClassify() {
-  const body = {
-    doc_ids: [...state.selected],
-    document_type: $("#clType").value || null,
-    department: $("#clDept").value || null,
-  };
-  if (!body.document_type && !body.department) { toast("Pick at least a type or department", true); return; }
-  try {
-    await api("/api/documents/classify", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-    await api("/api/documents/enqueue", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ doc_ids: body.doc_ids }) });
-    $("#classifyScrim").hidden = true;
-    state.selected.clear(); updateBulkBar();
-    toast("Classified and queued for extraction");
-    loadManage();
-  } catch (e) { toast("Failed: " + e.message, true); }
+function openClassifyAt(idx) {
+  state.classify.idx = idx;
+  const id = state.classify.ids[idx];
+  openDoc(id, state.rowById.get(id));
+}
+// After a doc is classified (or when stepping past it), move to the next selected doc;
+// when the list is exhausted, end the walkthrough and refresh the queue. Returns true if
+// it handled the "what next" so the caller shouldn't also close the drawer.
+function advanceClassify() {
+  const w = state.classify;
+  if (!w) return false;
+  state.selected.delete(w.ids[w.idx]); updateBulkBar();
+  if (w.idx + 1 < w.ids.length) { openClassifyAt(w.idx + 1); return true; }
+  state.classify = null;
+  state.selected.clear(); updateBulkBar();
+  closeDrawer(); loadManage();
+  return true;
+}
+// A prev/next strip shown atop the drawer while walking a multi-doc selection.
+function classifyNav() {
+  const w = state.classify;
+  if (!w || w.ids.length < 2) return null;
+  return el("div", { class: "classify-nav" },
+    el("button", { class: "btn small", disabled: w.idx === 0 ? "" : undefined,
+      onclick: () => openClassifyAt(w.idx - 1) }, "‹ Prev"),
+    el("span", { class: "muted small" }, `Document ${w.idx + 1} of ${w.ids.length}`),
+    el("button", { class: "btn small", disabled: w.idx + 1 >= w.ids.length ? "" : undefined,
+      onclick: () => openClassifyAt(w.idx + 1) }, "Skip ›"));
 }
 
 // ─────────────────────────────────────────────── DRAWER (detail/verify) ──
@@ -314,6 +329,7 @@ function closeDrawer() {
   $("#drawer").hidden = true; $("#drawerScrim").hidden = true;
   const frame = $("#reviewFrame"); frame.src = "about:blank"; frame.dataset.src = "";  // free the viewer
   state.currentDoc = null;
+  state.classify = null;   // closing mid-walkthrough ends it
 }
 // Open instantly with whatever the clicked row already knows (title + viewer), then fill the
 // fields panel from the detail fetch. Avoids a multi-query wait before anything appears.
@@ -353,6 +369,7 @@ function renderDrawer(data) {
   $("#drawerSub").textContent =
     `${locationOf(d)} · ${d.document_type || "unclassified"}`;
   const body = $("#drawerBody"); body.replaceChildren();
+  const nav = classifyNav(); if (nav) body.append(nav);
 
   const actions = el("div", { class: "field-actions" },
     el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}&inline=1`, target: "_blank" }, "View file"),
@@ -506,6 +523,7 @@ async function classifyOne(id, dt, dept) {
     await api("/api/documents/enqueue", { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ doc_ids: [id] }) });
     toast("Classified and queued for extraction");
+    if (advanceClassify()) return;   // multi-select walkthrough → move to the next doc
     closeDrawer(); loadManage();
   } catch (e) { toast("Failed: " + e.message, true); }
 }
