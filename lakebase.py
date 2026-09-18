@@ -981,31 +981,43 @@ def extend_lease(doc_id: str, worker_id: str, lease_secs: int) -> None:
 
 
 def replace_text(doc_id: str, pages: list[dict]) -> None:
-    """Replace this doc's page text atomically (delete-then-insert, idempotent per doc)."""
+    """Replace this doc's page text atomically (delete-then-insert, idempotent per doc).
+    The insert is one multi-row statement, not one round-trip per page."""
     _ensure_documents_ready()
     pg_execute(f"DELETE FROM {DOCUMENT_TEXT} WHERE doc_id = %s", (doc_id,))
-    for p in pages:
-        if (p.get("text") or "").strip():
-            pg_execute(
-                f"INSERT INTO {DOCUMENT_TEXT} (doc_id, page, text, updated_at) "
-                "VALUES (%s, %s, %s, now())",
-                (doc_id, int(p["page"]), p["text"]),
-            )
+    kept = [p for p in pages if (p.get("text") or "").strip()]
+    if not kept:
+        return
+    rows_sql = ", ".join("(%s, %s, %s, now())" for _ in kept)
+    params = []
+    for p in kept:
+        params += [doc_id, int(p["page"]), p["text"]]
+    pg_execute(
+        f"INSERT INTO {DOCUMENT_TEXT} (doc_id, page, text, updated_at) VALUES {rows_sql}",
+        tuple(params),
+    )
 
 
-def upsert_proposed_field(doc_id: str, field_key: str, value) -> None:
-    """AI-proposed value upsert — never clobbers an existing human confirmed_value or its
-    provenance (mirrors _commit_success' MERGE)."""
+def upsert_proposed_fields(doc_id: str, values: dict) -> None:
+    """Upsert all AI-proposed values in one multi-row round-trip. Never clobbers a human's
+    confirmed_value or provenance: existing source_provenance is preserved via coalesce."""
+    if not values:
+        return
     _ensure_documents_ready()
+    items = list(values.items())
+    rows_sql = ", ".join("(%s, %s, %s, 'ai', now())" for _ in items)
+    params = []
+    for key, val in items:
+        params += [doc_id, key, val]
     pg_execute(
         f"INSERT INTO {DOCUMENT_FIELDS} "
         "(doc_id, field_key, proposed_value, source_provenance, updated_at) "
-        "VALUES (%s, %s, %s, 'ai', now()) "
+        f"VALUES {rows_sql} "
         "ON CONFLICT (doc_id, field_key) DO UPDATE SET "
         "proposed_value = EXCLUDED.proposed_value, "
         f"source_provenance = coalesce({DOCUMENT_FIELDS}.source_provenance, 'ai'), "
         "updated_at = now()",
-        (doc_id, field_key, value),
+        tuple(params),
     )
 
 

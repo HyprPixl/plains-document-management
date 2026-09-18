@@ -497,10 +497,11 @@ def _commit_success(doc_id, derived_path, res, proposed) -> None:
     if lake:
         # Text: replace this doc's rows atomically (delete-then-insert is idempotent per doc).
         lakebase.replace_text(doc_id, res["pages"])
-        # Proposed fields: upsert so we never clobber a human's confirmed_value.
-        for key, val in (proposed or {}).items():
-            sval = None if val is None else (val if isinstance(val, str) else json.dumps(val))
-            lakebase.upsert_proposed_field(doc_id, key, sval)
+        # Proposed fields: upsert so we never clobber a human's confirmed_value (one round-trip).
+        lakebase.upsert_proposed_fields(doc_id, {
+            key: (None if val is None else (val if isinstance(val, str) else json.dumps(val)))
+            for key, val in (proposed or {}).items()
+        })
         lakebase.commit_extraction_done(
             doc_id, derived_path, res["text_source"], int(res["page_count"]), sig)
         print(f"  ✓ {doc_id} ({res['text_source']}, {res['page_count']}p, {len(proposed or {})} fields)")

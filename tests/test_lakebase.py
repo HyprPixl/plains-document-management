@@ -80,6 +80,40 @@ def test_save_fields_batches_all_keys_into_one_upsert(monkeypatch):
                       "d1", "amount", "42", "u@x.com")
 
 
+def test_upsert_proposed_fields_batches_and_preserves_provenance(monkeypatch):
+    monkeypatch.setattr(lakebase, "_ensure_documents_ready", lambda: None)
+    calls = []
+    monkeypatch.setattr(lakebase, "pg_execute", lambda sql, params=None: calls.append((sql, params)))
+    lakebase.upsert_proposed_fields("d1", {"title": "AI title", "amount": "9"})
+    assert len(calls) == 1
+    sql, params = calls[0]
+    assert "INSERT INTO" in sql and "document_fields" in sql
+    assert sql.count("(%s, %s, %s, 'ai', now())") == 2       # two proposed rows, one statement
+    assert "ON CONFLICT" in sql and "coalesce(" in sql       # never clobbers human provenance
+    assert params == ("d1", "title", "AI title", "d1", "amount", "9")
+
+
+def test_replace_text_inserts_all_pages_in_one_statement(monkeypatch):
+    monkeypatch.setattr(lakebase, "_ensure_documents_ready", lambda: None)
+    calls = []
+    monkeypatch.setattr(lakebase, "pg_execute", lambda sql, params=None: calls.append((sql, params)))
+    lakebase.replace_text("d1", [{"page": 1, "text": "a"}, {"page": 2, "text": "  "},
+                                 {"page": 3, "text": "c"}])
+    assert len(calls) == 2                                   # one DELETE, one multi-row INSERT
+    assert "DELETE FROM" in calls[0][0]
+    ins_sql, ins_params = calls[1]
+    assert ins_sql.count("(%s, %s, %s, now())") == 2         # blank page 2 dropped
+    assert ins_params == ("d1", 1, "a", "d1", 3, "c")
+
+
+def test_replace_text_with_no_text_pages_skips_insert(monkeypatch):
+    monkeypatch.setattr(lakebase, "_ensure_documents_ready", lambda: None)
+    calls = []
+    monkeypatch.setattr(lakebase, "pg_execute", lambda sql, params=None: calls.append((sql, params)))
+    lakebase.replace_text("d1", [{"page": 1, "text": "   "}])
+    assert len(calls) == 1 and "DELETE FROM" in calls[0][0]  # delete still runs, no insert
+
+
 def test_save_fields_empty_is_a_noop(monkeypatch):
     monkeypatch.setattr(lakebase, "_ensure_documents_ready",
                         lambda: (_ for _ in ()).throw(AssertionError("should not connect")))
