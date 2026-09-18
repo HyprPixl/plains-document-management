@@ -777,23 +777,11 @@ def tag_facets() -> list[dict]:
     )
 
 
-def get_links(doc_id: str) -> list[dict]:
-    _ensure_documents_ready()
-    return pg_query(
-        "SELECT l.relationship, l.child_doc_id, l.parent_doc_id, "
-        f"d.original_filename, d.document_type FROM {DOCUMENT_LINKS} l "
-        f"JOIN {DOCUMENTS} d ON d.doc_id = "
-        "  CASE WHEN l.parent_doc_id = %s THEN l.child_doc_id ELSE l.parent_doc_id END "
-        "WHERE l.parent_doc_id = %s OR l.child_doc_id = %s",
-        (doc_id, doc_id, doc_id),
-    )
-
-
 def get_document_bundle(doc_id: str) -> dict | None:
     """Document row + its field values, links, and tags in ONE Postgres round-trip.
 
-    api_document needs all four; issued serially (get_document / get_field_values /
-    get_links / get_tags) that's four network hops to Lakebase per drawer open. Correlated
+    api_document needs all four; reading document / field values / links / tags one at a
+    time is four network hops to Lakebase per drawer open. Correlated
     subqueries fold the three child collections into jsonb columns beside the document's own
     columns, so the document keeps its native psycopg2 types (timestamps etc. serialize
     exactly as the four-query path did) while fields/links/tags come back as already-parsed
@@ -927,23 +915,9 @@ def enqueue(doc_ids: list[str]) -> None:
     )
 
 
-def save_field(doc_id: str, field_key: str, value, email: str) -> None:
-    """Upsert a human-confirmed value (mirrors api_save_fields' MERGE)."""
-    _ensure_documents_ready()
-    pg_execute(
-        f"INSERT INTO {DOCUMENT_FIELDS} "
-        "(doc_id, field_key, confirmed_value, source_provenance, updated_at, updated_by) "
-        "VALUES (%s, %s, %s, 'human', now(), %s) "
-        "ON CONFLICT (doc_id, field_key) DO UPDATE SET "
-        "confirmed_value = EXCLUDED.confirmed_value, source_provenance = 'human', "
-        "updated_at = now(), updated_by = EXCLUDED.updated_by",
-        (doc_id, field_key, value, email),
-    )
-
-
 def save_fields(doc_id: str, values: dict, email: str) -> None:
-    """Batch-upsert human-confirmed values in ONE round-trip (vs. one per field). Same
-    semantics as save_field, collapsed into a single multi-row INSERT ... ON CONFLICT."""
+    """Batch-upsert human-confirmed values in ONE round-trip (vs. one per field), as a
+    single multi-row INSERT ... ON CONFLICT (mirrors api_save_fields' warehouse MERGE)."""
     if not values:
         return
     _ensure_documents_ready()

@@ -4,7 +4,6 @@ Two surfaces: Manage (classify/extract/verify) and Explore (search/view/download
 Heavy processing (OCR/render/extraction) is handed off to the Databricks job in
 processing/ — this web app only enqueues work and reads results from Delta.
 """
-import hashlib
 import io
 import json
 import logging

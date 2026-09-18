@@ -106,5 +106,5 @@ def process(file_bytes: bytes, filename: str) -> dict:
         return {"searchable_pdf": searchable, "pages": pages,
                 "text_source": "di_ocr", "page_count": len(pages)}
 
-    # Office / email / other: handled by extract.parse_other (ai_parse_document / programmatic).
+    # Office / email / other: text is recovered downstream by the extract step, not here.
     return {"searchable_pdf": None, "pages": [], "text_source": "deferred", "page_count": 0}

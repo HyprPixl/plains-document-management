@@ -461,15 +461,6 @@ def import_job_status(req_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
-def recent_import_jobs(email: str, limit: int = 10) -> list[dict]:
-    return query(
-        f"SELECT id, status, total_files, imported, duplicates, errors, last_error, "
-        f"unix_timestamp(created_at) AS created "
-        f"FROM {config.IMPORT_JOBS} WHERE lower(user_email) = {lit(email.lower())} "
-        f"ORDER BY created_at DESC LIMIT {int(limit)}"
-    )
-
-
 # ──────────────────────────────────────────────────────────────────── auto-sync ──
 
 def ensure_source(site_name, drive_name, folder_name, cfg_json, created_by) -> str:
