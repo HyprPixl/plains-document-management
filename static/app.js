@@ -111,6 +111,7 @@ function setFieldsMode(on) {
   $("#fieldsPanel").hidden = !on;
   $("#modifyFieldsBtn").classList.toggle("active", on);
   if (on) {
+    loadAccess();
     loadFieldDefs();
     $("#fieldsPanel").scrollIntoView({ behavior: "smooth", block: "start" });
   }
@@ -1030,6 +1031,7 @@ async function pollImportJob(reqId, tries = 0) {
 
 // ─────────────────────────────────────────────── FIELDS (admin) ──
 const fieldState = { docTypes: [], editing: null };
+const accessState = { grants: [], me: null };
 const TYPE_LABELS = { text: "Text", long_text: "Long text", date: "Date", currency: "Currency",
   number: "Number", picklist: "Picklist", multi: "Multi-value", summary: "Summary" };
 
@@ -1038,8 +1040,77 @@ function wireFields() {
   $("#fieldsDoneBtn").addEventListener("click", () => setFieldsMode(false));
   $("#fieldAddBtn").addEventListener("click", () => openFieldModal(null));
   $("#benchRunBtn").addEventListener("click", runBench);
+  $("#accessGrantBtn").addEventListener("click", grantAccess);
+  $("#accessEmail").addEventListener("keydown", (e) => { if (e.key === "Enter") grantAccess(); });
   $("#ffCancel").addEventListener("click", () => ($("#fieldScrim").hidden = true));
   $("#ffSave").addEventListener("click", saveFieldDef);
+}
+
+// ─────────────────────────────────────────────── APP ACCESS (admin) ──
+// Manage who's an app admin (and grant Full / Read). Site grants are auto-mirrored from
+// SharePoint and are not shown here. See /api/admin/access.
+const ACCESS_LABELS = { ADMIN: "Admin", FULL: "Full", READ: "Read" };
+
+async function loadAccess() {
+  const list = $("#accessList");
+  list.replaceChildren(el("div", { class: "muted small" }, "Loading access…"));
+  try {
+    const r = await api("/api/admin/access");
+    accessState.me = r.me;
+    accessState.grants = r.grants || [];
+    renderAccess();
+  } catch (e) {
+    list.replaceChildren(el("div", { class: "muted small" },
+      e.status === 403 ? "Admin access required." : "Could not load access: " + e.message));
+  }
+}
+
+function renderAccess() {
+  const list = $("#accessList");
+  if (!accessState.grants.length) {
+    list.replaceChildren(el("div", { class: "muted small" }, "No admin, full, or read grants yet."));
+    return;
+  }
+  list.replaceChildren(...accessState.grants.map(accessRow));
+}
+
+function accessRow(g) {
+  const isSelf = g.email === accessState.me;
+  const sel = el("select", { class: "access-select" },
+    ...Object.entries(ACCESS_LABELS).map(([v, l]) => el("option", { value: v }, l)));
+  sel.value = g.access_type;
+  const controls = [sel,
+    el("button", { class: "btn small danger", onclick: () => setAccess(g.email, "NONE") }, "Revoke")];
+  sel.addEventListener("change", () => setAccess(g.email, sel.value));
+  return el("div", { class: "access-row" },
+    el("div", { class: "access-who" },
+      el("span", {}, g.email),
+      isSelf ? el("span", { class: "access-you" }, "you") : null),
+    el("div", { class: "access-actions" }, ...controls));
+}
+
+async function grantAccess() {
+  const email = $("#accessEmail").value.trim().toLowerCase();
+  const access_type = $("#accessType").value;
+  if (!email || !email.includes("@")) { toast("Enter a valid email", true); return; }
+  await setAccess(email, access_type);
+  $("#accessEmail").value = "";
+}
+
+async function setAccess(email, access_type) {
+  try {
+    await api("/api/admin/access", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email, access_type }),
+    });
+    toast(access_type === "NONE"
+      ? `Removed access for ${email}`
+      : `${email} is now ${ACCESS_LABELS[access_type]}`);
+    loadAccess();
+  } catch (e) {
+    toast(e.status === 409 ? "Can't remove the last admin" : "Failed: " + e.message, true);
+    loadAccess();  // resync the dropdown if a change was rejected
+  }
 }
 
 // ─────────────────────────────────────────────── BENCHMARK (admin) ──

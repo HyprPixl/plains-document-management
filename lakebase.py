@@ -411,6 +411,44 @@ def mirror_user_sites(email: str, site_ids: list[str]) -> None:
         logger.warning(f"lakebase mirror_user_sites failed (warehouse write stands): {e}")
 
 
+def list_access_grants() -> list[dict]:
+    """All elevated (non-SITE) permission rows — the app-admin console's source list.
+
+    SITE rows are auto-mirrored from SharePoint browse and managed by `mirror_user_sites`;
+    only the manually-granted ADMIN / FULL / READ rows are surfaced here. Only called when
+    `enabled()`.
+    """
+    _ensure_permissions_ready()
+    return pg_query(
+        f"SELECT email, access_type, updated_at FROM {PERMISSIONS} "
+        f"WHERE upper(access_type) <> 'SITE' ORDER BY email"
+    )
+
+
+def set_access_grant(email: str, access: str) -> None:
+    """Dual-write hook: mirror an admin's grant change into Lakebase to match the warehouse
+    write in `app._set_access`. Replaces the user's elevated (non-SITE) rows with a single
+    access_type, or clears them when `access` is NONE (revoke). SITE rows are left untouched.
+    No-op unless Lakebase is active; never raises (the warehouse write is the source of truth)."""
+    if not (enabled() and config.USE_LAKEBASE_PERMISSIONS):
+        return
+    try:
+        _ensure_permissions_ready()
+        em = (email or "").lower()
+        pg_execute(
+            f"DELETE FROM {PERMISSIONS} WHERE lower(email) = %s AND upper(access_type) <> 'SITE'",
+            (em,),
+        )
+        if (access or "").upper() in ("ADMIN", "FULL", "READ"):
+            pg_execute(
+                f"INSERT INTO {PERMISSIONS} (email, access_type, allowed_site, updated_at) "
+                f"VALUES (%s, %s, NULL, NOW()) ON CONFLICT DO NOTHING",
+                (em, access.upper()),
+            )
+    except Exception as e:
+        logger.warning(f"lakebase set_access_grant failed (warehouse write stands): {e}")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Document family — FULL cutover behind config.USE_LAKEBASE_DOCUMENTS
 # ══════════════════════════════════════════════════════════════════════════

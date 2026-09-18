@@ -335,6 +335,20 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #cfe0f5; border-c
 .bench-table td { text-align: right; font-size: 13px; padding: 5px 10px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
 .bench-table td:first-child { text-align: left; font-weight: 600; }
 
+/* ── App access (admin) ── */
+.access-panel { margin-bottom: 4px; }
+.access-panel h3 { font-size: 15px; margin: 0 0 4px; }
+.access-add { display: flex; gap: 8px; margin: 10px 0 14px; }
+.access-add input { flex: 1; min-width: 0; }
+.access-row { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 6px;
+  background: var(--panel); }
+.access-who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.access-you { font-size: 11px; color: var(--muted); border: 1px solid var(--line);
+  border-radius: 999px; padding: 1px 7px; margin-left: 8px; }
+.access-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.section-rule { border: none; border-top: 1px solid var(--line); margin: 18px 0; }
+
 .loc { display: inline-block; max-width: 260px; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; vertical-align: bottom; }
 .rc-path { margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

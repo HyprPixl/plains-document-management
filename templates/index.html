@@ -93,6 +93,21 @@
           </div>
         </div>
         <div class="fields-body">
+          <div id="accessPanel" class="access-panel">
+            <h3>App access</h3>
+            <p class="muted small">Grant a person <strong>Admin</strong> (manage everything, including access), <strong>Full</strong> (see and edit every document), or <strong>Read</strong> (see every document). Site access is captured automatically from each person's SharePoint permissions and isn't managed here.</p>
+            <div class="access-add">
+              <input id="accessEmail" type="email" placeholder="person@plains.com" autocomplete="off" />
+              <select id="accessType">
+                <option value="ADMIN">Admin</option>
+                <option value="FULL">Full</option>
+                <option value="READ">Read</option>
+              </select>
+              <button class="btn small" id="accessGrantBtn">Grant</button>
+            </div>
+            <div id="accessList"></div>
+          </div>
+          <hr class="section-rule" />
           <p class="muted small">Define the fields extracted for each document type. Common fields apply to every document; a clear description with an example guides the AI extraction. Fields marked <strong>*</strong> must be filled before a document can be verified.</p>
           <div id="benchResult" class="bench-result" hidden></div>
           <div id="fieldDefsList"></div>

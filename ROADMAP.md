@@ -70,12 +70,14 @@ Front-loaded because Phases 2–5 all depend on it. No user-facing changes; pure
   `bench/` script that exercises the hot endpoints (`/api/documents`, `/api/stats`, `/api/document/*`,
   `/api/search`) and records baselines. These baselines are what Phase 2/3 are measured against.
 
-## Phase 2 — Data layer: Lakebase + scale + permissions — 🎯 the core efficiency goal
+## Phase 2 — Data layer: Lakebase + scale + permissions — ✅ DONE (2026-09-18)
 
-> **Status (2026-09-17):** Lakebase backend + permissions cutover + **full `document_*` cutover are
-> LIVE** (see AGENTS.md → "Phase 2 — Lakebase migration"). Permission read `/api/me` ~1,300 ms → 5 ms
-> warm (~260×). Remaining in this phase: **multi-user scale** (connection pooling / load test) and
-> **nexus-style permissions** (richer model). 🔒 One follow-up: rotate the SP OAuth secret.
+> **Status (2026-09-18):** ✅ **Phase 2 complete.** Lakebase backend + permissions cutover + full
+> `document_*` cutover are LIVE (see AGENTS.md → "Phase 2 — Lakebase migration"). Permission read
+> `/api/me` ~1,300 ms → 5 ms warm (~260×). Multi-user scale hardened (connection resilience:
+> reconnect-and-retry-once on a dropped socket). App-admin management shipped (in-app grant/revoke of
+> ADMIN/FULL/READ). 🔒 One follow-up remains: **rotate the SP OAuth secret** (deferred, tracked in
+> AGENTS.md + memory).
 
 - **Lakebase (Databricks Postgres OLTP) backend** — ✅ DONE. Move hot transactional reads/writes — `documents`, `document_fields`,
   `document_tags`, `document_links`, `sp_sessions`, `import_jobs`, `sharepoint_syncs`, `job_state` —
@@ -84,12 +86,18 @@ Front-loaded because Phases 2–5 all depend on it. No user-facing changes; pure
   extraction, full-text search over `document_text`, and analytics. Introduce a data-access layer so
   both coexist behind one interface; migrate table-by-table, each guarded by Phase 1 benches so the
   win is measured, not assumed.
-- **Multi-user scale** (req: *ensure it scales to multiple users*). Connection pooling against
-  Lakebase; confirm no global mutable state in the request path; load-test the claim/lease paths and
-  concurrent verify/save. gunicorn worker count revisited once per-request latency drops.
-- **plains-nexus-style permissions** (req: *similar permission handling to plains-nexus*). Align the
-  permission model with nexus (currently site-level mirror of SharePoint; nexus is richer). Design
-  alongside the Lakebase migration since both touch every read path (`perms_where`).
+- **Multi-user scale** (req: *ensure it scales to multiple users*) — ✅ DONE. Confirmed no global
+  mutable state in the request path (perms memoized on per-request `flask.g`, no shared caches); the
+  real multi-user gap was long-lived workers holding a socket that Lakebase idle-closes, so `pg_query`
+  now reconnects and retries once on a dropped connection (safe: statements are idempotent by design).
+  gunicorn worker count revisited once per-request latency drops.
+- **plains-nexus-style permissions** (req: *similar permission handling to plains-nexus*) — ✅ DONE,
+  scoped to **app-admin management** (per user: *"mostly … being able to change who's an app admin and
+  stuff"*). Added an admin-only in-app console (`/api/admin/access`, "App access" panel in Manage) to
+  grant/revoke ADMIN / FULL / READ — replacing hand-edits to the `permissions` table. SITE grants stay
+  auto-mirrored from SharePoint. Guarded against demoting the last admin. The full nexus project/RBAC
+  model was deliberately **not** ported (nexus is project-based; Doc Hub is site-based) — revisit only
+  if a richer model is actually needed.
 
 ## Phase 3 — Quality passes (optimization + Fable cleanup)
 
@@ -155,7 +163,7 @@ Depends on the fast data layer (2), the viewer and permissions (4), and tested f
 | H | SharePoint-first upload; optional drop | 4 |
 | I | Tests for everything | 1 |
 | J | Time benchmarks / profiling | 1 |
-| K | Scale to multiple users; nexus-style permissions | 2 |
+| K | Scale to multiple users; nexus-style permissions | 2 ✅ |
 | L | Contract obligation mgmt (timelines, calendars, relation trees) | 5 |
 | M | Fix "edited by a person" on all fields | 0 ✅ |
 | N | Doc-type suggestion UX | 4 |

@@ -158,7 +158,7 @@ live warehouse + SSO), not offline.
 ## Phase 2 — Lakebase migration (permissions cutover LIVE; documents cutover LIVE)
 
 **Status:** `lakebase.py` (Pattern A) + the `permissions` read cutover + the full `document_*`
-cutover are LIVE. Offline suite green (112 tests). What exists now:
+cutover are LIVE. Offline suite green (130 tests). What exists now:
 
 - **`lakebase.py`** — Pattern A: `pg_query`/`pg_execute` (params, RealDictCursor), thread-local
   no-op-close conn, SP-token minting + cache (`LAKEBASE_TOKEN` env override for local probing —
@@ -172,6 +172,13 @@ cutover are LIVE. Offline suite green (112 tests). What exists now:
   table from the warehouse `permissions` table the first time it's empty (per worker).
 - **Dual-write**: `sp.sync_user_sites()` mirrors SITE grants into Lakebase too (`mirror_user_sites`,
   no-op when disabled, never breaks the warehouse write) so both stores stay consistent / rollback-safe.
+- **App-admin management** (`/api/admin/access`, GET list + POST set; app.py `_elevated_grants` /
+  `_set_access`): admin-only in-app console to grant/revoke ADMIN / FULL / READ — the elevated grants
+  that used to be hand-seeded in the `permissions` table. SITE rows stay auto-mirrored from SharePoint
+  and are **not** touched here. Same dual-store discipline (warehouse source-of-truth + `lakebase.
+  set_access_grant` mirror). Guard: the **last remaining admin can't be demoted/revoked** (409). UI is
+  the "App access" block in Manage → Modify fields (admin-gated). This is the "nexus-style permissions"
+  roadmap item, scoped down to app-admin management (not the full nexus project/RBAC model).
 - **Wiring**: `requirements.txt += psycopg2-binary`; `app.yaml` binds the `database` resource
   (`valueFrom: database`) + `LAKEBASE_HOST/DB/SCHEMA` + `USE_LAKEBASE_PERMISSIONS` (set `"false"` to
   roll back to the warehouse instantly).

@@ -307,6 +307,79 @@ def test_admin_bench_caps_n(client, fake_db):
     assert r.get_json()["n"] == 100
 
 
+# ── admin access management ──────────────────────────────────────────────────
+GRANTS = "upper(access_type) <> 'SITE'"  # distinctive substring of _elevated_grants query
+
+
+def test_access_list_forbidden_for_non_admin(client, fake_db):
+    fake_db.responder = route([(PERMS, SITE_A)])
+    r = client.get("/api/admin/access")
+    assert r.status_code == 403
+
+
+def test_access_list_collapses_to_strongest_grant_per_user(client, fake_db):
+    fake_db.responder = route([
+        (PERMS, ADMIN),
+        (GRANTS, [
+            {"email": "a@plains.com", "access_type": "READ", "updated_at": None},
+            {"email": "a@plains.com", "access_type": "ADMIN", "updated_at": None},
+            {"email": "b@plains.com", "access_type": "FULL", "updated_at": None},
+        ]),
+    ])
+    r = client.get("/api/admin/access")
+    assert r.status_code == 200
+    grants = {g["email"]: g["access_type"] for g in r.get_json()["grants"]}
+    assert grants == {"a@plains.com": "ADMIN", "b@plains.com": "FULL"}
+
+
+def test_access_set_grants_writes_warehouse(client, fake_db):
+    fake_db.responder = route([(PERMS, ADMIN), (GRANTS, [])])
+    r = client.post("/api/admin/access", json={"email": "New@Plains.com", "access_type": "FULL"})
+    assert r.status_code == 200
+    assert r.get_json()["email"] == "new@plains.com"       # normalised to lower-case
+    assert any("<> 'SITE'" in s for s in fake_db.executed_matching("DELETE FROM"))
+    ins = fake_db.executed_matching("INSERT INTO")
+    assert any("'FULL'" in s and "new@plains.com" in s for s in ins)
+
+
+def test_access_set_revoke_deletes_without_insert(client, fake_db):
+    fake_db.responder = route([(PERMS, ADMIN), (GRANTS, [
+        {"email": "gone@plains.com", "access_type": "READ", "updated_at": None}])])
+    r = client.post("/api/admin/access", json={"email": "gone@plains.com", "access_type": "NONE"})
+    assert r.status_code == 200
+    assert any("<> 'SITE'" in s for s in fake_db.executed_matching("DELETE FROM"))
+    # No permission row is inserted on revoke (the audit-log INSERT is unrelated).
+    assert not any("allowed_site" in s for s in fake_db.executed_matching("INSERT INTO"))
+
+
+def test_access_set_rejects_bad_email(client, fake_db):
+    fake_db.responder = route([(PERMS, ADMIN)])
+    r = client.post("/api/admin/access", json={"email": "not-an-email", "access_type": "FULL"})
+    assert r.status_code == 400
+
+
+def test_access_set_rejects_bad_type(client, fake_db):
+    fake_db.responder = route([(PERMS, ADMIN)])
+    r = client.post("/api/admin/access", json={"email": "x@plains.com", "access_type": "WHEEL"})
+    assert r.status_code == 400
+
+
+def test_access_set_blocks_removing_last_admin(client, fake_db):
+    # The caller (default DEV_USER) is the sole admin — demoting them would lock everyone out.
+    me = "caleb.fedyshen@plains.com"
+    fake_db.responder = route([(PERMS, ADMIN), (GRANTS, [
+        {"email": me, "access_type": "ADMIN", "updated_at": None}])])
+    r = client.post("/api/admin/access", json={"email": me, "access_type": "FULL"})
+    assert r.status_code == 409
+    assert not fake_db.executed_matching("DELETE FROM")   # nothing written
+
+
+def test_access_set_forbidden_for_non_admin(client, fake_db):
+    fake_db.responder = route([(PERMS, SITE_A)])
+    r = client.post("/api/admin/access", json={"email": "x@plains.com", "access_type": "FULL"})
+    assert r.status_code == 403
+
+
 # ── structured error handlers ────────────────────────────────────────────────
 def _raiser(msg):
     def _r(sql):

@@ -30,6 +30,39 @@ def test_mirror_user_sites_is_noop_when_disabled(monkeypatch):
     assert called == []
 
 
+def test_set_access_grant_noop_when_disabled(monkeypatch):
+    monkeypatch.setattr(lakebase, "enabled", lambda: False)
+    called = []
+    monkeypatch.setattr(lakebase, "pg_execute", lambda *a, **k: called.append(a))
+    lakebase.set_access_grant("u@x.com", "ADMIN")
+    assert called == []
+
+
+def test_set_access_grant_replaces_elevated_rows_when_enabled(monkeypatch):
+    import config
+    monkeypatch.setattr(lakebase, "enabled", lambda: True)
+    monkeypatch.setattr(config, "USE_LAKEBASE_PERMISSIONS", True)
+    monkeypatch.setattr(lakebase, "_ensure_permissions_ready", lambda: None)
+    calls = []
+    monkeypatch.setattr(lakebase, "pg_execute", lambda sql, params=None: calls.append((sql, params)))
+    lakebase.set_access_grant("U@X.com", "full")
+    assert any("DELETE" in s and "<> 'SITE'" in s for s, _ in calls)      # elevated rows cleared
+    ins = [(s, p) for s, p in calls if "INSERT" in s]
+    assert ins and ins[0][1] == ("u@x.com", "FULL")                       # normalised + upper-cased
+
+
+def test_set_access_grant_revoke_deletes_without_insert(monkeypatch):
+    import config
+    monkeypatch.setattr(lakebase, "enabled", lambda: True)
+    monkeypatch.setattr(config, "USE_LAKEBASE_PERMISSIONS", True)
+    monkeypatch.setattr(lakebase, "_ensure_permissions_ready", lambda: None)
+    calls = []
+    monkeypatch.setattr(lakebase, "pg_execute", lambda sql, params=None: calls.append((sql, params)))
+    lakebase.set_access_grant("u@x.com", "NONE")
+    assert any("DELETE" in s for s, _ in calls)
+    assert not any("INSERT" in s for s, _ in calls)
+
+
 # ── get_perms flag routing ───────────────────────────────────────────────────
 def test_get_perms_uses_warehouse_when_lakebase_disabled(bind_db, monkeypatch):
     import app as app_module

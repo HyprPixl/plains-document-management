@@ -308,6 +308,89 @@ def api_field_def_delete(field_key):
     return jsonify(ok=True)
 
 
+# ─────────────────────────────────────────────── admin: access management ──
+# The in-app way to change who's an app admin (and grant FULL / READ). SITE rows are
+# auto-mirrored from a user's own SharePoint browse (sp.sync_user_sites) and are NOT
+# managed here — this console only touches the manually-granted ADMIN / FULL / READ rows.
+# Dual-store like every permission write during Phase 2: the warehouse is the source of
+# truth for the fallback path, and the change is mirrored into Lakebase (the live read path).
+
+_ACCESS_TYPES = ("ADMIN", "FULL", "READ")
+_ACCESS_RANK = {"ADMIN": 3, "FULL": 2, "READ": 1}
+
+
+def _elevated_grants():
+    """All elevated (non-SITE) grants, collapsed to the strongest access_type per user.
+
+    Reads Lakebase (the live path) when enabled, falling back to the warehouse on any error —
+    the same read discipline as get_perms()."""
+    rows = None
+    if config.USE_LAKEBASE_PERMISSIONS and lakebase.enabled():
+        try:
+            rows = lakebase.list_access_grants()
+        except Exception as e:
+            app.logger.warning(f"lakebase list_access_grants failed, warehouse fallback — {e!r}")
+            rows = None
+    if rows is None:
+        rows = query(
+            f"SELECT email, access_type, updated_at FROM {config.PERMISSIONS} "
+            f"WHERE upper(access_type) <> 'SITE' ORDER BY email"
+        )
+    best = {}
+    for r in rows:
+        em = (r.get("email") or "").lower()
+        at = (r.get("access_type") or "").upper()
+        if not em or at not in _ACCESS_RANK:
+            continue
+        cur = best.get(em)
+        if cur is None or _ACCESS_RANK[at] > _ACCESS_RANK[cur["access_type"]]:
+            best[em] = {"email": em, "access_type": at,
+                        "updated_at": str(r.get("updated_at")) if r.get("updated_at") else None}
+    return sorted(best.values(), key=lambda g: g["email"])
+
+
+def _set_access(email_l, access):
+    """Replace a user's elevated (non-SITE) grant with a single access_type, or clear it on
+    NONE (revoke). Warehouse write is the source of truth; then mirror into Lakebase. SITE
+    rows (SharePoint-mirrored) are never touched here."""
+    execute(f"DELETE FROM {config.PERMISSIONS} WHERE lower(email) = {lit(email_l)} "
+            f"AND upper(access_type) <> 'SITE'")
+    if access in _ACCESS_TYPES:
+        execute(f"INSERT INTO {config.PERMISSIONS} (email, access_type, allowed_site, updated_at) "
+                f"VALUES ({lit(email_l)}, {lit(access)}, NULL, current_timestamp())")
+    lakebase.set_access_grant(email_l, access)
+
+
+@app.get("/api/admin/access")
+def api_admin_access_list():
+    email = current_user()
+    if not _require_admin(email):
+        return jsonify(error="forbidden"), 403
+    return jsonify(grants=_elevated_grants(), me=email)
+
+
+@app.post("/api/admin/access")
+def api_admin_access_set():
+    email = current_user()
+    if not _require_admin(email):
+        return jsonify(error="forbidden"), 403
+    b = request.get_json(force=True)
+    target = (b.get("email") or "").strip().lower()
+    access = (b.get("access_type") or "").strip().upper()
+    if not target or "@" not in target:
+        return jsonify(error="a valid email is required"), 400
+    if access not in _ACCESS_TYPES and access != "NONE":
+        return jsonify(error="access_type must be ADMIN, FULL, READ, or NONE"), 400
+    # Guard against locking everyone out: the last remaining admin can't be demoted/revoked.
+    if access != "ADMIN":
+        admins = {g["email"] for g in _elevated_grants() if g["access_type"] == "ADMIN"}
+        if target in admins and len(admins) == 1:
+            return jsonify(error="cannot remove the last remaining admin"), 409
+    _set_access(target, access)
+    _audit(email, "access_set", target, {"access_type": access})
+    return jsonify(ok=True, email=target, access_type=access)
+
+
 # ─────────────────────────────────────────── admin: warehouse latency bench ──
 # Server-side companion to bench/bench.py. The client script times the HTTP round-trip
 # from outside; this endpoint times the *warehouse* round-trip in-process — the number
