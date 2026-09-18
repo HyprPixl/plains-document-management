@@ -187,12 +187,17 @@ async function loadDocs() {
   $("#docEmpty").hidden = rows.length > 0;
   for (const d of rows) {
     state.rowById.set(d.doc_id, d);
-    const cb = el("input", { type: "checkbox", "data-id": d.doc_id,
-      onclick: (e) => { e.stopPropagation();
-        e.target.checked ? state.selected.add(d.doc_id) : state.selected.delete(d.doc_id);
-        updateBulkBar(); } });
+    const cb = el("input", { type: "checkbox", "data-id": d.doc_id });
+    const setSel = (on) => { on ? state.selected.add(d.doc_id) : state.selected.delete(d.doc_id); updateBulkBar(); };
+    cb.onchange = () => setSel(cb.checked);
+    // Toggle from anywhere in the cell, not just the tiny box, and never let a select-click
+    // fall through to the row (which opens the doc) — that mis-fire is why selecting felt flaky.
+    const checkCell = el("td", { class: "col-check", onclick: (e) => {
+      e.stopPropagation();
+      if (e.target !== cb) { cb.checked = !cb.checked; setSel(cb.checked); }
+    } }, cb);
     tb.append(el("tr", { onclick: () => openDoc(d.doc_id, d) },
-      el("td", { class: "col-check" }, cb),
+      checkCell,
       el("td", {}, el("span", { class: "doc-name" }, d.original_filename || "(unnamed)")),
       el("td", {}, el("span", { class: "loc muted small", title: locationOf(d) },
         locationOf(d))),

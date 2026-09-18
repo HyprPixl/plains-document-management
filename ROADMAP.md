@@ -147,6 +147,48 @@ Depends on the fast data layer (2), the viewer and permissions (4), and tested f
   timelines, calendars, relation trees*). Timelines from extracted dates, an obligations calendar, and
   a relation tree built on `document_links`.
 
+## Phase 6 — SharePoint as the live source: lifecycle, ACL parity & sync fidelity — ⏳ NEW (raised 2026-09-18)
+
+> **Decision (2026-09-18, user):** SharePoint is now treated as the **live source of truth for file
+> lifecycle** (existence, location, per-item access). This **revises SPEC §13's locked
+> "Databricks-primary, one-way DBX→SP mirror"** decision — Databricks stays the *brain* (extraction,
+> search, metadata) but no longer owns whether/where a file exists or who may see it. **SPEC §13/§14
+> must be updated to record this revision** (the one-way mirror is demoted; see S3). This aligns with
+> the "SharePoint as the spine" model already in PLAN.md.
+
+Today (audited 2026-09-18) all three of these are **gaps** — sync is additive-only (SP→DBX pull), never
+reconciles, and there is no per-item ACL and no DBX→SP mirror. Details in AGENTS.md.
+
+- **S1 — Lifecycle reconciliation: moves & deletes** (req: *what happens if a doc is moved / deleted in
+  SharePoint? keep metadata and rehydrate on hash match*). Depends on S3's delta query.
+  - **Moved:** today `sp_path`/`sp_web_url` are written only at first import and go stale on any move.
+    Refresh them (and the enclosing-folder link, Phase 4 item Q) whenever a tracked `source_ref` reports
+    a new parent/path.
+  - **Deleted:** today the row + text + fields + volume bytes are silently orphaned. Add a
+    **soft-delete** (`status='source_removed'` or a `source_deleted_at` marker) that **keeps all
+    metadata + `content_sha256`**, hides the doc from Explore/Manage by default, and audits the event.
+  - **Hash rehydration** (user's idea): when identical bytes reappear anywhere in SP (a re-add, or a
+    move we couldn't track by `item_id`), **revive the soft-deleted row** — relink `source_ref`/`sp_path`
+    and clear the deleted marker — instead of orphaning or re-processing from scratch. Make this
+    deliberate (today it's an accidental no-op because we never delete). Reuses the existing
+    `content_sha256` twin/dedup machinery (SPEC §9).
+- **S2 — Per-file ACL parity** (req: *how do permissions work on viewing docs in the app?*). Today
+  access is **site-level only** (`perms_where`/`perms_sites` filter by `sp_site_id`): see a site → see
+  every doc from it, even files you couldn't open in SharePoint. Move to **item-level parity**: read each
+  item's Graph `/permissions` during sync, persist the item's allowed principals, and extend the
+  permission predicate to filter by item ACL (handling broken inheritance / item-level sharing), not just
+  site membership. Big lift — call out Graph call volume + storage; reconcile ACLs on the same delta
+  sweep as S1. **Also fix now (cheap):** in-app uploads have `sp_site_id = NULL`, so non-FULL users
+  can't see them at all — give uploads a first-class scope so they're visible to the right users.
+- **S3 — Sync-mechanism upgrade + mirror decision** (req: *how do we sync them with SharePoint?*).
+  - **Delta query:** replace the `lastModifiedDateTime` **watermark crawl** with a **Graph delta-token**
+    query per drive. Deltas surface **deletes and moves** (which a watermark cannot see) — this is the
+    prerequisite that unblocks S1 and keeps S2's ACLs fresh.
+  - **DBX→SP mirror (SPEC §13) is currently unbuilt** — `mirror_status` is only ever written
+    `not_mirrored`, no worker pushes to SharePoint. Given the source-of-truth flip, **decide whether the
+    one-way mirror is still wanted** (it may be demoted to "push confirmed metadata columns back onto the
+    SP item" rather than a file mirror). Resolve before building anything against `mirror_status`.
+
 ---
 
 ## Requirement → phase map
@@ -171,5 +213,8 @@ Depends on the fast data layer (2), the viewer and permissions (4), and tested f
 | P | Select docs → open in plains-nexus | 5 |
 | Q | "Open enclosing folder in SharePoint" | 4 |
 | R | Copy extraction/verified results free for identical docs | 3 ✅ |
+| S | Handle moved/deleted SP docs: keep metadata, hash-rehydrate | 6 |
+| T | View permissions faithful to SharePoint (per-file ACL parity) | 6 |
+| U | Sync fidelity — how docs sync with SharePoint (delta query + mirror decision) | 6 |
 </content>
 </invoke>
