@@ -13,6 +13,7 @@ import re
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from flask import Flask, Response, g, jsonify, request, send_file, render_template
@@ -27,6 +28,23 @@ from db import query, execute, lit, cached_query, bust_cache
 
 app = Flask(__name__)
 _w = WorkspaceClient()
+
+# Best-effort side-effects (audit-log writes, kicking the processing job) hit the warehouse or
+# the Jobs API — each ~1s+ — but the response doesn't depend on them. Run them off the request
+# thread so a submit (classify / enqueue / tag / verify) returns as soon as its fast Lakebase
+# write lands. Small bounded pool per gunicorn worker; failures are swallowed by the callables.
+_bg_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dochub-bg")
+
+
+def _submit_bg(fn, *args, **kwargs):
+    """Run a best-effort side-effect in the background. Runs inline under test for determinism."""
+    if app.config.get("TESTING"):
+        try:
+            fn(*args, **kwargs)
+        except Exception:
+            pass
+        return
+    _bg_pool.submit(fn, *args, **kwargs)
 
 # ─────────────────────────────────────────────────────────────── logging ──
 # Structured logs to stdout so the Databricks App log captures every error on the
@@ -673,7 +691,7 @@ def api_enqueue():
             f"next_attempt_at = NULL, updated_at = current_timestamp() "
             f"WHERE doc_id IN ({id_list}) AND classification_status = 'classified'"
         )
-    _trigger_processing_run()  # kick the job now so extraction doesn't wait for the schedule
+    _submit_bg(_trigger_processing_run)  # kick the job off-thread; extraction isn't part of the response
     _audit(email, "enqueue", f"{len(ids)} docs", None)
     return jsonify(enqueued=len(ids))
 
@@ -1217,14 +1235,27 @@ def _trigger_processing_run():
 
 
 def _audit(actor, action, target, detail):
-    try:
-        execute(
-            f"INSERT INTO {config.AUDIT_LOG} (event_id, actor, action, target, detail, created_at) "
-            f"VALUES ({lit('e_'+uuid.uuid4().hex[:12])}, {lit(actor)}, {lit(action)}, "
-            f"{lit(target)}, {lit(json.dumps(detail) if detail else None)}, current_timestamp())"
-        )
-    except Exception:
-        pass
+    # Prefer Lakebase — a single-digit-ms write in the same store the mutation itself used, so it
+    # stays synchronous and durable. Only if Lakebase is down do we fall back to the warehouse,
+    # and that write (~1.2s) is fired off the request thread so a submit still returns promptly.
+    if lakebase.enabled():
+        try:
+            lakebase.write_audit(actor, action, target, detail)
+            return
+        except Exception:
+            pass  # Lakebase hiccup — fall through to the (backgrounded) warehouse write
+    sql = (
+        f"INSERT INTO {config.AUDIT_LOG} (event_id, actor, action, target, detail, created_at) "
+        f"VALUES ({lit('e_'+uuid.uuid4().hex[:12])}, {lit(actor)}, {lit(action)}, "
+        f"{lit(target)}, {lit(json.dumps(detail) if detail else None)}, current_timestamp())"
+    )
+
+    def _write():
+        try:
+            execute(sql)
+        except Exception:
+            pass
+    _submit_bg(_write)
 
 
 if __name__ == "__main__":

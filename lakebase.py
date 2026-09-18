@@ -19,10 +19,12 @@ Design (matches the sibling `dbx-deal-capture-app` on the same Lakebase instance
   `LAKEBASE_TOKEN` is an ephemeral local-probing override only; it is NEVER persisted.
 - **Parameterized queries only** (`%s`). Do NOT reuse `db.lit()` string interpolation.
 """
+import json
 import logging
 import os
 import threading
 import time
+import uuid
 
 import config
 
@@ -467,6 +469,7 @@ DOCUMENT_FIELDS = f"{SCHEMA}.document_fields"
 DOCUMENT_TEXT = f"{SCHEMA}.document_text"
 DOCUMENT_TAGS = f"{SCHEMA}.document_tags"
 DOCUMENT_LINKS = f"{SCHEMA}.document_links"
+AUDIT_LOG = f"{SCHEMA}.audit_log"
 
 _DOCS_LOCK_KEY = 918273646  # distinct from the permissions backfill lock
 
@@ -558,6 +561,15 @@ _DOCS_DDL = (
     "  created_at    TIMESTAMPTZ,"
     "  PRIMARY KEY (parent_doc_id, child_doc_id, relationship)"
     ")",
+    f"CREATE TABLE IF NOT EXISTS {AUDIT_LOG} ("
+    "  event_id   TEXT PRIMARY KEY,"
+    "  actor      TEXT,"
+    "  action     TEXT,"
+    "  target     TEXT,"
+    "  detail     TEXT,"
+    "  created_at TIMESTAMPTZ"
+    ")",
+    f"CREATE INDEX IF NOT EXISTS audit_log_created_idx ON {AUDIT_LOG} (created_at DESC)",
 )
 
 
@@ -756,6 +768,19 @@ def document_type(doc_id: str) -> str | None:
 def document_exists(doc_id: str) -> bool:
     _ensure_documents_ready()
     return bool(pg_query(f"SELECT 1 FROM {DOCUMENTS} WHERE doc_id = %s LIMIT 1", (doc_id,)))
+
+
+def write_audit(actor: str, action: str, target: str, detail) -> None:
+    """Append an audit row to Lakebase — a single-digit-ms PG write, so it stays synchronous on
+    the request path (vs. ~1.2s on the warehouse). Same store the mutations themselves now use;
+    the caller only reaches here when enabled()."""
+    _ensure_documents_ready()
+    pg_execute(
+        f"INSERT INTO {AUDIT_LOG} (event_id, actor, action, target, detail, created_at) "
+        f"VALUES (%s, %s, %s, %s, %s, NOW())",
+        ("e_" + uuid.uuid4().hex[:12], actor, action, target,
+         json.dumps(detail) if detail else None),
+    )
 
 
 def satisfied_field_keys(doc_id: str) -> set:

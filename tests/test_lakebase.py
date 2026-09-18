@@ -51,6 +51,20 @@ def test_set_access_grant_replaces_elevated_rows_when_enabled(monkeypatch):
     assert ins and ins[0][1] == ("u@x.com", "FULL")                       # normalised + upper-cased
 
 
+def test_write_audit_inserts_row_to_lakebase(monkeypatch):
+    monkeypatch.setattr(lakebase, "_ensure_documents_ready", lambda: None)
+    calls = []
+    monkeypatch.setattr(lakebase, "pg_execute", lambda sql, params=None: calls.append((sql, params)))
+    lakebase.write_audit("u@x.com", "classify", "3 docs", {"document_type": "Invoice"})
+    assert len(calls) == 1
+    sql, params = calls[0]
+    assert "INSERT INTO" in sql and "audit_log" in sql
+    # event_id generated, then actor/action/target, then the JSON-encoded detail.
+    assert params[0].startswith("e_")
+    assert params[1:4] == ("u@x.com", "classify", "3 docs")
+    assert '"document_type": "Invoice"' in params[4]
+
+
 def test_set_access_grant_revoke_deletes_without_insert(monkeypatch):
     import config
     monkeypatch.setattr(lakebase, "enabled", lambda: True)
