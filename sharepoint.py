@@ -215,10 +215,18 @@ def access_token_for(email: str) -> str:
 
 # ───────────────────────────────────────────────────────────────── Graph browse ──
 
+_GRAPH_RETRIES = 4  # 429/503 are common under a large crawl; Graph tells us how long to wait
+
 def _graph(token: str, url: str, params: dict | None = None) -> dict:
-    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=60)
-    r.raise_for_status()
-    return r.json()
+    for attempt in range(_GRAPH_RETRIES):
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=60)
+        if r.status_code in (429, 503) and attempt < _GRAPH_RETRIES - 1:
+            # Respect Graph's Retry-After (seconds); otherwise short exponential backoff.
+            ra = r.headers.get("Retry-After", "")
+            time.sleep(min(int(ra), 30) if ra.isdigit() else 2 ** attempt)
+            continue
+        r.raise_for_status()
+        return r.json()
 
 
 def list_sites(token: str, q: str = "") -> list[dict]:

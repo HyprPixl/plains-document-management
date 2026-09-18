@@ -135,6 +135,9 @@ def sweep_sharepoint() -> int:
 # ──────────────────────────────────────────── delegated SharePoint sync ──
 
 SYNC_LEASE_SECONDS = int(os.getenv("SP_SYNC_LEASE", "900"))
+# Cap the per-tick ACL-inheritance probes (Phase 6 measurement, not enforcement): a large
+# first crawl mustn't fire one /permissions call per item. Beyond the budget we record NULL.
+ACL_PROBE_BUDGET = int(os.getenv("SP_ACL_PROBE_BUDGET", "25"))
 
 
 def sync_delegated() -> int:
@@ -216,10 +219,16 @@ def _sync_one(s: dict, watermark: str | None) -> int:
     else:
         files = sp.walk_files(access, s["drive_id"], None, modified_after=watermark)
     n = 0
+    acl_budget = ACL_PROBE_BUDGET
     for it in files:
-        # Phase 6 instrumentation (best-effort, never blocks sync): record whether this item
-        # has unique (broken-inheritance) permissions, to measure if per-item ACLs are needed.
-        has_unique = sp.item_has_unique_acl(access, s["drive_id"], it["id"])
+        # Phase 6 instrumentation (best-effort, never blocks sync): sample whether items have
+        # unique (broken-inheritance) permissions, to measure if per-item ACLs are needed.
+        # Bounded per tick so a large crawl can't balloon Graph traffic — past the budget we
+        # record NULL (unknown) and the sample fills in over subsequent ticks.
+        has_unique = None
+        if acl_budget > 0:
+            has_unique = sp.item_has_unique_acl(access, s["drive_id"], it["id"])
+            acl_budget -= 1
         r = ingest.register_bytes(
             sp.download(access, s["drive_id"], it["id"]), it["name"], it.get("mime"),
             source_id=s["source_id"], source_ref=f"{s['drive_id']}/{it['id']}",

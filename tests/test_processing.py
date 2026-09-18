@@ -149,6 +149,31 @@ def test_sync_one_single_file_synced_when_newer(fake_db, bind_db, monkeypatch):
     assert job._sync_one(s, "2020-01-01T00:00:00Z") == 1
 
 
+def test_sync_one_caps_acl_probes_per_tick(fake_db, bind_db, monkeypatch):
+    bind_db(fake_db, job)
+    monkeypatch.setattr(job, "ACL_PROBE_BUDGET", 2)                  # tiny budget for the test
+    probes = []
+
+    def walk_files(access, drive, folder, modified_after=None):
+        return [{"id": f"i{i}", "name": f"a{i}.pdf", "mime": "application/pdf",
+                 "path": f"/p/a{i}.pdf", "web_url": "http://u",
+                 "modified": "2024-01-01T00:00:00Z"} for i in range(5)]
+
+    def item_has_unique_acl(access, drive, item_id):
+        probes.append(item_id)
+        return False
+
+    _patch_sp(monkeypatch, walk_files=walk_files, item_has_unique_acl=item_has_unique_acl)
+    captured = []
+    monkeypatch.setattr(job.ingest, "register_bytes",
+                        lambda *a, **k: captured.append(k.get("has_unique_acl")) or {"status": "new"})
+
+    n = job._sync_one(_sync_row(), "2020-01-01T00:00:00Z")
+    assert n == 5                                                    # all files still registered
+    assert probes == ["i0", "i1"]                                   # only budget-many items probed
+    assert captured == [False, False, None, None, None]             # past budget -> unknown
+
+
 def test_sync_delegated_claims_with_lease_guard(fake_db, bind_db, monkeypatch):
     bind_db(fake_db, job)
     import sharepoint as sp
