@@ -138,6 +138,50 @@ databricks jobs run-now 607689951574858
    the reuse ("already verified — reused for free"). The searchable PDF is a sha-keyed volume artifact
    already shared, so only the pointer is copied, never bytes.
 
+## Phases 4 & 5 — Manage UX + Explore build-out (SHIPPED 2026-09-18)
+
+Built by fanning out two agents with **exclusive file ownership** (frontend owns
+`static/app.js` + `templates/index.html` + `static/style.css`; backend owns `app.py` +
+`lakebase.py` + `tests/` + `config.py` + `requirements.txt`) coordinated by pinned contracts —
+the way to parallelize safely given the single ~1600-line imperative `app.js`.
+
+- **Phase 4 Manage UX (item F) + item Q** (commits `29bc937`, `24df0d2`): a11y overlay kit
+  (`openOverlay`/`closeOverlay`/focus trap), loading/error/empty states across stats/docs,
+  keyboard access on stat cards + rows, double-submit guards, shared utils
+  (`activate`/`debounce`/`withBusy`). Explore search bar gained count/sort/dept+path filters/
+  pagination/multi-select + a read-only drawer (`openDoc(id,row,{readOnly})`). Q = client-side
+  "Open folder" link derived from `sp_web_url` (no schema change, works for all existing docs).
+- **Phase 5 Explore E/O/L** (commit `0114441`):
+  - **E — Office viewer.** `GET /api/render?doc_id=&sheet=` renders `.docx` via **mammoth** and
+    `.xlsx`/`.xlsm` via **xlsx2html + openpyxl** (tabbed sheets) to standalone HTML — pure-Python,
+    replicated from **plains-nexus** (NO LibreOffice/Graph conversion). Content-addressed volume
+    sidecar `{DOCS_VOLUME}/_render_cache/{content_sha256}.{docx|xlsx}.html` (read-through, best-
+    effort write) + per-worker LRU. Frontend dispatches Office types into the drawer iframe via
+    `srcdoc`; other types keep View/Download. Render libs imported lazily (import-safe offline).
+  - **O — corpus chat.** `POST /api/chat` streams **keyword-grounded RAG** over SSE. OpenAI SDK →
+    Databricks serving (`base_url=host/serving-endpoints`, key from `w.config.authenticate()`,
+    model `config.CHAT_MODEL` default `databricks-claude-sonnet-4-6`), client cached ~50min +
+    rebuild/retry-once on auth error. Retrieval is site-scoped: `lakebase.search(...limit=8)` +
+    new `lakebase.passages_for_docs(doc_ids, char_budget=12000)`. Frames: `data: <json token>`,
+    `event: citations` (`[{doc_id,page,filename}]`), `event: done`, `event: error`; **503
+    `chat_unavailable`** before streaming when serving unconfigured. Client = Search|Chat|
+    Obligations sub-tabs, multi-turn history, clickable citation chips. **The live streaming path
+    is only verifiable against the real serving endpoint — not the offline suite** (tests mock the
+    OpenAI client + cover the 503 path).
+  - **L — relations + obligations.** `GET /api/documents/<id>/tree` → `{root,nodes,edges}` from
+    `lakebase.link_graph(doc_id)` (both-direction, cycle-guarded `WITH RECURSIVE`; warehouse
+    fallback = one-hop only) → indented relation tree in the drawer. `GET /api/obligations?from=&
+    to=&document_type=` lists upcoming date-field obligations — date field keys from `FIELD_DEFS
+    WHERE data_type='date'`, values are free-text EAV strings **parsed/range-filtered in Python**
+    (`_parse_date`, never SQL-cast), default range today..+1yr, site-scoped via
+    `lakebase.obligations(...)`; rendered as a read-only month-grouped calendar. Lakebase-first
+    (warehouse mode returns `[]`).
+
+New read routes route through `_doc_visibility()` (row-level `perms_where`/`_sites_clause`
+equivalent). ⚠️ **`/api/download` has a pre-existing site-scope gap** (no visibility check) — left
+untouched as out of scope; worth closing. **Deferred: item P** (plains-nexus handoff — disabled
+"Open in plains-nexus" scaffold; needs nexus base URL + contract from user). Suite: **178 tests**.
+
 ## Tests (Phase 1 item DONE — commit fb3485a)
 
 `tests/` is a pytest suite, **112 tests, fully offline** (`pytest` from repo root; `pytest.ini` sets
