@@ -38,6 +38,15 @@ USE_LAKEBASE_PERMISSIONS = _env_bool("USE_LAKEBASE_PERMISSIONS", default=bool(os
 # would write Lakebase while the job reads an empty warehouse). See lakebase.py + AGENTS.md.
 USE_LAKEBASE_DOCUMENTS = _env_bool("USE_LAKEBASE_DOCUMENTS", default=False)
 
+# USE_LAKEBASE_CONFIG mirrors the tiny, rarely-changing config tables (field_defs, taxonomy)
+# into Lakebase for single-digit-ms hot-path reads (every document open re-reads field_defs).
+# Unlike documents, the WAREHOUSE stays the source of truth (reads fall back to it on any
+# Lakebase error; admin writes go to the warehouse then resync the mirror), and the job never
+# reads the mirror — so this is app-only and safe to default ON when a Postgres host is bound,
+# like permissions. CONFIG_MIRROR_TTL_S bounds staleness for externally-seeded taxonomy edits.
+USE_LAKEBASE_CONFIG = _env_bool("USE_LAKEBASE_CONFIG", default=bool(os.getenv("PGHOST")))
+CONFIG_MIRROR_TTL_S = int(os.getenv("CONFIG_MIRROR_TTL_S", "600"))
+
 # ai_query (batch inference) doesn't support the newest sonnet-5/opus-5 endpoints yet;
 # sonnet-4-5 is the current model that works with ai_query batch calls.
 EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "databricks-claude-sonnet-4-5")

@@ -541,3 +541,118 @@ def test_classify_rejects_missing_document_type(client, fake_db, monkeypatch):
     r = client.post("/api/documents/classify", json={"doc_ids": ["d1"], "department": "AP"})
     assert r.status_code == 400 and r.get_json() == {"error": "document_type_required"}
     assert called == []      # nothing classified when the type is absent
+
+
+# ── config mirror: field_defs / taxonomy (USE_LAKEBASE_CONFIG) ────────────────
+def test_config_enabled_requires_both_lakebase_and_flag(monkeypatch):
+    import config
+    monkeypatch.setattr(lakebase, "enabled", lambda: True)
+    monkeypatch.setattr(config, "USE_LAKEBASE_CONFIG", False)
+    assert lakebase.config_enabled() is False          # flag off → warehouse path
+    monkeypatch.setattr(config, "USE_LAKEBASE_CONFIG", True)
+    assert lakebase.config_enabled() is True
+    monkeypatch.setattr(lakebase, "enabled", lambda: False)
+    assert lakebase.config_enabled() is False           # lakebase inert → warehouse path
+
+
+def test_resync_config_noop_when_disabled(monkeypatch):
+    monkeypatch.setattr(lakebase, "config_enabled", lambda: False)
+    called = []
+    monkeypatch.setattr(lakebase, "_ensure_config_fresh", lambda *a, **k: called.append(a))
+    lakebase.resync_config()
+    assert called == []                                  # never touches the warehouse/pg when off
+
+
+def test_read_field_defs_reads_active_only(monkeypatch):
+    monkeypatch.setattr(lakebase, "_ensure_config_fresh", lambda *a, **k: None)
+    calls = []
+    monkeypatch.setattr(lakebase, "pg_query", lambda sql, params=None: calls.append(sql) or [])
+    lakebase.read_field_defs()
+    assert calls and "WHERE active = true" in calls[0] and lakebase.FIELD_DEFS in calls[0]
+
+
+def test_read_taxonomy_reads_active_only(monkeypatch):
+    monkeypatch.setattr(lakebase, "_ensure_config_fresh", lambda *a, **k: None)
+    calls = []
+    monkeypatch.setattr(lakebase, "pg_query", lambda sql, params=None: calls.append(sql) or [])
+    lakebase.read_taxonomy()
+    assert calls and "WHERE active = true" in calls[0] and lakebase.TAXONOMY in calls[0]
+
+
+def test_reload_config_replaces_both_tables_from_warehouse(monkeypatch):
+    import sys, types
+    fake_db = types.SimpleNamespace(query=lambda sql: (
+        [{"field_key": "amount", "label": "Amount", "data_type": "number", "applies_to": "Invoice",
+          "picklist_source": None, "extraction_prompt_hint": None, "required_for_verify": True,
+          "sort_order": 1, "active": True, "created_by": "x", "updated_at": None}]
+        if "field_defs" in sql.lower() else
+        [{"category": "document_type", "value": "Invoice", "label": "Invoice",
+          "business_unit": None, "sort_order": 1, "active": True}]))
+    monkeypatch.setitem(sys.modules, "db", fake_db)
+    stmts = []
+
+    class Cur:
+        def execute(self, sql, params=None):
+            stmts.append((sql, params))
+
+    lakebase._reload_config_from_warehouse(Cur())
+    joined = " ".join(s for s, _ in stmts)
+    assert f"DELETE FROM {lakebase.FIELD_DEFS}" in joined            # full replace, not merge
+    assert f"DELETE FROM {lakebase.TAXONOMY}" in joined
+    assert any(f"INSERT INTO {lakebase.FIELD_DEFS}" in s for s, _ in stmts)
+    assert any(f"INSERT INTO {lakebase.TAXONOMY}" in s for s, _ in stmts)
+    assert any(lakebase.CONFIG_META in s and "synced_at" in s for s, _ in stmts)  # watermark bumped
+
+
+class _FreshCur:
+    """Minimal cursor: reports a config_meta age (for the TTL freshness check)."""
+    def __init__(self, age):
+        self._age = age
+        self._q = ""
+
+    def execute(self, sql, params=None):
+        self._q = sql
+
+    def fetchone(self):
+        return (self._age,) if "EXTRACT(EPOCH" in self._q else (0,)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _wire_ensure(monkeypatch, age):
+    import config
+    monkeypatch.setattr(lakebase, "_bootstrap", lambda: None)
+    monkeypatch.setattr(lakebase, "_config_synced_at", 0.0)   # local stale → enters the lock
+    monkeypatch.setattr(config, "CONFIG_MIRROR_TTL_S", 600)
+    reloaded = []
+    monkeypatch.setattr(lakebase, "_reload_config_from_warehouse", lambda cur: reloaded.append(1))
+    cur = _FreshCur(age)
+    monkeypatch.setattr(lakebase, "_connect", lambda: types_cursor(cur))
+    return reloaded
+
+
+def types_cursor(cur):
+    import types
+    return types.SimpleNamespace(cursor=lambda: cur)
+
+
+def test_ensure_config_fresh_skips_when_sibling_refreshed(monkeypatch):
+    reloaded = _wire_ensure(monkeypatch, age=100.0)          # 100s < 600s TTL → still fresh
+    lakebase._ensure_config_fresh()
+    assert reloaded == []                                    # a sibling worker already reloaded
+
+
+def test_ensure_config_fresh_reloads_when_stale(monkeypatch):
+    reloaded = _wire_ensure(monkeypatch, age=9999.0)         # > TTL → stale
+    lakebase._ensure_config_fresh()
+    assert reloaded == [1]                                   # this worker reloads from warehouse
+
+
+def test_ensure_config_fresh_force_reloads_ignoring_age(monkeypatch):
+    reloaded = _wire_ensure(monkeypatch, age=1.0)            # fresh, but force overrides
+    lakebase._ensure_config_fresh(force=True)
+    assert reloaded == [1]

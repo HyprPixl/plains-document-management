@@ -75,3 +75,11 @@ env:
   # job, then push+deploy (the warehouse path is untouched). See AGENTS.md.
   - name: USE_LAKEBASE_DOCUMENTS
     value: "true"
+  # Mirror the config tables (field_defs, taxonomy) into Lakebase for single-digit-ms hot-path
+  # reads (every document open re-reads field_defs — ~1.2s warehouse round-trip otherwise). The
+  # WAREHOUSE stays source of truth: reads fall back to it on any Lakebase error, admin writes
+  # go to the warehouse then resync the mirror, and the processing job is unaffected (it reads
+  # field_defs from the warehouse). App-only + fallback, so safe to default on when PGHOST is
+  # bound. Rollback: set 'false' (warehouse-cached reads). CONFIG_MIRROR_TTL_S bounds staleness.
+  - name: USE_LAKEBASE_CONFIG
+    value: "true"

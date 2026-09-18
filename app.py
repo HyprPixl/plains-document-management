@@ -231,13 +231,46 @@ def api_me():
 
 
 # ────────────────────────────────────────────────────────────────── taxonomy ──
+# field_defs / taxonomy are read on hot paths (every document open) but change rarely. They
+# live in the warehouse (source of truth) and are mirrored into Lakebase for single-digit-ms
+# reads (see lakebase.py config-mirror). These two accessors centralise the store choice:
+# Lakebase when the cutover is on, warehouse (TTL-cached) as the fallback on any error.
+# Callers filter the ACTIVE-row lists by applies_to / data_type / category in Python.
+
+def _active_field_defs():
+    """All active field defs (canonical order), Lakebase-first with warehouse fallback."""
+    if lakebase.config_enabled():
+        try:
+            return lakebase.read_field_defs()
+        except Exception as e:
+            app.logger.warning(f"lakebase field_defs read failed, warehouse fallback ({e!r}) — {_req_ctx()}")
+    return cached_query(
+        f"SELECT field_key, label, data_type, applies_to, picklist_source, "
+        f"extraction_prompt_hint, required_for_verify, sort_order FROM {config.FIELD_DEFS} "
+        f"WHERE active = true ORDER BY (applies_to = 'common') DESC, sort_order")
+
+
+def _active_taxonomy():
+    """All active taxonomy option-set rows, Lakebase-first with warehouse fallback."""
+    if lakebase.config_enabled():
+        try:
+            return lakebase.read_taxonomy()
+        except Exception as e:
+            app.logger.warning(f"lakebase taxonomy read failed, warehouse fallback ({e!r}) — {_req_ctx()}")
+    return cached_query(
+        f"SELECT category, value, label, business_unit, sort_order FROM {config.TAXONOMY} "
+        f"WHERE active = true ORDER BY category, sort_order")
+
+
+def _applies(defn, doc_type):
+    """A field def applies to a doc when it's common or scoped to that document_type."""
+    a = defn.get("applies_to")
+    return a == "common" or (doc_type is not None and a == doc_type)
+
 
 @app.get("/api/taxonomy")
 def api_taxonomy():
-    rows = cached_query(
-        f"SELECT category, value, label, business_unit, sort_order FROM {config.TAXONOMY} "
-        f"WHERE active = true ORDER BY category, sort_order"
-    )
+    rows = _active_taxonomy()
     out = {"department": [], "document_type": []}
     for r in rows:
         out.setdefault(r["category"], []).append(
@@ -249,15 +282,7 @@ def api_taxonomy():
 @app.get("/api/field-defs")
 def api_field_defs():
     doc_type = request.args.get("document_type")
-    where = "active = true AND (applies_to = 'common'"
-    if doc_type:
-        where += f" OR applies_to = {lit(doc_type)}"
-    where += ")"
-    rows = cached_query(
-        f"SELECT field_key, label, data_type, applies_to, picklist_source, "
-        f"extraction_prompt_hint, required_for_verify, sort_order FROM {config.FIELD_DEFS} WHERE {where} "
-        f"ORDER BY (applies_to = 'common') DESC, sort_order"
-    )
+    rows = [r for r in _active_field_defs() if _applies(r, doc_type)]
     for r in rows:
         if r.get("picklist_source") and "|" in str(r["picklist_source"]):
             r["options"] = str(r["picklist_source"]).split("|")
@@ -269,14 +294,10 @@ def api_field_defs():
 @app.get("/api/field-defs/all")
 def api_field_defs_all():
     """Every active field def, grouped by what it applies to — for the Fields admin screen."""
-    rows = cached_query(
-        f"SELECT field_key, label, data_type, applies_to, picklist_source, "
-        f"extraction_prompt_hint, required_for_verify, sort_order FROM {config.FIELD_DEFS} "
-        f"WHERE active = true ORDER BY (applies_to = 'common') DESC, applies_to, sort_order"
-    )
-    doc_types = [r["value"] for r in cached_query(
-        f"SELECT value FROM {config.TAXONOMY} WHERE category = 'document_type' AND active = true "
-        f"ORDER BY sort_order")]
+    rows = sorted(_active_field_defs(),
+                  key=lambda r: (r.get("applies_to") != "common", r.get("applies_to") or "",
+                                 r.get("sort_order") or 0))
+    doc_types = [r["value"] for r in _active_taxonomy() if r.get("category") == "document_type"]
     return jsonify(fields=rows, doc_types=doc_types)
 
 
@@ -314,6 +335,7 @@ def api_field_def_create():
         f"{lit(bool(b.get('required_for_verify')))}, {int(order)}, true, {lit(email)}, current_timestamp())"
     )
     bust_cache()
+    lakebase.resync_config()  # push the new def into the Lakebase read mirror immediately
     _audit(email, "field_def_create", key, b)
     return jsonify(ok=True, field_key=key)
 
@@ -334,6 +356,7 @@ def api_field_def_update(field_key):
         sets.append(f"sort_order = {int(b['sort_order'])}")
     execute(f"UPDATE {config.FIELD_DEFS} SET {', '.join(sets)} WHERE field_key = {lit(field_key)}")
     bust_cache()
+    lakebase.resync_config()
     _audit(email, "field_def_update", field_key, b)
     return jsonify(ok=True)
 
@@ -346,6 +369,7 @@ def api_field_def_delete(field_key):
     execute(f"UPDATE {config.FIELD_DEFS} SET active = false, updated_at = current_timestamp() "
             f"WHERE field_key = {lit(field_key)}")
     bust_cache()
+    lakebase.resync_config()
     _audit(email, "field_def_delete", field_key, None)
     return jsonify(ok=True)
 
@@ -645,13 +669,10 @@ def api_document(doc_id):
         if not bundle:
             return jsonify(error="not found"), 404
         doc = bundle["document"]
-        defs = cached_query(
-            f"SELECT fd.field_key, fd.label, fd.data_type, fd.picklist_source, fd.required_for_verify, "
-            f"fd.applies_to, fd.sort_order FROM {config.FIELD_DEFS} fd "
-            f"WHERE fd.active = true AND "
-            f"(fd.applies_to = 'common' OR fd.applies_to = {lit(doc.get('document_type'))}) "
-            f"ORDER BY (fd.applies_to='common') DESC, fd.sort_order"
-        )
+        # field_defs comes from the config mirror (Lakebase-first, warehouse fallback) — a
+        # cross-store join isn't possible, so merge the doc's values (from the bundle) by
+        # field_key in Python.
+        defs = [r for r in _active_field_defs() if _applies(r, doc.get("document_type"))]
         vals = {r["field_key"]: r for r in bundle["fields"]}
         for d in defs:
             v = vals.get(d["field_key"], {})
@@ -733,13 +754,10 @@ def api_verify(doc_id):
         if not docs:
             return jsonify(error="not found"), 404
         dtype = docs[0].get("document_type")
-    # required fields present? (field_defs is warehouse-resident in either mode; cached —
-    # it changes only via admin field-def edits, which bust the cache)
-    req = cached_query(
-        f"SELECT fd.field_key FROM {config.FIELD_DEFS} fd "
-        f"WHERE fd.active = true AND fd.required_for_verify = true AND "
-        f"(fd.applies_to = 'common' OR fd.applies_to = {lit(dtype)})"
-    )
+    # required fields present? (field_defs read from the config mirror — Lakebase-first,
+    # warehouse fallback; it changes only via admin field-def edits, which resync the mirror)
+    req = [{"field_key": r["field_key"]} for r in _active_field_defs()
+           if r.get("required_for_verify") and _applies(r, dtype)]
     # A required field is satisfied by a human-confirmed value OR an unedited AI proposal —
     # the reviewer sees the suggested value in the drawer and vouches for it by verifying.
     if lake:
@@ -1278,9 +1296,7 @@ def api_obligations():
     d_from = _parse_date(request.args.get("from")) or date.today()
     d_to = _parse_date(request.args.get("to")) or (date.today() + timedelta(days=365))
     document_type = request.args.get("document_type")
-    defs = cached_query(
-        f"SELECT field_key, label FROM {config.FIELD_DEFS} "
-        f"WHERE data_type='date' AND active=true")
+    defs = [r for r in _active_field_defs() if r.get("data_type") == "date"]
     date_keys = [r["field_key"] for r in defs]
     labels = {r["field_key"]: r.get("label") for r in defs}
     if not date_keys:

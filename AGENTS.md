@@ -291,6 +291,26 @@ places (warehouse path untouched). 🔒 **STILL TODO: rotate the SP OAuth secret
 during setup) — see the rotation steps below; the app/job read it fresh from scope `document-hub` each
 run, so rotation is put-secret + proxy-delete + one validation run, no redeploy.
 
+**Config mirror (field_defs + taxonomy) — LIVE (2026-09-18, `USE_LAKEBASE_CONFIG`, default ON when
+PGHOST bound).** These two tiny, rarely-changing config tables were the last hot-path warehouse
+reads (every document open re-reads `field_defs` → the ~1.2s slow-query lines in the app log).
+Unlike documents, this is **NOT** a full cutover: the **warehouse stays source of truth**, Lakebase
+is a read mirror. `lakebase.py` config-mirror block: `config_enabled()` = `enabled() and
+USE_LAKEBASE_CONFIG`; `read_field_defs()`/`read_taxonomy()` read the mirror (active rows only);
+`_ensure_config_fresh()` refreshes from the warehouse on first use + when the Lakebase `config_meta`
+watermark is older than `CONFIG_MIRROR_TTL_S` (default 600s) — the watermark lives in Lakebase so the
+4 workers coordinate via `pg_advisory_lock` (`_CONFIG_LOCK_KEY`) and only ONE reloads per TTL window;
+`_reload_config_from_warehouse()` does a full DELETE+INSERT of **active rows only** (the warehouse
+keeps soft-deleted `field_defs` rows that would collide on the mirror PK). `resync_config()` force-
+refreshes after an admin field-def create/update/delete. app.py routes every hot read through
+`_active_field_defs()` / `_active_taxonomy()` (Lakebase-first, **warehouse fallback on any error**,
+Python-side filtering by applies_to/data_type/required_for_verify) — `api_taxonomy`, `api_field_defs`,
+`api_field_defs_all`, the per-document drawer defs, verify-required check, and obligations date-keys.
+**The processing job is untouched** (`processing/extract.py` still reads `field_defs` from the
+warehouse — batch context, latency irrelevant), which is why this is safe to default ON like
+permissions. Rollback: `USE_LAKEBASE_CONFIG=false` → warehouse-cached reads. ⚠️ Externally-seeded
+taxonomy edits (no in-app taxonomy editor yet) are picked up within one TTL window, not instantly.
+
 The whole `document_*`
 family (documents / document_fields / document_text / document_tags / document_links) is wired to
 Lakebase for **reads AND writes** behind `USE_LAKEBASE_DOCUMENTS` (default **off**). It's a full

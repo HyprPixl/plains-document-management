@@ -102,7 +102,11 @@ def test_verify_accepts_unedited_ai_proposal_via_coalesce(client, fake_db):
 def test_verify_blocks_on_missing_required(client, fake_db):
     fake_db.responder = route([
         ("SELECT document_type FROM", [{"document_type": "Invoice"}]),
-        ("required_for_verify = true", [{"field_key": "title"}, {"field_key": "amount"}]),
+        # _active_field_defs() reads all active defs; the endpoint filters required + applies_to
+        ("active = true ORDER BY (applies_to = 'common')", [
+            {"field_key": "title", "required_for_verify": True, "applies_to": "common", "data_type": "text"},
+            {"field_key": "amount", "required_for_verify": True, "applies_to": "Invoice", "data_type": "number"},
+        ]),
         ("coalesce(confirmed_value, proposed_value)", [{"field_key": "title"}]),  # amount missing
     ])
     r = client.post("/api/documents/d1/verify")
@@ -599,7 +603,9 @@ def test_obligations_parses_and_filters_by_range(client, fake_db, monkeypatch):
     import app as app_module
     fake_db.responder = route([
         (PERMS, FULL),
-        ("data_type='date'", [{"field_key": "expiry_date", "label": "Expiry Date"}]),
+        # _active_field_defs() returns all active defs; obligations filters data_type == 'date'
+        ("active = true ORDER BY (applies_to = 'common')",
+         [{"field_key": "expiry_date", "label": "Expiry Date", "data_type": "date"}]),
     ], default=[])
     monkeypatch.setattr(app_module.lakebase, "docs_enabled", lambda: True)
     rows = [
@@ -629,3 +635,58 @@ def test_obligations_empty_when_no_date_fields(client, fake_db, monkeypatch):
     r = client.get("/api/obligations")
     assert r.status_code == 200
     assert r.get_json() == []
+
+
+# ── config reads route through Lakebase mirror with warehouse fallback ────────
+def test_active_field_defs_prefers_lakebase(client, monkeypatch):
+    import app as app_module
+    monkeypatch.setattr(app_module.lakebase, "config_enabled", lambda: True)
+    monkeypatch.setattr(app_module.lakebase, "read_field_defs", lambda: [{"field_key": "lb"}])
+    assert app_module._active_field_defs() == [{"field_key": "lb"}]     # served from the mirror
+
+
+def test_active_field_defs_falls_back_to_warehouse_on_error(client, fake_db, monkeypatch):
+    import app as app_module
+    from conftest import route
+    monkeypatch.setattr(app_module.lakebase, "config_enabled", lambda: True)
+
+    def boom():
+        raise RuntimeError("pg down")
+
+    monkeypatch.setattr(app_module.lakebase, "read_field_defs", boom)
+    fake_db.responder = route([("active = true ORDER BY (applies_to = 'common')",
+                                [{"field_key": "wh"}])])
+    with app_module.app.test_request_context():        # _req_ctx() in the warning reads flask.g
+        assert app_module._active_field_defs() == [{"field_key": "wh"}]  # warehouse fallback
+
+
+def test_active_taxonomy_falls_back_to_warehouse_on_error(client, fake_db, monkeypatch):
+    import app as app_module
+    from conftest import route
+    monkeypatch.setattr(app_module.lakebase, "config_enabled", lambda: True)
+
+    def boom():
+        raise RuntimeError("pg down")
+
+    monkeypatch.setattr(app_module.lakebase, "read_taxonomy", boom)
+    fake_db.responder = route([("FROM " + app_module.config.TAXONOMY,
+                                [{"category": "department", "value": "AP", "label": "AP",
+                                  "business_unit": None, "sort_order": 1}])])
+    with app_module.app.test_request_context():
+        rows = app_module._active_taxonomy()
+    assert rows and rows[0]["value"] == "AP"
+
+
+def test_field_def_create_resyncs_config_mirror(client, fake_db, monkeypatch):
+    import app as app_module
+    from conftest import route
+    fake_db.responder = route([
+        ("access_type, allowed_site", [{"access_type": "ADMIN", "allowed_site": None}]),
+        ("WHERE field_key =", []),                       # no existing key → create proceeds
+        ("max(sort_order)", [{"m": 3}]),
+    ])
+    resynced = []
+    monkeypatch.setattr(app_module.lakebase, "resync_config", lambda: resynced.append(1))
+    r = client.post("/api/field-defs", json={"field_key": "new_key", "label": "New"})
+    assert r.status_code == 200
+    assert resynced == [1]                               # write pushed into the read mirror

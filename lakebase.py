@@ -52,6 +52,12 @@ LAKEBASE_DB = os.getenv("LAKEBASE_DB", "databricks_postgres")
 SCHEMA = os.getenv("LAKEBASE_SCHEMA", "document_hub")
 
 PERMISSIONS = f"{SCHEMA}.permissions"
+# Config reference tables mirrored from the warehouse for low-latency hot-path reads
+# (every document open reads field_defs — ~1.2s warehouse round-trip each; see
+# USE_LAKEBASE_CONFIG below). The warehouse copies stay the source of truth.
+FIELD_DEFS = f"{SCHEMA}.field_defs"
+TAXONOMY = f"{SCHEMA}.taxonomy"
+CONFIG_META = f"{SCHEMA}.config_meta"
 
 
 def enabled() -> bool:
@@ -334,6 +340,35 @@ def _bootstrap():
             f"  updated_at   TIMESTAMPTZ DEFAULT NOW()"
             f")",
             f"CREATE INDEX IF NOT EXISTS permissions_email_idx ON {PERMISSIONS} (lower(email))",
+            # Config mirror tables (source of truth stays the warehouse; refreshed by
+            # _ensure_config_fresh). Columns mirror the warehouse field_defs / taxonomy.
+            f"CREATE TABLE IF NOT EXISTS {FIELD_DEFS} ("
+            f"  field_key             TEXT PRIMARY KEY,"
+            f"  label                 TEXT,"
+            f"  data_type             TEXT,"
+            f"  applies_to            TEXT,"
+            f"  picklist_source       TEXT,"
+            f"  extraction_prompt_hint TEXT,"
+            f"  required_for_verify   BOOLEAN,"
+            f"  sort_order            INTEGER,"
+            f"  active                BOOLEAN,"
+            f"  created_by            TEXT,"
+            f"  updated_at            TIMESTAMPTZ"
+            f")",
+            f"CREATE INDEX IF NOT EXISTS field_defs_active_idx ON {FIELD_DEFS} (active)",
+            f"CREATE TABLE IF NOT EXISTS {TAXONOMY} ("
+            f"  category      TEXT NOT NULL,"
+            f"  value         TEXT NOT NULL,"
+            f"  label         TEXT,"
+            f"  business_unit TEXT,"
+            f"  sort_order    INTEGER,"
+            f"  active        BOOLEAN"
+            f")",
+            f"CREATE INDEX IF NOT EXISTS taxonomy_cat_idx ON {TAXONOMY} (category, sort_order)",
+            f"CREATE TABLE IF NOT EXISTS {CONFIG_META} ("
+            f"  key       TEXT PRIMARY KEY,"
+            f"  synced_at TIMESTAMPTZ"
+            f")",
         )
         for stmt in ddl:
             try:
@@ -474,6 +509,129 @@ def set_access_grant(email: str, access: str) -> None:
         logger.warning(f"lakebase set_access_grant failed (warehouse write stands): {e}")
 
 
+# ─────────────────────────────────────────── config mirror (field_defs/taxonomy) ──
+# field_defs + taxonomy are tiny, rarely-changing config tables read on hot paths (every
+# document open re-reads field_defs — ~1.2s of warehouse Statement-Execution latency each).
+# We mirror them into Lakebase for single-digit-ms reads. The warehouse stays the SOURCE OF
+# TRUTH: the mirror is refreshed (a) once on first use, (b) on a bounded TTL so an
+# externally-seeded taxonomy edit can't rot indefinitely, and (c) immediately after an admin
+# field-def write (resync_config). Reads route here only when config.USE_LAKEBASE_CONFIG.
+_config_synced_at = 0.0
+_config_lock = threading.Lock()
+_CONFIG_LOCK_KEY = 918273646  # distinct from the permissions backfill lock
+
+
+def config_enabled() -> bool:
+    """True when Lakebase is live AND the config-read cutover flag is on."""
+    return enabled() and config.USE_LAKEBASE_CONFIG
+
+
+def _reload_config_from_warehouse(cur) -> None:
+    """Replace the Lakebase field_defs + taxonomy mirror with the warehouse's current rows.
+
+    Runs under the caller's advisory lock + autocommit connection. Full replace (DELETE +
+    INSERT) is simplest and safe for tables this small, and picks up warehouse-side deletes."""
+    import db  # lazy — import-safe under conftest stubs, avoids import-time coupling
+    # Mirror only ACTIVE rows: the warehouse keeps soft-deleted (active=false) rows, and a
+    # recreated key can coexist with its old inactive row — two rows, one field_key — which
+    # would collide on the mirror's PRIMARY KEY. The mirror is only ever read WHERE active,
+    # so active-only is both correct and smaller.
+    fds = db.query(
+        f"SELECT field_key, label, data_type, applies_to, picklist_source, "
+        f"extraction_prompt_hint, required_for_verify, sort_order, active, created_by, updated_at "
+        f"FROM {config.FIELD_DEFS} WHERE active = true")
+    cur.execute(f"DELETE FROM {FIELD_DEFS}")
+    for r in fds:
+        cur.execute(
+            f"INSERT INTO {FIELD_DEFS} (field_key, label, data_type, applies_to, picklist_source, "
+            f"extraction_prompt_hint, required_for_verify, sort_order, active, created_by, updated_at) "
+            f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, COALESCE(%s::timestamptz, NOW())) "
+            f"ON CONFLICT (field_key) DO NOTHING",
+            (r.get("field_key"), r.get("label"), r.get("data_type"), r.get("applies_to"),
+             r.get("picklist_source"), r.get("extraction_prompt_hint"),
+             bool(r.get("required_for_verify")), r.get("sort_order"),
+             r.get("active", True) if r.get("active") is not None else True,
+             r.get("created_by"), r.get("updated_at")))
+    tax = db.query(
+        f"SELECT category, value, label, business_unit, sort_order, active "
+        f"FROM {config.TAXONOMY} WHERE active = true")
+    cur.execute(f"DELETE FROM {TAXONOMY}")
+    for r in tax:
+        cur.execute(
+            f"INSERT INTO {TAXONOMY} (category, value, label, business_unit, sort_order, active) "
+            f"VALUES (%s,%s,%s,%s,%s,%s)",
+            (r.get("category"), r.get("value"), r.get("label"), r.get("business_unit"),
+             r.get("sort_order"), r.get("active", True) if r.get("active") is not None else True))
+    cur.execute(
+        f"INSERT INTO {CONFIG_META} (key, synced_at) VALUES ('config', NOW()) "
+        f"ON CONFLICT (key) DO UPDATE SET synced_at = NOW()")
+    logger.info(f"config mirror refreshed: {len(fds)} field_defs, {len(tax)} taxonomy rows")
+
+
+def _ensure_config_fresh(force: bool = False) -> None:
+    """Ensure the Lakebase config mirror exists and is within its TTL, refreshing from the
+    warehouse if stale. The synced-at watermark lives in Lakebase (config_meta), so the 4
+    gunicorn workers coordinate: only the first worker to notice staleness reloads (advisory
+    lock + re-check), the rest see the fresh watermark and skip the warehouse round-trip."""
+    global _config_synced_at
+    _bootstrap()
+    now = time.monotonic()
+    if not force and _config_synced_at and now - _config_synced_at < config.CONFIG_MIRROR_TTL_S:
+        return
+    with _config_lock:
+        if not force and _config_synced_at and time.monotonic() - _config_synced_at < config.CONFIG_MIRROR_TTL_S:
+            return
+        conn = _connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(%s)", (_CONFIG_LOCK_KEY,))
+            try:
+                stale = True
+                if not force:
+                    cur.execute(
+                        f"SELECT EXTRACT(EPOCH FROM (NOW() - synced_at)) AS age "
+                        f"FROM {CONFIG_META} WHERE key = 'config'")
+                    row = cur.fetchone()
+                    if row and row[0] is not None and row[0] < config.CONFIG_MIRROR_TTL_S:
+                        stale = False  # a sibling worker already refreshed within the TTL
+                if stale:
+                    _reload_config_from_warehouse(cur)
+            finally:
+                cur.execute("SELECT pg_advisory_unlock(%s)", (_CONFIG_LOCK_KEY,))
+        _config_synced_at = time.monotonic()
+
+
+def read_field_defs() -> list[dict]:
+    """All ACTIVE field defs from the Lakebase mirror, in the canonical drawer order
+    (common fields first, then by sort_order). Callers filter by applies_to / data_type /
+    required_for_verify in Python. Only called when config_enabled()."""
+    _ensure_config_fresh()
+    return pg_query(
+        f"SELECT field_key, label, data_type, applies_to, picklist_source, "
+        f"extraction_prompt_hint, required_for_verify, sort_order FROM {FIELD_DEFS} "
+        f"WHERE active = true ORDER BY (applies_to = 'common') DESC, sort_order")
+
+
+def read_taxonomy() -> list[dict]:
+    """All ACTIVE taxonomy option-set rows from the Lakebase mirror. Only called when
+    config_enabled()."""
+    _ensure_config_fresh()
+    return pg_query(
+        f"SELECT category, value, label, business_unit, sort_order FROM {TAXONOMY} "
+        f"WHERE active = true ORDER BY category, sort_order")
+
+
+def resync_config() -> None:
+    """Force-refresh the config mirror from the warehouse — call after an admin field-def
+    write so the change is visible on the reading workers immediately. No-op unless the
+    cutover is active; never raises (the warehouse write is the source of truth)."""
+    if not config_enabled():
+        return
+    try:
+        _ensure_config_fresh(force=True)
+    except Exception as e:
+        logger.warning(f"lakebase resync_config failed (warehouse write stands): {e}")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Document family — FULL cutover behind config.USE_LAKEBASE_DOCUMENTS
 # ══════════════════════════════════════════════════════════════════════════
@@ -481,8 +639,10 @@ def set_access_grant(email: str, access: str) -> None:
 # wholesale to Lakebase: reads AND writes, no warehouse copy. The five tables inter-join
 # inside single statements (search joins document_text; related-docs joins document_links;
 # explore filters document_tags) and Postgres can't join across the warehouse boundary, so
-# they must live together. field_defs / taxonomy / extraction_cache stay on the warehouse
-# (config + ai_query cache); ai_query itself is a pure warehouse function fed text inline.
+# they must live together. field_defs / taxonomy are the warehouse's source-of-truth but are
+# ALSO mirrored into Lakebase for hot-path reads (see the config-mirror block above,
+# USE_LAKEBASE_CONFIG); extraction_cache stays warehouse-only (ai_query cache); ai_query
+# itself is a pure warehouse function fed text inline.
 #
 # All values are passed as %s parameters (never lit()-interpolated) — OCR text and field
 # values are arbitrary, and Spark vs Postgres escape backslashes differently.
