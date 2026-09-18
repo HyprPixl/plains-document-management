@@ -81,6 +81,14 @@ main { max-width: 1160px; margin: 0 auto; padding: 28px 24px 80px; }
 
 /* ── Upload ── */
 .upload-panel { padding: 16px; }
+.upload-primary { display: flex; align-items: center; gap: 14px; padding: 4px 2px 14px; }
+.upload-primary .upload-icon { font-size: 30px; margin: 0; }
+.upload-primary-txt { flex: 1; min-width: 0; }
+.upload-primary-txt strong { font-size: 15px; }
+.upload-local { margin-top: 6px; border-top: 1px solid var(--line); padding-top: 12px; }
+.upload-local > summary { cursor: pointer; color: var(--muted); font-size: 13px; font-weight: 600; }
+.upload-site-row { max-width: 420px; margin: 12px 0; }
+.upload-site-row select { width: 100%; }
 .upload-drop {
   border: 2px dashed var(--line); border-radius: var(--radius);
   padding: 30px; text-align: center; transition: .15s; cursor: pointer;

@@ -4,6 +4,8 @@ Covers the classify -> enqueue -> save -> verify happy path and its guards,
 permission scoping via perms_where, field-def CRUD, and the structured error
 handlers (friendly JSON, no traceback leak, context tags in the log).
 """
+import io
+
 from conftest import route
 
 ADMIN = [{"access_type": "ADMIN", "allowed_site": None}]
@@ -165,6 +167,35 @@ def test_documents_no_perms_sees_only_own_uploads(client, fake_db):
     assert r.status_code == 200
     q = fake_db.queried_matching("LIMIT 500")
     assert any("1=0 OR (sp_site_id IS NULL AND created_by =" in s for s in q)
+
+
+# ── upload site picker + filing under a site ─────────────────────────────────
+def test_sites_lists_scoped_distinct_sites(client, fake_db):
+    fake_db.responder = route([
+        (PERMS, SITE_A),
+        ("DISTINCT sp_site_id", [{"id": "site-A", "name": "Site A"}]),
+    ], default=[])
+    r = client.get("/api/sites")
+    assert r.status_code == 200
+    assert r.get_json()["sites"] == [{"id": "site-A", "name": "Site A"}]
+    # the picker query is site-scoped via perms_where
+    assert any("sp_site_id IN ('site-A')" in s for s in fake_db.queried_matching("DISTINCT sp_site_id"))
+
+
+def test_upload_requires_a_site(client, fake_db):
+    fake_db.responder = route([(PERMS, SITE_A)], default=[])
+    r = client.post("/api/upload", data={"files": (io.BytesIO(b"x"), "a.pdf")},
+                    content_type="multipart/form-data")
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "site_required"
+
+
+def test_upload_rejects_site_without_access(client, fake_db):
+    fake_db.responder = route([(PERMS, SITE_A)], default=[])
+    r = client.post("/api/upload",
+                    data={"files": (io.BytesIO(b"x"), "a.pdf"), "sp_site_id": "site-Z"},
+                    content_type="multipart/form-data")
+    assert r.status_code == 403
 
 
 # ── per-request permission caching (BASELINE.md: perms_where fired 2-3x/page) ─

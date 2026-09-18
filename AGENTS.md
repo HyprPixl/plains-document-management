@@ -75,9 +75,15 @@ databricks jobs run-now 607689951574858
 7. **`[hidden]` must win in CSS.** `style.css` has `[hidden] { display:none !important }` because
    class rules that set `display:flex`/`position:fixed` (modals/drawers) otherwise override the
    low-specificity `[hidden]` rule and leave overlays stuck open.
-8. **Permissions are site-scoped.** `perms_where()` filters every Manage/Explore query by
-   `sp_site_id` (`FULL`/`ADMIN` unrestricted). A user's accessible sites are learned from their own
-   delegated browse (`sp.sync_user_sites`), not a manual grant table.
+8. **Permissions are site-scoped.** `perms_where()` (warehouse) and `lakebase._sites_clause()`
+   filter every Manage/Explore query by `sp_site_id` (`FULL`/`ADMIN` unrestricted). A user's
+   accessible sites are learned from their own delegated browse (`sp.sync_user_sites`), not a manual
+   grant table. Two extra rules: (a) a doc with `sp_site_id IS NULL` (legacy drag-drop uploads /
+   the SPN sweep) is visible to its `created_by` uploader, so orphans aren't invisible; (b) new
+   drag-drop uploads must be **filed under a site** — `api_upload` requires `sp_site_id` (validated
+   against the uploader's own sites) so the upload inherits that site's audience. The picker's
+   options come from `/api/sites` (distinct sites already in the caller's scope). "Import from
+   SharePoint" is the primary upload path in the UI; local upload is the collapsed secondary.
 9. **Identical bytes = free reuse (SPEC §9/§10.3) — IMPLEMENTED (roadmap item R).** Everything is
    keyed on `content_sha256`. Two layers: (a) `extraction_cache` (keyed sha+prompt_version+type)
    already made the `ai_query` free on a re-run; (b) `process_doc` now short-circuits on a **twin** —

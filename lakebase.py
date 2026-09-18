@@ -653,6 +653,20 @@ _DOC_LIST_COLS = (
 )
 
 
+def list_sites(sites, email) -> list[dict]:
+    """Distinct (id, name) of sites the caller can see — feeds the upload site picker.
+    The IS NOT NULL guard drops the own-uploads branch of the scope clause (those rows
+    carry no site), leaving only real sites in scope."""
+    _ensure_documents_ready()
+    clause, params = _sites_clause(sites, email)
+    rows = pg_query(
+        f"SELECT DISTINCT sp_site_id AS id, sp_site_name AS name FROM {DOCUMENTS} "
+        f"WHERE sp_site_id IS NOT NULL{clause} ORDER BY sp_site_name",
+        params,
+    )
+    return [{"id": r["id"], "name": r["name"]} for r in rows]
+
+
 def list_documents(sites, email, status: str | None = None, cstatus: str | None = None) -> list[dict]:
     """Queue list — mirrors api_documents' warehouse query, site-scoped."""
     _ensure_documents_ready()

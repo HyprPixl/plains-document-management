@@ -235,12 +235,42 @@ function wireUpload() {
   ["dragleave", "drop"].forEach((ev) =>
     drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("drag"); }));
   drop.addEventListener("drop", (e) => uploadFiles(e.dataTransfer.files));
+  // Refresh the site list when the local-upload panel is opened, so newly-imported sites appear.
+  const local = $(".upload-local");
+  if (local) local.addEventListener("toggle", () => { if (local.open) loadUploadSites(); });
+  loadUploadSites();
+}
+// A local upload has no SharePoint home of its own, so it must be filed under a site the
+// uploader can access — it then inherits that site's audience. Options come from the sites
+// already visible to the user (site-scoped server-side).
+async function loadUploadSites() {
+  const sel = $("#uploadSite");
+  if (!sel) return;
+  try {
+    const { sites } = await api("/api/sites");
+    const chosen = sel.value;
+    sel.replaceChildren(
+      el("option", { value: "" }, "Choose a site…"),
+      ...sites.map((s) => el("option", { value: s.id, "data-name": s.name || "" }, s.name || s.id)));
+    if (chosen) sel.value = chosen;
+  } catch { /* leave the placeholder; uploadFiles() prompts if no site is chosen */ }
 }
 async function uploadFiles(fileList) {
   const files = [...fileList];
   if (!files.length) return;
+  const sel = $("#uploadSite");
+  const siteId = sel ? sel.value : "";
+  if (!siteId) {
+    toast("Choose a site to file the upload under.", true);
+    const local = $(".upload-local"); if (local) local.open = true;
+    if (sel) sel.focus();
+    return;
+  }
+  const siteName = sel.selectedOptions[0]?.dataset.name || "";
   const fd = new FormData();
   files.forEach((f) => fd.append("files", f));
+  fd.append("sp_site_id", siteId);
+  fd.append("sp_site_name", siteName);
   const box = $("#uploadResults");
   box.replaceChildren(el("div", { class: "up-item" }, `Uploading ${files.length} file(s)…`));
   // Optimistic: drop each file into the table right away with an "Uploading" status so the

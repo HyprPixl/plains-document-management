@@ -420,8 +420,18 @@ def api_admin_access_set():
 
 @app.post("/api/upload")
 def api_upload():
-    """Hash-first upload. Returns per-file new/duplicate; writes new files to the volume."""
+    """Hash-first upload. Each file is filed under a SharePoint site the uploader can
+    access, so it inherits that site's audience via the normal site-level scoping (a
+    local file has no external ACL of its own). Returns per-file new/duplicate."""
     email = current_user()
+    site_id = (request.form.get("sp_site_id") or "").strip() or None
+    site_name = (request.form.get("sp_site_name") or "").strip() or None
+    if not site_id:
+        return jsonify(error="site_required",
+                       detail="Choose a SharePoint site to file the upload under."), 400
+    _is_admin, is_full, allowed = get_perms(email)
+    if not is_full and site_id not in allowed:
+        return jsonify(error="forbidden", detail="You don't have access to that site."), 403
     batch_id = "b_" + uuid.uuid4().hex[:12]
     results = []
     for f in request.files.getlist("files"):
@@ -429,9 +439,26 @@ def api_upload():
             f.read(), f.filename, f.mimetype,
             source_id="upload", source_ref="upload", created_by=email,
             subdir="uploads", batch_id=batch_id,
+            sp_site_id=site_id, sp_site_name=site_name,
         )
         results.append(r)
     return jsonify(batch_id=batch_id, results=results)
+
+
+@app.get("/api/sites")
+def api_sites():
+    """Sites the caller may file an upload under — the distinct SharePoint sites already
+    visible to them (site-scoped), so an upload's audience is always a site they truly
+    have access to. Feeds the upload site picker."""
+    email = current_user()
+    if lakebase.docs_enabled():
+        return jsonify(sites=lakebase.list_sites(perms_sites(email), email))
+    where = "sp_site_id IS NOT NULL" + perms_where(email)
+    rows = query(
+        f"SELECT DISTINCT sp_site_id AS id, sp_site_name AS name FROM {config.DOCUMENTS} "
+        f"WHERE {where} ORDER BY sp_site_name"
+    )
+    return jsonify(sites=[{"id": r["id"], "name": r.get("name")} for r in rows if r.get("id")])
 
 
 # ─────────────────────────────────────────────────────────────── documents ──

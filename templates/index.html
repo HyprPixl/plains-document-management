@@ -30,18 +30,30 @@
       <div class="stat-row" id="statRow"></div>
 
       <div class="panel upload-panel">
-        <div class="upload-drop" id="uploadDrop">
-          <input type="file" id="fileInput" multiple hidden>
-          <div class="upload-inner">
-            <div class="upload-icon">⬆</div>
-            <div><strong>Drop files here</strong> or <button class="link-btn" id="browseBtn">browse</button></div>
-            <div class="muted small">PDF, Word, Excel, PowerPoint, images, email — grouped or individual</div>
+        <div class="upload-primary" id="spEntry" hidden>
+          <div class="upload-icon">☁</div>
+          <div class="upload-primary-txt">
+            <strong>Import from SharePoint</strong>
+            <div class="muted small">Bring in files you already have access to — each stays scoped to its SharePoint site.</div>
           </div>
+          <button class="btn primary" id="spImportBtn">Import from SharePoint…</button>
         </div>
-        <div class="upload-alt" id="spEntry" hidden>
-          <span class="muted small">or</span>
-          <button class="btn" id="spImportBtn">Import from SharePoint…</button>
-        </div>
+        <details class="upload-local">
+          <summary>Or upload files from your computer</summary>
+          <div class="field-row upload-site-row">
+            <label for="uploadSite">File under site</label>
+            <select id="uploadSite"><option value="">Choose a site…</option></select>
+            <div class="prov">Uploaded files are shared with everyone who can access the chosen SharePoint site.</div>
+          </div>
+          <div class="upload-drop" id="uploadDrop">
+            <input type="file" id="fileInput" multiple hidden>
+            <div class="upload-inner">
+              <div class="upload-icon">⬆</div>
+              <div><strong>Drop files here</strong> or <button class="link-btn" id="browseBtn">browse</button></div>
+              <div class="muted small">PDF, Word, Excel, PowerPoint, images, email — grouped or individual</div>
+            </div>
+          </div>
+        </details>
         <div id="uploadResults" class="upload-results"></div>
       </div>
 
