@@ -461,6 +461,21 @@ def api_sites():
     return jsonify(sites=[{"id": r["id"], "name": r.get("name")} for r in rows if r.get("id")])
 
 
+@app.get("/api/admin/acl-audit")
+def api_acl_audit():
+    """Phase 6 measurement: distribution of unique vs inherited SharePoint permissions across
+    synced docs. Admin-only, temporary — tells us whether per-item ACLs are worth building
+    before we commit to the group-expansion machinery. Recorded only in Lakebase."""
+    email = current_user()
+    is_admin, _is_full, _allowed = get_perms(email)
+    if not is_admin:
+        return jsonify(error="forbidden"), 403
+    if not lakebase.docs_enabled():
+        return jsonify(error="unavailable",
+                       detail="ACL instrumentation is recorded only in Lakebase."), 503
+    return jsonify(lakebase.acl_stats())
+
+
 # ─────────────────────────────────────────────────────────────── documents ──
 
 @app.get("/api/documents")

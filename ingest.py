@@ -82,6 +82,7 @@ def register_bytes(
     sp_drive_id: str | None = None,
     sp_path: str | None = None,
     sp_web_url: str | None = None,
+    has_unique_acl: bool | None = None,
 ) -> dict:
     """Land bytes + register a document (idempotent by content hash).
 
@@ -122,6 +123,7 @@ def register_bytes(
             batch_id=batch_id, business_unit=business_unit, document_type=document_type,
             department=department, sp_site_id=sp_site_id, sp_site_name=sp_site_name,
             sp_drive_id=sp_drive_id, sp_path=sp_path, sp_web_url=sp_web_url,
+            has_unique_acl=has_unique_acl,
             classification_status=cstatus, extraction_status="pending",
             verification_status="needs_review", mirror_status="not_mirrored",
             attempt_count=0, file_modified_at=file_modified_at, created_by=created_by,

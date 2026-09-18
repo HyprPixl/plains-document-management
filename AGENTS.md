@@ -84,6 +84,12 @@ databricks jobs run-now 607689951574858
    against the uploader's own sites) so the upload inherits that site's audience. The picker's
    options come from `/api/sites` (distinct sites already in the caller's scope). "Import from
    SharePoint" is the primary upload path in the UI; local upload is the collapsed secondary.
+   **Phase 6 ACL measure-first:** each synced item is probed for unique/broken-inheritance
+   permissions (`sp.item_has_unique_acl`, best-effort, one Graph `/permissions` call) and the
+   result stored in `documents.has_unique_acl` (NULL=unknown/not-probed, Lakebase-only column).
+   This is *instrumentation only* — no enforcement change. Read the distribution via admin-only
+   `GET /api/admin/acl-audit`; build per-item ACL enforcement only if the data shows meaningful
+   broken inheritance.
 9. **Identical bytes = free reuse (SPEC §9/§10.3) — IMPLEMENTED (roadmap item R).** Everything is
    keyed on `content_sha256`. Two layers: (a) `extraction_cache` (keyed sha+prompt_version+type)
    already made the `ai_query` free on a re-run; (b) `process_doc` now short-circuits on a **twin** —

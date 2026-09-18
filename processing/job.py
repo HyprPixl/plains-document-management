@@ -217,6 +217,9 @@ def _sync_one(s: dict, watermark: str | None) -> int:
         files = sp.walk_files(access, s["drive_id"], None, modified_after=watermark)
     n = 0
     for it in files:
+        # Phase 6 instrumentation (best-effort, never blocks sync): record whether this item
+        # has unique (broken-inheritance) permissions, to measure if per-item ACLs are needed.
+        has_unique = sp.item_has_unique_acl(access, s["drive_id"], it["id"])
         r = ingest.register_bytes(
             sp.download(access, s["drive_id"], it["id"]), it["name"], it.get("mime"),
             source_id=s["source_id"], source_ref=f"{s['drive_id']}/{it['id']}",
@@ -225,6 +228,7 @@ def _sync_one(s: dict, watermark: str | None) -> int:
             department=s.get("department"), file_modified_at=it.get("modified"),
             sp_site_id=s.get("site_id"), sp_site_name=s.get("site_name"),
             sp_drive_id=s["drive_id"], sp_path=it.get("path"), sp_web_url=it.get("web_url"),
+            has_unique_acl=has_unique,
         )
         if r["status"] == "new":
             n += 1

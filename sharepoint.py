@@ -238,6 +238,26 @@ def list_drives(token: str, site_id: str) -> list[dict]:
             for d in data.get("value", [])]
 
 
+def item_has_unique_acl(token: str, drive_id: str, item_id: str) -> bool | None:
+    """Best-effort probe: does this drive item carry unique (non-inherited) permissions?
+
+    Phase 6 instrumentation — we measure whether inheritance is actually broken in this
+    tenant before building per-item ACL machinery. Graph lists each grant on an item; an
+    inherited grant carries `inheritedFrom`, a direct grant does not — so any entry missing
+    it means inheritance is broken here. Returns True/False, or None when undeterminable
+    (no visible perms, or the call failed). Never raises: ACL capture must not break a sync.
+    """
+    try:
+        data = _graph(token, f"{GRAPH}/drives/{drive_id}/items/{item_id}/permissions",
+                      {"$select": "id,inheritedFrom"})
+    except Exception:
+        return None
+    perms = data.get("value")
+    if not perms:
+        return None
+    return any("inheritedFrom" not in p for p in perms)
+
+
 def _item_path(it: dict) -> str:
     """Human folder path (incl. filename) from a Graph item's parentReference, e.g.
     '/General/2023/file.pdf'. Empty parent → '/name'."""
@@ -393,6 +413,8 @@ def import_file(token: str, drive_id: str, item: dict, *, created_by: str, sourc
                 site_id=None, site_name=None, business_unit=None, document_type=None,
                 department=None) -> dict:
     data = download(token, drive_id, item["id"])
+    # Phase 6 instrumentation (best-effort): flag unique/broken-inheritance permissions.
+    has_unique = item_has_unique_acl(token, drive_id, item["id"])
     return ingest.register_bytes(
         data, item["name"], item.get("mime"),
         source_id=source_id, source_ref=f"{drive_id}/{item['id']}", created_by=created_by,
@@ -400,6 +422,7 @@ def import_file(token: str, drive_id: str, item: dict, *, created_by: str, sourc
         document_type=document_type, department=department, file_modified_at=item.get("modified"),
         sp_site_id=site_id, sp_site_name=site_name, sp_drive_id=drive_id,
         sp_path=item.get("path"), sp_web_url=item.get("web_url"),
+        has_unique_acl=has_unique,
     )
 
 

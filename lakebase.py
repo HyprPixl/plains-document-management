@@ -543,8 +543,11 @@ _DOCS_DDL = (
     "  sp_site_name          TEXT,"
     "  sp_drive_id           TEXT,"
     "  sp_path               TEXT,"
-    "  sp_web_url            TEXT"
+    "  sp_web_url            TEXT,"
+    "  has_unique_acl        BOOLEAN"  # Phase 6 instrumentation: NULL=unknown, else broken-inheritance
     ")",
+    # ADD COLUMN IF NOT EXISTS migrates the live table (CREATE ... IF NOT EXISTS is a no-op there).
+    f"ALTER TABLE {DOCUMENTS} ADD COLUMN IF NOT EXISTS has_unique_acl BOOLEAN",
     f"CREATE INDEX IF NOT EXISTS documents_sha_idx     ON {DOCUMENTS} (content_sha256)",
     f"CREATE INDEX IF NOT EXISTS documents_srcref_idx  ON {DOCUMENTS} (source_ref)",
     f"CREATE INDEX IF NOT EXISTS documents_ext_idx     ON {DOCUMENTS} (extraction_status)",
@@ -665,6 +668,24 @@ def list_sites(sites, email) -> list[dict]:
         params,
     )
     return [{"id": r["id"], "name": r["name"]} for r in rows]
+
+
+def acl_stats() -> dict:
+    """Phase 6 measurement readout: across SharePoint-sourced docs, how many carry unique
+    (broken-inheritance) vs inherited permissions, or are still unknown (not yet probed).
+    Restricted to items with a drive/item source_ref — local uploads have no SharePoint ACL."""
+    _ensure_documents_ready()
+    rows = pg_query(
+        f"SELECT has_unique_acl AS flag, count(*) AS n FROM {DOCUMENTS} "
+        f"WHERE source_ref LIKE %s GROUP BY has_unique_acl",
+        ["%/%"],
+    )
+    out = {"unique": 0, "inherited": 0, "unknown": 0, "total": 0}
+    for r in rows:
+        n, flag = r["n"], r["flag"]
+        out["total"] += n
+        out["unique" if flag is True else "inherited" if flag is False else "unknown"] += n
+    return out
 
 
 def list_documents(sites, email, status: str | None = None, cstatus: str | None = None) -> list[dict]:

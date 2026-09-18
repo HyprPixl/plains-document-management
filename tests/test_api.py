@@ -198,6 +198,21 @@ def test_upload_rejects_site_without_access(client, fake_db):
     assert r.status_code == 403
 
 
+# ── Phase 6 ACL instrumentation readout (admin-only) ─────────────────────────
+def test_acl_audit_forbidden_for_non_admin(client, fake_db):
+    fake_db.responder = route([(PERMS, SITE_A)], default=[])
+    r = client.get("/api/admin/acl-audit")
+    assert r.status_code == 403
+
+
+def test_acl_audit_admin_unavailable_off_lakebase(client, fake_db):
+    # Admin passes the gate; the flag lives only in Lakebase, so the warehouse mode is 503.
+    fake_db.responder = route([(PERMS, ADMIN)], default=[])
+    r = client.get("/api/admin/acl-audit")
+    assert r.status_code == 503
+    assert r.get_json()["error"] == "unavailable"
+
+
 # ── per-request permission caching (BASELINE.md: perms_where fired 2-3x/page) ─
 def test_perms_lookup_issued_once_per_request(client, fake_db):
     """PIN: /api/stats calls perms_where twice, but the single-row permission lookup
