@@ -296,6 +296,19 @@ def _benign_ddl_error(e: Exception) -> bool:
     return any(s in msg for s in _BENIGN_DDL)
 
 
+# The processing job connects as its run-as *user* (ambient JWT), which has full DML on the
+# document_* tables but does NOT own them — the app SP does, and the app owns + migrates the
+# schema. So the job's defensive bootstrap DDL (a missing index/constraint on an SP-owned
+# table) fails "must be owner"/"permission denied". That's expected and harmless: the job only
+# needs DML, and schema shape is the owner's responsibility. Treat such errors as skip-not-fail.
+# (On the App path this never triggers — it runs as the owning SP and the DDL succeeds.)
+_NOT_OWNER = ("must be owner", "permission denied", "insufficientprivilege", "insufficient privilege")
+
+
+def _not_owner_error(e: Exception) -> bool:
+    return any(s in str(e).lower() for s in _NOT_OWNER)
+
+
 def _bootstrap():
     """Idempotently ensure the schema + permissions table exist (once per worker).
 
@@ -598,12 +611,19 @@ def _ensure_documents_ready():
         with conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_lock(%s)", (_DOCS_LOCK_KEY,))
             try:
+                skipped_not_owner = False
                 for stmt in _DOCS_DDL:
                     try:
                         cur.execute(stmt)
                     except Exception as e:
+                        if _not_owner_error(e):
+                            skipped_not_owner = True  # non-owner job; owner (app SP) holds schema
+                            continue
                         if not _benign_ddl_error(e):
                             raise
+                if skipped_not_owner:
+                    logger.info("document_* DDL skipped where not owner (job runs as non-owner; "
+                                "app SP owns/migrates schema) — DML unaffected")
             finally:
                 cur.execute("SELECT pg_advisory_unlock(%s)", (_DOCS_LOCK_KEY,))
         _docs_ready = True
