@@ -89,7 +89,13 @@ databricks jobs run-now 607689951574858
    result stored in `documents.has_unique_acl` (NULL=unknown/not-probed, Lakebase-only column).
    This is *instrumentation only* — no enforcement change. Read the distribution via admin-only
    `GET /api/admin/acl-audit`; build per-item ACL enforcement only if the data shows meaningful
-   broken inheritance.
+   broken inheritance. **Coverage note:** the sync-time probe only fires on new/changed items and
+   the delta crawl never revisits stable files, so existing docs stay `has_unique_acl = NULL`. A
+   one-off `python -m processing.job --acl-backfill [--acl-limit N]` (job.acl_backfill →
+   `graph.item_has_unique_acl`, app-only token, one light /permissions call per doc, no downloads,
+   429-backed-off) probes the unmeasured docs so the audit rests on real coverage. First readout
+   (2026-09-18, pre-backfill): 189 docs, 0 unique, 1 inherited, 188 unknown → per-item ACL not
+   justified; re-run the audit after a backfill to confirm on real coverage.
    **Phase 6 delta crawl (item U):** folder/drive auto-syncs now pull changes via Graph's delta
    query (`sp.delta_changes`) instead of re-listing the subtree each tick — it returns only
    adds/edits/moves/deletes since a stored `sharepoint_syncs.delta_link` (added lazily by

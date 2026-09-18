@@ -266,6 +266,32 @@ def test_delta_changes_stale_link_triggers_full_resync(monkeypatch):
     assert calls[1].endswith("/drives/drv/root/delta")           # then restarted full
 
 
+# ── Phase 6 ACL-coverage backfill ─────────────────────────────────────────────
+def test_acl_backfill_probes_records_and_leaves_unknown(monkeypatch):
+    docs = [
+        {"doc_id": "d1", "sp_drive_id": "drv", "source_ref": "drv/i1"},
+        {"doc_id": "d2", "sp_drive_id": "drv", "source_ref": "drv/i2"},
+        {"doc_id": "d3", "sp_drive_id": "drv", "source_ref": "drv/i3"},
+    ]
+    monkeypatch.setattr(job.lakebase, "docs_enabled", lambda: True)
+    monkeypatch.setattr(job.lakebase, "unprobed_acl_docs", lambda limit: docs)
+    recorded = {}
+    monkeypatch.setattr(job.lakebase, "set_has_unique_acl",
+                        lambda doc_id, v: recorded.__setitem__(doc_id, v))
+    probed = {"i1": True, "i2": False, "i3": None}   # None = undeterminable probe
+    monkeypatch.setattr(job.graph, "item_has_unique_acl", lambda drive, item: probed[item])
+    monkeypatch.setattr(job, "_heartbeat", lambda *a, **k: None)
+
+    counts = job.acl_backfill(1000)
+    assert counts == {"probed": 3, "unique": 1, "inherited": 1, "unknown": 1}
+    assert recorded == {"d1": True, "d2": False}     # None left unwritten → retried next pass
+
+
+def test_acl_backfill_noop_off_lakebase(monkeypatch):
+    monkeypatch.setattr(job.lakebase, "docs_enabled", lambda: False)
+    assert job.acl_backfill() == {"probed": 0, "unique": 0, "inherited": 0, "unknown": 0}
+
+
 def test_sync_delegated_claims_with_lease_guard(fake_db, bind_db, monkeypatch):
     bind_db(fake_db, job)
     import sharepoint as sp

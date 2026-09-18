@@ -688,6 +688,29 @@ def acl_stats() -> dict:
     return out
 
 
+def unprobed_acl_docs(limit: int) -> list[dict]:
+    """SharePoint-sourced docs whose ACL inheritance hasn't been measured yet (has_unique_acl
+    IS NULL). Used by the one-off backfill (processing.job.acl_backfill) to raise coverage of
+    the acl_stats readout. source_ref is `{drive_id}/{item_id}`; sp_drive_id must be present."""
+    _ensure_documents_ready()
+    return pg_query(
+        f"SELECT doc_id, sp_drive_id, source_ref FROM {DOCUMENTS} "
+        f"WHERE has_unique_acl IS NULL AND sp_drive_id IS NOT NULL AND source_ref LIKE %s "
+        f"ORDER BY created_at DESC LIMIT %s",
+        ["%/%", limit],
+    )
+
+
+def set_has_unique_acl(doc_id: str, value: bool | None) -> None:
+    """Record a measured ACL-inheritance flag for one doc (True=unique/broken, False=inherited).
+    None probes are left as-is by the backfill, so this only ever writes a real boolean."""
+    _ensure_documents_ready()
+    pg_execute(
+        f"UPDATE {DOCUMENTS} SET has_unique_acl = %s, updated_at = now() WHERE doc_id = %s",
+        [value, doc_id],
+    )
+
+
 def list_documents(sites, email, status: str | None = None, cstatus: str | None = None) -> list[dict]:
     """Queue list — mirrors api_documents' warehouse query, site-scoped."""
     _ensure_documents_ready()

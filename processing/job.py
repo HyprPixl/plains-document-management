@@ -399,6 +399,42 @@ def _iso_from_epoch(epoch) -> str | None:
     return datetime.datetime.utcfromtimestamp(int(epoch)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ──────────────────────────────────── Phase 6 ACL-coverage backfill (one-off) ──
+
+def acl_backfill(limit: int = 1000) -> dict:
+    """Raise coverage of the ACL-inheritance measurement (acl_stats / /api/admin/acl-audit).
+
+    The sync-time probe only fires on newly-imported or *changed* items, and the delta crawl
+    never re-visits stable files — so most existing docs stay `has_unique_acl = NULL` (unknown)
+    forever. This one-off pass probes /permissions for those unmeasured SharePoint docs and
+    records the result, so the 0-unique reading rests on real coverage instead of a sample of
+    one. Uses the app-only Graph token (not tied to a live delegated sync), one light
+    permissions call per doc (no downloads), bounded by `limit`. None probes are left unknown
+    to retry on a later pass. Lakebase-only (has_unique_acl is a Lakebase column).
+    """
+    if not lakebase.docs_enabled():
+        logger.warning("stage=acl_backfill skipped: documents not on Lakebase")
+        return {"probed": 0, "unique": 0, "inherited": 0, "unknown": 0}
+    docs = lakebase.unprobed_acl_docs(limit)
+    counts = {"probed": 0, "unique": 0, "inherited": 0, "unknown": 0}
+    for d in docs:
+        drive_id = d.get("sp_drive_id") or d["source_ref"].split("/", 1)[0]
+        item_id = d["source_ref"].split("/", 1)[1]
+        flag = graph.item_has_unique_acl(drive_id, item_id)
+        counts["probed"] += 1
+        if flag is None:
+            counts["unknown"] += 1
+            continue
+        lakebase.set_has_unique_acl(d["doc_id"], flag)
+        counts["unique" if flag else "inherited"] += 1
+    logger.info("stage=acl_backfill probed=%(probed)d unique=%(unique)d "
+                "inherited=%(inherited)d unknown=%(unknown)d", counts)
+    print(f"ACL backfill: probed {counts['probed']} — {counts['unique']} unique / "
+          f"{counts['inherited']} inherited / {counts['unknown']} unknown (left to retry)")
+    _heartbeat("acl_backfill", info=f"probed={counts['probed']} unique={counts['unique']}")
+    return counts
+
+
 # ───────────────────────────────────────────────────────── claim/lease ──
 
 def claim_batch(n: int) -> list[dict]:
@@ -711,6 +747,9 @@ def main():
     ap.add_argument("--sync", action="store_true", help="include delegated auto-sync")
     ap.add_argument("--check-lakebase", action="store_true",
                     help="probe Lakebase connectivity (SELECT 1) then exit — pre-cutover validation")
+    ap.add_argument("--acl-backfill", action="store_true",
+                    help="one-off: probe /permissions for unmeasured SharePoint docs then exit")
+    ap.add_argument("--acl-limit", type=int, default=1000, help="max docs to probe in --acl-backfill")
     ap.add_argument("--idle-sleep", type=int, default=30, help="seconds to sleep when idle in loop mode")
     args = ap.parse_args()
 
@@ -721,6 +760,9 @@ def main():
         # when the probe fails so the task result reflects real connectivity.
         if check_lakebase() != 0:
             raise SystemExit(1)
+        return
+    if args.acl_backfill:
+        acl_backfill(args.acl_limit)
         return
     # Passive reachability signal on every run once Lakebase creds are wired (flag-independent).
     if lakebase.enabled():

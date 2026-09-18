@@ -47,13 +47,37 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {_token}", "Accept": "application/json"}
 
 
+_GET_RETRIES = 4
+
+
 def _get(url: str, **kw):
-    r = requests.get(url, headers=_headers(), timeout=60, **kw)
-    if r.status_code == 401:  # token raced expiry — refresh once
-        _acquire_token()
+    for attempt in range(_GET_RETRIES):
         r = requests.get(url, headers=_headers(), timeout=60, **kw)
-    r.raise_for_status()
-    return r
+        if r.status_code == 401:  # token raced expiry — refresh once
+            _acquire_token()
+            r = requests.get(url, headers=_headers(), timeout=60, **kw)
+        if r.status_code in (429, 503) and attempt < _GET_RETRIES - 1:
+            ra = r.headers.get("Retry-After", "")
+            time.sleep(min(int(ra), 30) if ra.isdigit() else 2 ** attempt)
+            continue
+        r.raise_for_status()
+        return r
+    return r  # pragma: no cover — loop always returns/raises above
+
+
+def item_has_unique_acl(drive_id: str, item_id: str) -> bool | None:
+    """App-only counterpart of sharepoint.item_has_unique_acl: does this item carry unique
+    (non-inherited) permissions? True/False, or None when undeterminable (no visible perms,
+    or the call failed). Never raises — ACL measurement must not break a backfill pass."""
+    try:
+        data = _get(f"{GRAPH}/drives/{drive_id}/items/{item_id}/permissions",
+                    params={"$select": "id,inheritedFrom"}).json()
+    except Exception:
+        return None
+    perms = data.get("value")
+    if not perms:
+        return None
+    return any("inheritedFrom" not in p for p in perms)
 
 
 def resolve_site_drive(cfg: dict) -> tuple[str, str]:
