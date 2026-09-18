@@ -531,6 +531,9 @@ def api_classify():
     dept = body.get("department")
     if not ids:
         return jsonify(error="no doc_ids"), 400
+    # A doc classified with no document_type has no type and no extractable fields — reject it.
+    if not dt:
+        return jsonify(error="document_type_required"), 400
     if lakebase.docs_enabled():
         lakebase.classify(ids, dt, dept)
     else:
@@ -798,8 +801,24 @@ def api_search():
     dept = request.args.get("department")
     path = request.args.get("path")  # prefix filter on the SharePoint path
     tag = request.args.get("tag")
+    # sort: whitelist keyword only — the raw value never reaches the SQL. limit/offset clamped.
+    sort = request.args.get("sort") or "newest"
+    if sort not in lakebase._SEARCH_ORDER_BY:
+        sort = "newest"
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(200, limit))
+    try:
+        offset = int(request.args.get("offset", 0))
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, offset)
     if lakebase.docs_enabled():
-        return jsonify(lakebase.search(perms_sites(email), email, q, dt, dept, path, tag))
+        rows, total = lakebase.search(perms_sites(email), email, q, dt, dept, path, tag,
+                                      sort, limit, offset)
+        return jsonify(rows=rows, total=total)
     where = "verification_status = 'verified'" + perms_where(email, "d.sp_site_id")
     if dt:
         where += f" AND d.document_type = {lit(dt)}"
@@ -827,14 +846,19 @@ def api_search():
         f"SELECT d.doc_id, d.original_filename, d.document_type, d.department, "
         f"d.sp_site_name, d.sp_path, d.sp_web_url, d.mime_type, d.derived_pdf_path, "
         f"coalesce(f_title.confirmed_value, f_title.proposed_value) AS title, "
-        f"coalesce(f_sum.confirmed_value, f_sum.proposed_value) AS summary, d.created_at "
+        f"coalesce(f_sum.confirmed_value, f_sum.proposed_value) AS summary, d.created_at, "
+        f"count(*) OVER() AS _total "
         f"FROM {config.DOCUMENTS} d "
         f"LEFT JOIN {config.DOCUMENT_FIELDS} f_title ON f_title.doc_id = d.doc_id AND f_title.field_key = 'title' "
         f"LEFT JOIN {config.DOCUMENT_FIELDS} f_sum ON f_sum.doc_id = d.doc_id AND f_sum.field_key = 'summary' "
         f"{join_txt}{join_tag}"
-        f"WHERE {where} ORDER BY d.created_at DESC LIMIT 200"
+        f"WHERE {where} ORDER BY {lakebase._SEARCH_ORDER_BY[sort]} "
+        f"LIMIT {int(limit)} OFFSET {int(offset)}"
     )
-    return jsonify(rows)
+    total = int(rows[0]["_total"]) if rows else 0
+    for r in rows:
+        r.pop("_total", None)
+    return jsonify(rows=rows, total=total)
 
 
 @app.get("/api/download")

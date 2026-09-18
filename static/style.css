@@ -360,3 +360,29 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #cfe0f5; border-c
 .loc { display: inline-block; max-width: 260px; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; vertical-align: bottom; }
 .rc-path { margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Keyboard-reachable stat cards / rows get a visible focus ring. */
+.stat-card:focus-visible, .doc-table tbody tr:focus-visible, .result-card:focus-visible {
+  outline: 2px solid var(--brand); outline-offset: 2px; }
+.stat-card.err .n { color: var(--muted); }
+
+/* Bulk bars (Manage header + Explore) */
+.bulk-bar { display: flex; align-items: center; gap: 10px; }
+
+/* Import progress line (sync panel area) */
+.import-progress { padding: 14px 16px; font-size: 14px; }
+.import-progress.done { color: var(--ok); }
+.import-progress.error { color: var(--danger); }
+
+/* Auto-sync "single item only" note */
+.sp-autosync-note { margin-left: 4px; color: var(--warn); }
+
+/* ── Explore: filters, count, multi-select, pagination ── */
+.search-bar .filter-path { flex: 1; min-width: 160px; }
+.explore-head-row { display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 12px; flex-wrap: wrap; min-height: 22px; }
+.result-card { position: relative; }
+.result-card .rc-title { padding-right: 26px; }
+.rc-check-wrap { position: absolute; top: 12px; right: 12px; display: inline-flex; }
+.rc-check-wrap input { width: 16px; height: 16px; cursor: pointer; }
+.load-more-wrap { text-align: center; margin: 18px 0 4px; }

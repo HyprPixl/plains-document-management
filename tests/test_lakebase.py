@@ -412,3 +412,67 @@ def test_list_documents_hides_soft_deleted(monkeypatch):
     calls = _capture_pg(monkeypatch)
     lakebase.list_documents(None, "u@x.com")
     assert "deleted_at IS NULL" in calls[0][0]
+
+
+# ── Phase 5 F: search sort + pagination + total count ────────────────────────
+def test_search_sort_maps_to_whitelisted_order_and_strips_total(monkeypatch):
+    calls = _capture_pg(monkeypatch, rows=[{"doc_id": "d1", "_total": 7},
+                                           {"doc_id": "d2", "_total": 7}])
+    rows, total = lakebase.search(None, "u@x.com", sort="title", limit=25, offset=50)
+    assert total == 7                                   # count(*) OVER() read once
+    assert rows == [{"doc_id": "d1"}, {"doc_id": "d2"}]  # _total stripped from every row
+    sql, params = calls[0]
+    assert "count(*) OVER() AS _total" in sql
+    # raw sort value is never interpolated — the whitelist expression is used verbatim
+    assert ("ORDER BY lower(coalesce(f_title.confirmed_value, f_title.proposed_value, "
+            "d.original_filename)) ASC") in sql
+    assert sql.rstrip().endswith("LIMIT %s OFFSET %s")
+    assert params[-2:] == [25, 50]                      # LIMIT/OFFSET bind last
+
+
+def test_search_unknown_sort_falls_back_to_newest(monkeypatch):
+    calls = _capture_pg(monkeypatch)
+    lakebase.search(None, "u@x.com", sort="; DROP TABLE--")
+    assert "ORDER BY d.created_at DESC" in calls[0][0]
+
+
+def test_search_tag_param_binds_before_limit_offset(monkeypatch):
+    calls = _capture_pg(monkeypatch)
+    lakebase.search(None, "u@x.com", tag="finance", limit=10, offset=0)
+    _sql, params = calls[0]
+    assert params[0] == "finance"      # tag JOIN precedes WHERE → binds first
+    assert params[-2:] == [10, 0]      # LIMIT/OFFSET still bind last
+
+
+def test_api_search_returns_rows_and_total_and_clamps_paging(client, fake_db, monkeypatch):
+    import app as app_module
+    from conftest import route
+    fake_db.responder = route([("access_type, allowed_site",
+                                [{"access_type": "FULL", "allowed_site": None}])])
+    monkeypatch.setattr(app_module.lakebase, "docs_enabled", lambda: True)
+    captured = {}
+
+    def _search(sites, email, q, dt, dept, path, tag, sort, limit, offset):
+        captured.update(sort=sort, limit=limit, offset=offset)
+        return ([{"doc_id": "d1"}], 42)
+
+    monkeypatch.setattr(app_module.lakebase, "search", _search)
+    r = client.get("/api/search?sort=oldest&limit=999&offset=-5")
+    assert r.status_code == 200
+    assert r.get_json() == {"rows": [{"doc_id": "d1"}], "total": 42}
+    assert captured == {"sort": "oldest", "limit": 200, "offset": 0}  # clamped to 1..200 / >=0
+
+
+# ── Phase 4 fix: classify requires a document_type ───────────────────────────
+def test_classify_rejects_missing_document_type(client, fake_db, monkeypatch):
+    import app as app_module
+    from conftest import route
+    fake_db.responder = route([("access_type, allowed_site",
+                                [{"access_type": "FULL", "allowed_site": None}])])
+    monkeypatch.setattr(app_module.lakebase, "docs_enabled", lambda: True)
+    called = []
+    monkeypatch.setattr(app_module.lakebase, "classify",
+                        lambda *a: called.append(a))
+    r = client.post("/api/documents/classify", json={"doc_ids": ["d1"], "department": "AP"})
+    assert r.status_code == 400 and r.get_json() == {"error": "document_type_required"}
+    assert called == []      # nothing classified when the type is absent

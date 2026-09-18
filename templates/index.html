@@ -50,7 +50,7 @@
             <div class="upload-inner">
               <div class="upload-icon">⬆</div>
               <div><strong>Drop files here</strong> or <button class="link-btn" id="browseBtn">browse</button></div>
-              <div class="muted small">PDF, Word, Excel, PowerPoint, images, email — grouped or individual</div>
+              <div class="muted small">PDFs and images preview inline; Word, Excel, PowerPoint and email are accepted too — grouped or individual</div>
             </div>
           </div>
         </details>
@@ -63,6 +63,8 @@
         </div>
         <div id="syncList" class="sync-list"></div>
       </div>
+
+      <div class="panel import-progress" id="importProgress" role="status" aria-live="polite" hidden></div>
 
       <div class="panel">
         <div class="panel-head">
@@ -134,16 +136,32 @@
       <div class="search-bar">
         <input type="search" id="searchInput" placeholder="Search content, title, or path…">
         <select id="filterType"><option value="">All types</option></select>
+        <select id="filterDept"><option value="">All departments</option></select>
         <select id="filterTag"><option value="">All tags</option></select>
+        <input type="search" id="filterPath" class="filter-path" placeholder="Path contains…">
+        <select id="sortSel" aria-label="Sort results">
+          <option value="newest">Newest</option>
+          <option value="oldest">Oldest</option>
+          <option value="title">Title</option>
+          <option value="type">Type</option>
+        </select>
         <button class="btn primary" id="searchBtn">Search</button>
       </div>
+      <div class="explore-head-row">
+        <div id="searchCount" class="muted small"></div>
+        <div class="bulk-bar" id="exploreBulkBar" hidden>
+          <span id="exploreBulkCount">0 selected</span>
+          <button class="btn" id="exploreNexusBtn" disabled title="Coming soon">Open in plains-nexus</button>
+        </div>
+      </div>
       <div id="searchResults" class="result-grid"></div>
+      <div class="load-more-wrap"><button class="btn" id="loadMoreBtn" hidden>Load more</button></div>
     </section>
   </main>
 
   <!-- ─────────── Field definition modal (admin) ─────────── -->
   <div class="modal-scrim" id="fieldScrim" hidden>
-    <div class="modal" style="width:min(560px,95vw);">
+    <div class="modal" style="width:min(560px,95vw);" role="dialog" aria-modal="true" aria-labelledby="fieldModalTitle">
       <h2 id="fieldModalTitle">Add field</h2>
       <div class="field-form-grid">
         <div><label>Applies to</label><select id="ffApplies"></select></div>
@@ -174,7 +192,7 @@
 
   <!-- ─────────── Review workspace (viewer left · fields right) ─────────── -->
   <div class="review-scrim" id="drawerScrim" hidden></div>
-  <section class="review" id="drawer" hidden>
+  <section class="review" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle" tabindex="-1" hidden>
     <div class="review-head">
       <div class="review-head-main">
         <div class="drawer-title" id="drawerTitle">Document</div>
@@ -188,8 +206,8 @@
         <div class="review-noprev" id="reviewNoPrev" hidden>
           <div>
             <div class="review-noprev-ic">📄</div>
-            <p>No inline preview for this file type.</p>
-            <p class="muted small">Use <strong>View file</strong> or <strong>Download</strong> on the right.</p>
+            <p>No inline preview yet.</p>
+            <p class="muted small">A preview appears here automatically once the server converts this file. Use <strong>Download original</strong> on the right to open it now.</p>
           </div>
         </div>
       </div>
@@ -202,9 +220,9 @@
 
   <!-- ─────────── SharePoint browser modal ─────────── -->
   <div class="modal-scrim" id="spScrim" hidden>
-    <div class="modal sp-modal">
+    <div class="modal sp-modal" role="dialog" aria-modal="true" aria-labelledby="spModalTitle">
       <div class="sp-head">
-        <h2>Import from SharePoint</h2>
+        <h2 id="spModalTitle">Import from SharePoint</h2>
         <button class="icon-btn" id="spClose">✕</button>
       </div>
 
@@ -227,6 +245,7 @@
         <label class="sp-autosync">
           <input type="checkbox" id="spAutoSync" checked>
           Keep this folder in sync automatically
+          <span class="sp-autosync-note muted small" id="spAutoSyncNote" hidden>— single item only</span>
           <span class="muted small">— new and changed files get pulled in on a schedule. SharePoint connections can be fickle; if the connection lapses you'll be asked to reconnect.</span>
         </label>
         <div class="modal-foot">
@@ -237,7 +256,7 @@
     </div>
   </div>
 
-  <div id="toast" class="toast" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <script src="/static/app.js"></script>
 </body>
 </html>

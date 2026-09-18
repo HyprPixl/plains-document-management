@@ -66,16 +66,62 @@ const parentFolderUrl = (webUrl) => {
   } catch { return null; }
 };
 
+// Small shared UI utilities ─────────────────────────────────
+// Fire a handler on Enter/Space so role="button"/tabindex targets are keyboard-operable.
+const activate = (fn) => (e) => {
+  if (e.currentTarget === e.target && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); fn(); }
+};
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+// Disable a button and swap its label while an async action is in flight — kills double-submits.
+async function withBusy(btn, label, fn) {
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = label;
+  try { await fn(); } finally { if (btn.isConnected) { btn.disabled = false; btn.textContent = orig; } }
+}
+
+// Overlay a11y: Escape to close, focus into the overlay on open, trap Tab while open, and
+// restore focus to the element that triggered it on close. Used by the drawer + both modals.
+const overlayState = new Map();  // element → { closer, prevFocus, keyHandler }
+const focusablesIn = (root) =>
+  $$('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])', root)
+    .filter((n) => n.getClientRects().length > 0);
+function openOverlay(elm, closer) {
+  if (overlayState.has(elm)) return;  // already tracked (e.g. drawer re-render) — keep original trigger
+  const prevFocus = document.activeElement;
+  const keyHandler = (e) => {
+    if (e.key === "Escape") { e.preventDefault(); closer(); return; }
+    if (e.key !== "Tab") return;
+    const f = focusablesIn(elm);
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  };
+  elm.addEventListener("keydown", keyHandler);
+  overlayState.set(elm, { closer, prevFocus, keyHandler });
+  (focusablesIn(elm)[0] || elm).focus();
+}
+function closeOverlay(elm) {
+  const s = overlayState.get(elm);
+  if (!s) return;
+  elm.removeEventListener("keydown", s.keyHandler);
+  overlayState.delete(elm);
+  if (s.prevFocus && s.prevFocus.focus) s.prevFocus.focus();
+}
+
 // ─────────────────────────────────────────────── surfaces ──
 function setSurface(name) {
   state.surface = name;
   localStorage.setItem("dochub.surface", name);
-  $$(".surface-tab").forEach((b) => b.classList.toggle("active", b.dataset.surface === name));
+  $$(".surface-tab").forEach((b) => {
+    const on = b.dataset.surface === name;
+    b.classList.toggle("active", on); b.setAttribute("aria-selected", on ? "true" : "false");
+  });
   $("#surface-manage").hidden = name !== "manage";
   $("#surface-explore").hidden = name !== "explore";
   const path = "/" + name;
   if (location.pathname !== path) history.replaceState({}, "", path);
-  if (name === "manage") loadManage();
+  if (name === "manage") { setFieldsMode(false); loadManage(); }  // explicit nav lands on the table
   else loadExploreFilters();
 }
 
@@ -111,8 +157,10 @@ async function init() {
 }
 
 // ─────────────────────────────────────────────── MANAGE ──
+// Data refresh only — repaints stats/table/sync without leaving the fields editor. Explicit
+// navigation (surface switch, queue tab, "Done") is what returns to the table; a background
+// import poll or upload must not evict an admin who's mid-edit in the fields panel.
 async function loadManage() {
-  setFieldsMode(false);  // always land on the document view, not the fields editor
   if (state.me?.is_admin) $("#modifyFieldsBtn").hidden = false;
   loadStats();
   loadDocs();
@@ -151,11 +199,20 @@ async function loadStats() {
     $("#statRow").replaceChildren(
       ...cards.map(([l, n, q]) =>
         el("div", { class: "stat-card" + (state.queue === q ? " active" : ""),
-          onclick: () => selectQueue(q) },
+          role: "button", tabindex: "0", "aria-pressed": state.queue === q ? "true" : "false",
+          onclick: () => selectQueue(q), onkeydown: activate(() => selectQueue(q)) },
           el("div", { class: "n" }, String(n)), el("div", { class: "l" }, l))
       )
     );
-  } catch (e) { /* non-fatal */ }
+  } catch (e) {
+    // Don't leave the shimmer forever — show "—" cards the user can click to retry.
+    $("#statRow").replaceChildren(
+      ...["Needs classification", "Needs review", "Verified"].map((l) =>
+        el("div", { class: "stat-card err", role: "button", tabindex: "0",
+          title: "Couldn't load — click to retry", onclick: loadStats, onkeydown: activate(loadStats) },
+          el("div", { class: "n" }, "—"), el("div", { class: "l" }, l)))
+    );
+  }
 }
 function wireQueueTabs() {
   $$("#queueTabs .qtab").forEach((b) =>
@@ -173,7 +230,10 @@ function selectQueue(q) {
   if (state.fieldsMode) setFieldsMode(false);  // a queue tab / stat card returns to the table
   state.queue = q;
   state.selected.clear(); updateBulkBar();
-  $$("#queueTabs .qtab").forEach((b) => b.classList.toggle("active", b.dataset.queue === q));
+  $$("#queueTabs .qtab").forEach((b) => {
+    const on = b.dataset.queue === q;
+    b.classList.toggle("active", on); b.setAttribute("aria-selected", on ? "true" : "false");
+  });
   // keep the top stat cards' highlight in sync with the active queue
   $$("#statRow .stat-card").forEach((c, i) =>
     c.classList.toggle("active", ["unclassified", "needs_review", "verified"][i] === q));
@@ -196,7 +256,17 @@ async function loadDocs() {
   const tb = $("#docRows");
   $("#docEmpty").hidden = true;
   if (!tb.children.length) skeletonDocRows();
-  const rows = await api(path);
+  let rows;
+  try {
+    rows = await api(path);
+  } catch (e) {
+    // Surface the failure with a retry instead of leaving skeleton rows spinning forever.
+    tb.replaceChildren(el("tr", {}, el("td", { class: "empty", colspan: "5" },
+      "Couldn't load documents. ",
+      el("button", { class: "link-btn", onclick: loadDocs }, "Retry"))));
+    $("#docEmpty").hidden = true;
+    return;
+  }
   tb.replaceChildren();
   state.rowById.clear();
   $("#docEmpty").hidden = rows.length > 0;
@@ -211,7 +281,8 @@ async function loadDocs() {
       e.stopPropagation();
       if (e.target !== cb) { cb.checked = !cb.checked; setSel(cb.checked); }
     } }, cb);
-    tb.append(el("tr", { onclick: () => openDoc(d.doc_id, d) },
+    tb.append(el("tr", { role: "button", tabindex: "0",
+      onclick: () => openDoc(d.doc_id, d), onkeydown: activate(() => openDoc(d.doc_id, d)) },
       checkCell,
       el("td", {}, el("span", { class: "doc-name" }, d.original_filename || "(unnamed)")),
       el("td", {}, el("span", { class: "loc muted small", title: locationOf(d) },
@@ -351,6 +422,7 @@ function openClassify() {
 function renderBulkClassify() {
   const ids = state.classify.ids;
   $("#drawer").hidden = false; $("#drawerScrim").hidden = false;
+  openOverlay($("#drawer"), closeDrawer);
   $("#drawerTitle").textContent = `Classify ${ids.length} document${ids.length > 1 ? "s" : ""}`;
   $("#drawerSub").textContent = "Set a type and department for the batch — preview any file on the left if you want.";
   const body = $("#drawerBody"); body.replaceChildren();
@@ -399,7 +471,8 @@ function renderBulkClassify() {
 
   $("#drawerFoot").replaceChildren(
     el("button", { class: "btn primary",
-      onclick: () => applyBulkClassify(typeSel.value || null, deptSel.value || null) },
+      onclick: (e) => withBusy(e.currentTarget, "Classifying…",
+        () => applyBulkClassify(typeSel.value || null, deptSel.value || null)) },
       "Classify & queue extraction"));
 
   focusBulkDoc(ids[0]);  // lazy-preview the first so the viewer isn't empty
@@ -439,6 +512,7 @@ function wireDrawer() {
   $("#drawerScrim").addEventListener("click", closeDrawer);
 }
 function closeDrawer() {
+  closeOverlay($("#drawer"));
   $("#drawer").hidden = true; $("#drawerScrim").hidden = true;
   const frame = $("#reviewFrame"); frame.src = "about:blank"; frame.dataset.src = "";  // free the viewer
   state.currentDoc = null;
@@ -446,8 +520,10 @@ function closeDrawer() {
 }
 // Open instantly with whatever the clicked row already knows (title + viewer), then fill the
 // fields panel from the detail fetch. Avoids a multi-query wait before anything appears.
-async function openDoc(docId, row) {
+async function openDoc(docId, row, opts = {}) {
+  const readOnly = !!opts.readOnly;   // Explore opens the drawer as read-only discovery
   $("#drawer").hidden = false; $("#drawerScrim").hidden = false;
+  openOverlay($("#drawer"), closeDrawer);
   if (row) {
     $("#drawerTitle").textContent = row.original_filename || "Document";
     $("#drawerSub").textContent = `${locationOf(row)} · ${row.document_type || "unclassified"}`;
@@ -459,7 +535,7 @@ async function openDoc(docId, row) {
     const data = await api("/api/documents/" + docId);
     if ($("#drawer").hidden) return;  // user closed it while loading
     state.currentDoc = data;
-    renderDrawer(data);
+    renderDrawer(data, readOnly);
     loadPreview(data.document);  // refine with authoritative mime/derived
   } catch (e) { toast("Could not open: " + e.message, true); closeDrawer(); }
 }
@@ -476,16 +552,23 @@ function loadPreview(d) {
   if (embeddable) { frame.hidden = false; noprev.hidden = true; frame.src = target; }
   else { frame.hidden = true; noprev.hidden = false; frame.src = "about:blank"; }
 }
-function renderDrawer(data) {
+function renderDrawer(data, readOnly = false) {
   const d = data.document;
   $("#drawerTitle").textContent = d.original_filename || "Document";
   $("#drawerSub").textContent =
     `${locationOf(d)} · ${d.document_type || "unclassified"}`;
   const body = $("#drawerBody"); body.replaceChildren();
 
+  // The viewer only embeds PDFs, images and the derived searchable PDF. When nothing can be
+  // shown inline, offer the original for download rather than a "View file" that opens blank.
+  const mime = (d.mime_type || "").toLowerCase();
+  const embeddable = !!d.derived_pdf_path || mime === "application/pdf" || mime.startsWith("image/");
   const actions = el("div", { class: "field-actions" },
-    el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}&inline=1`, target: "_blank" }, "View file"),
-    el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}` }, "Download"));
+    embeddable
+      ? el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}&inline=1`, target: "_blank" }, "View file")
+      : el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}` }, "Download original"));
+  if (embeddable)  // keep a plain download alongside the inline view; redundant when not embeddable
+    actions.append(el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}` }, "Download"));
   if (d.sp_web_url) {
     actions.append(el("a", { class: "btn", href: d.sp_web_url, target: "_blank" }, "Open in SharePoint"));
     const folder = parentFolderUrl(d.sp_web_url);
@@ -493,6 +576,18 @@ function renderDrawer(data) {
       actions.append(el("a", { class: "btn", href: folder, target: "_blank" }, "Open folder"));
   }
   body.append(actions);
+
+  // Explore is read-only discovery for everyone: no field editor, no Save/Verify — just the
+  // file actions and read-only tags.
+  if (readOnly) {
+    body.append(el("div", { class: "section-label" }, "Tags"));
+    const tags = data.tags || [];
+    body.append(tags.length
+      ? el("div", { class: "tag-chips" }, ...tags.map((t) => el("span", { class: "tag-chip" }, t)))
+      : el("div", { class: "muted small" }, "No tags."));
+    $("#drawerFoot").replaceChildren();
+    return;
+  }
 
   // Unclassified docs get a classify-first panel (no extracted fields yet); once classified
   // they leave this queue and enter review with the full field editor.
@@ -574,10 +669,10 @@ function renderDrawer(data) {
 
   // footer actions
   const foot = $("#drawerFoot"); foot.replaceChildren(
-    el("button", { class: "btn", onclick: saveFields }, "Save"),
+    el("button", { class: "btn", onclick: (e) => withBusy(e.currentTarget, "Saving…", saveFields) }, "Save"),
     d.verification_status === "verified"
-      ? el("button", { class: "btn", onclick: () => setVerify(false) }, "Un-verify")
-      : el("button", { class: "btn ok", onclick: () => setVerify(true) }, "Save & verify"));
+      ? el("button", { class: "btn", onclick: (e) => withBusy(e.currentTarget, "Working…", () => setVerify(false)) }, "Un-verify")
+      : el("button", { class: "btn ok", onclick: (e) => withBusy(e.currentTarget, "Verifying…", () => setVerify(true)) }, "Save & verify"));
 }
 // Right-hand panel for an unclassified doc: pick type/department, then classify + queue
 // extraction in one step. The viewer on the left lets the user read the doc while deciding.
@@ -616,7 +711,8 @@ function renderClassify(body, data) {
 
   $("#drawerFoot").replaceChildren(
     el("button", { class: "btn primary",
-      onclick: () => classifyOne(d.doc_id, typeSel.value || null, deptSel.value || null) },
+      onclick: (e) => withBusy(e.currentTarget, "Classifying…",
+        () => classifyOne(d.doc_id, typeSel.value || null, deptSel.value || null)) },
       "Classify & queue extraction"));
 }
 function renderExtractPreview(container, defs) {
@@ -791,8 +887,11 @@ async function setVerify(on) {
     toast(on ? "Verified" : "Moved back to review");
     closeDrawer(); loadManage();
   } catch (e) {
-    if (e.body?.error === "missing_required")
-      toast("Fill required fields: " + (e.body.fields || []).join(", "), true);
+    if (e.body?.error === "missing_required") {
+      // Server returns raw field_keys; show the human labels from the loaded field defs.
+      const labelOf = (k) => (state.currentDoc?.fields || []).find((f) => f.field_key === k)?.label || k;
+      toast("Fill required fields: " + (e.body.fields || []).map(labelOf).join(", "), true);
+    }
     else if (e.body?.error === "amendment_needs_parent")
       toast("Link this amendment to a parent contract first", true);
     else toast("Failed: " + e.message, true);
@@ -800,8 +899,13 @@ async function setVerify(on) {
 }
 
 // ─────────────────────────────────────────────── EXPLORE ──
+// limit/offset drive "Load more"; selected mirrors Manage's state.selected (prep for the
+// plains-nexus hand-off). Read-only discovery for everyone — the drawer opens read-only.
+const exploreState = { limit: 50, offset: 0, total: 0, selected: new Set() };
+
 async function loadExploreFilters() {
   fillSelectKeep($("#filterType"), "document_type", "All types");
+  fillSelectKeep($("#filterDept"), "department", "All departments");
   await loadTagFilter();
   if (!$("#searchResults").children.length) runSearch();
 }
@@ -821,28 +925,82 @@ function fillSelectKeep(sel, cat, placeholder) {
   sel.value = cur;
 }
 function wireExplore() {
-  $("#searchBtn").addEventListener("click", runSearch);
-  $("#searchInput").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
-  $("#filterTag").addEventListener("change", runSearch);
-  $("#filterType").addEventListener("change", runSearch);
+  const search = () => runSearch();
+  const debounced = debounce(search, 300);   // don't fire a search per keystroke/rapid change
+  $("#searchBtn").addEventListener("click", search);
+  $("#searchInput").addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
+  $("#searchInput").addEventListener("input", debounced);
+  $("#filterTag").addEventListener("change", debounced);
+  $("#filterType").addEventListener("change", debounced);
+  $("#filterDept").addEventListener("change", debounced);
+  $("#filterPath").addEventListener("input", debounced);
+  $("#sortSel").addEventListener("change", debounced);
+  $("#loadMoreBtn").addEventListener("click", () => runSearch(true));
 }
-async function runSearch() {
+function searchParams() {
   const params = new URLSearchParams();
   if ($("#searchInput").value) params.set("q", $("#searchInput").value);
   if ($("#filterTag").value) params.set("tag", $("#filterTag").value);
   if ($("#filterType").value) params.set("document_type", $("#filterType").value);
-  const rows = await api("/api/search?" + params);
-  const grid = $("#searchResults"); grid.replaceChildren();
-  if (!rows.length) { grid.append(el("div", { class: "empty" }, "No matching documents.")); return; }
-  for (const d of rows) {
-    grid.append(el("div", { class: "result-card", onclick: () => openDoc(d.doc_id, d) },
-      el("div", { class: "rc-title" }, d.title || d.original_filename),
-      el("div", { class: "rc-meta" },
-        el("span", { class: "badge gray" }, d.document_type || "—"),
-        d.sp_site_name ? el("span", { class: "badge blue" }, d.sp_site_name) : null),
-      d.sp_path ? el("div", { class: "rc-path muted small", title: d.sp_path }, d.sp_path) : null,
-      el("div", { class: "rc-sum" }, d.summary || d.original_filename)));
+  if ($("#filterDept").value) params.set("department", $("#filterDept").value);
+  if ($("#filterPath").value) params.set("path", $("#filterPath").value.trim());
+  params.set("sort", $("#sortSel").value || "newest");
+  params.set("limit", String(exploreState.limit));
+  params.set("offset", String(exploreState.offset));
+  return params;
+}
+// append=false → fresh search (reset offset + clear grid/selection); append=true → next page.
+async function runSearch(append = false) {
+  if (!append) exploreState.offset = 0;
+  const grid = $("#searchResults");
+  if (!append) { grid.replaceChildren(); exploreState.selected.clear(); updateExploreBulkBar(); }
+  try {
+    const data = await api("/api/search?" + searchParams());
+    const rows = data.rows || [];
+    exploreState.total = data.total || 0;
+    if (!append && !rows.length) {
+      grid.replaceChildren(el("div", { class: "empty" }, "No matching documents."));
+      $("#searchCount").textContent = "0 results";
+      $("#loadMoreBtn").hidden = true;
+      return;
+    }
+    rows.forEach((d) => grid.append(resultCard(d)));
+    exploreState.offset += rows.length;
+    $("#searchCount").textContent =
+      `${exploreState.total} result${exploreState.total === 1 ? "" : "s"}`;
+    $("#loadMoreBtn").hidden = grid.querySelectorAll(".result-card").length >= exploreState.total;
+  } catch (e) {
+    if (append) { toast("Load failed: " + e.message, true); return; }
+    grid.replaceChildren(el("div", { class: "empty" },
+      "Search failed. ", el("button", { class: "link-btn", onclick: () => runSearch() }, "Retry")));
+    $("#searchCount").textContent = "";
+    $("#loadMoreBtn").hidden = true;
   }
+}
+function resultCard(d) {
+  const cb = el("input", { type: "checkbox", class: "rc-check",
+    ...(exploreState.selected.has(d.doc_id) ? { checked: "" } : {}),
+    onclick: (e) => {
+      e.stopPropagation();
+      e.target.checked ? exploreState.selected.add(d.doc_id) : exploreState.selected.delete(d.doc_id);
+      updateExploreBulkBar();
+    } });
+  const open = () => openDoc(d.doc_id, d, { readOnly: true });
+  return el("div", { class: "result-card", role: "button", tabindex: "0",
+      onclick: open, onkeydown: activate(open) },
+    el("label", { class: "rc-check-wrap", title: "Select", onclick: (e) => e.stopPropagation() }, cb),
+    el("div", { class: "rc-title" }, d.title || d.original_filename),
+    el("div", { class: "rc-meta" },
+      el("span", { class: "badge gray" }, d.document_type || "—"),
+      d.sp_site_name ? el("span", { class: "badge blue" }, d.sp_site_name) : null),
+    d.sp_path ? el("div", { class: "rc-path muted small", title: d.sp_path }, d.sp_path) : null,
+    el("div", { class: "rc-sum" }, d.summary || d.original_filename));
+}
+function updateExploreBulkBar() {
+  const n = exploreState.selected.size;
+  $("#exploreBulkBar").hidden = n === 0;
+  $("#exploreBulkCount").textContent = `${n} selected`;
+  // "Open in plains-nexus" stays disabled until the hand-off contract lands (separate item).
 }
 
 // ─────────────────────────────────────────────── SHAREPOINT ──
@@ -949,11 +1107,13 @@ function openSharePoint() {
   spState.selected.clear(); spState.visible = [];
   spState.view = "sites"; spState.site = null; spState.drive = null; spState.path = [];
   $("#spScrim").hidden = false;
+  openOverlay($("#spScrim"), closeSharePoint);
   $("#spAutoSync").checked = true;   // default ON — imports stay in sync unless opted out
+  updateSpSelCount();
   if (spState.status?.connected) showSpBrowser();
   else { $("#spConnect").hidden = false; $("#spBrowser").hidden = true; $("#spFoot").hidden = true; }
 }
-function closeSharePoint() { $("#spScrim").hidden = true; }
+function closeSharePoint() { closeOverlay($("#spScrim")); $("#spScrim").hidden = true; }
 
 async function connectSharePoint() {
   try {
@@ -992,6 +1152,14 @@ function updateSpSelCount() {
   const vis = spState.visible || [];
   const allSel = vis.length && vis.every((e) => spState.selected.has(selKey(e.drive_id, e.id)));
   $("#spSelectAll").textContent = allSel ? "Select none" : "Select all";
+  // Auto-sync tracks a single file/folder, so it's only offered when exactly one is selected.
+  const auto = $("#spAutoSync"), note = $("#spAutoSyncNote");
+  if (auto) {
+    const single = n === 1;
+    auto.disabled = !single;
+    if (!single) auto.checked = false;
+    if (note) note.hidden = single;
+  }
 }
 
 function spListBusy() { $("#spList").replaceChildren(el("div", { class: "muted small sp-busy" }, "Loading…")); }
@@ -1082,11 +1250,10 @@ const fmtSize = (n) => !n ? "" : n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).
 async function doSharePointImport() {
   const entries = [...spState.selected.values()];
   if (!entries.length) return;
-  const autosync = $("#spAutoSync").checked;
+  // Auto-sync only applies to a single item; the checkbox is disabled/unchecked otherwise
+  // (see updateSpSelCount), so a multi-file import just proceeds without it — no error.
+  const autosync = $("#spAutoSync").checked && entries.length === 1;
   const folderSel = entries.filter((e) => e.is_folder);
-  if (autosync && entries.length !== 1) {
-    toast("Auto-sync needs exactly one file or folder selected", true); return;
-  }
   // Folders import recursively; we only know immediate child counts client-side, so warn.
   if (folderSel.length) {
     const fileCount = entries.length - folderSel.length;
@@ -1128,6 +1295,7 @@ async function doSharePointImport() {
     if (anyQueued) {
       toast(`Import queued${byDrive.size > 1 ? ` (${byDrive.size} libraries)` : ""}` +
         `${autosync ? " · auto-sync on" : ""} — processing in the background…`);
+      setImportProgress("Import queued — processing in the background…");
       pollImportJob(firstReq);
     } else {
       toast(`Imported ${inlineNew} new, ${inlineDup} already stored` + (autosync ? " · auto-sync on" : ""));
@@ -1139,23 +1307,36 @@ async function doSharePointImport() {
   } finally { btn.disabled = false; btn.textContent = "Import selected"; }
 }
 
-// Poll a queued import until it finishes; refresh the Manage queue as docs land.
+// A single persistent progress line (in the sync panel area) instead of a toast per poll tick.
+// Pass null to hide it. `state` is "" (in-progress), "done", or "error".
+function setImportProgress(text, status = "") {
+  const p = $("#importProgress");
+  if (!p) return;
+  if (text == null) { p.hidden = true; p.replaceChildren(); return; }
+  p.hidden = false;
+  p.className = "panel import-progress" + (status ? " " + status : "");
+  p.replaceChildren(el("span", {}, text));
+}
+
+// Poll a queued import until it finishes. Update the single progress line each tick; only
+// reload the Manage table once, on completion, rather than on every poll.
 async function pollImportJob(reqId, tries = 0) {
   if (!reqId) { loadManage(); return; }
   try {
     const st = await api(`/api/sharepoint/import/${reqId}`);
     const done = st.imported || 0, dup = st.duplicates || 0, errs = st.errors || 0;
     if (st.status === "done") {
-      toast(`Import complete: ${done} new, ${dup} already stored${errs ? `, ${errs} failed` : ""}`);
+      setImportProgress(`Import complete: ${done} new, ${dup} already stored${errs ? `, ${errs} failed` : ""}`, "done");
       loadManage(); return;
     }
     if (st.status === "error") {
-      toast("Import failed: " + (st.last_error || "unknown error"), true);
+      setImportProgress("Import failed: " + (st.last_error || "unknown error"), "error");
       loadManage(); return;
     }
-    if (st.status === "processing" && st.total_files) {
-      toast(`Importing… ${done + dup + errs}/${st.total_files}`);
-      loadManage();
+    if (st.status === "processing") {
+      setImportProgress(st.total_files
+        ? `Importing… ${done + dup + errs}/${st.total_files}`
+        : `Importing… ${done + dup + errs} so far`);
     }
   } catch (e) { /* transient; keep polling */ }
   // Back off from 2s toward 10s; give up surfacing progress after ~10 min (work continues server-side).
@@ -1174,9 +1355,10 @@ function wireFields() {
   $("#fieldAddBtn").addEventListener("click", () => openFieldModal(null));
   $("#accessGrantBtn").addEventListener("click", grantAccess);
   $("#accessEmail").addEventListener("keydown", (e) => { if (e.key === "Enter") grantAccess(); });
-  $("#ffCancel").addEventListener("click", () => ($("#fieldScrim").hidden = true));
+  $("#ffCancel").addEventListener("click", closeFieldModal);
   $("#ffSave").addEventListener("click", saveFieldDef);
 }
+function closeFieldModal() { closeOverlay($("#fieldScrim")); $("#fieldScrim").hidden = true; }
 
 // ─────────────────────────────────────────────── APP ACCESS (admin) ──
 // Manage who's an app admin (and grant Full / Read). Site grants are auto-mirrored from
@@ -1297,6 +1479,7 @@ function openFieldModal(f) {
   $("#ffOptions").value = f ? (f.picklist_source || "") : "";
   $("#ffRequired").checked = f ? !!f.required_for_verify : false;
   $("#fieldScrim").hidden = false;
+  openOverlay($("#fieldScrim"), closeFieldModal);
 }
 
 async function saveFieldDef() {
@@ -1319,7 +1502,7 @@ async function saveFieldDef() {
       await api("/api/field-defs", { method: "POST",
         headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     }
-    $("#fieldScrim").hidden = true;
+    closeFieldModal();
     toast("Field saved");
     loadFieldDefs();
   } catch (e) { toast("Failed: " + e.message, true); }

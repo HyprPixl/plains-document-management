@@ -754,20 +754,32 @@ _SEARCH_SELECT = (
     "SELECT d.doc_id, d.original_filename, d.document_type, d.department, "
     "d.sp_site_name, d.sp_path, d.sp_web_url, d.mime_type, d.derived_pdf_path, "
     "coalesce(f_title.confirmed_value, f_title.proposed_value) AS title, "
-    "coalesce(f_sum.confirmed_value, f_sum.proposed_value) AS summary, d.created_at "
+    "coalesce(f_sum.confirmed_value, f_sum.proposed_value) AS summary, d.created_at, "
+    "count(*) OVER() AS _total "
     f"FROM {DOCUMENTS} d "
     f"LEFT JOIN {DOCUMENT_FIELDS} f_title ON f_title.doc_id = d.doc_id AND f_title.field_key = 'title' "
     f"LEFT JOIN {DOCUMENT_FIELDS} f_sum   ON f_sum.doc_id   = d.doc_id AND f_sum.field_key   = 'summary' "
 )
 
+# sort keyword → ORDER BY. Whitelist only: the raw request value is NEVER interpolated.
+_SEARCH_ORDER_BY = {
+    "newest": "d.created_at DESC",
+    "oldest": "d.created_at ASC",
+    "title": "lower(coalesce(f_title.confirmed_value, f_title.proposed_value, d.original_filename)) ASC",
+    "type": "d.document_type ASC NULLS LAST, d.created_at DESC",
+}
+
 
 def search(sites, email, q: str = "", document_type: str | None = None, department: str | None = None,
-           path: str | None = None, tag: str | None = None) -> list[dict]:
+           path: str | None = None, tag: str | None = None, sort: str = "newest",
+           limit: int = 50, offset: int = 0) -> tuple[list[dict], int]:
     """Full search over verified docs — mirrors api_search (Spark concat_ws/collect_list
     becomes Postgres string_agg; LIKE terms are ILIKE params).
 
-    Params are assembled in the SQL's textual %s order: the tag JOIN (which precedes WHERE)
-    binds first, then the WHERE site scope, filters, and free-text LIKEs.
+    Returns ``(rows, total)`` where ``total`` is the full match count ignoring LIMIT/OFFSET
+    (via ``count(*) OVER()``, stripped off each row). Params are assembled in the SQL's
+    textual %s order: the tag JOIN (which precedes WHERE) binds first, then the WHERE site
+    scope, filters, free-text LIKEs, and finally the LIMIT/OFFSET pair.
     """
     _ensure_documents_ready()
     site_clause, site_params = _sites_clause(sites, email, "d.sp_site_id")
@@ -800,11 +812,17 @@ def search(sites, email, q: str = "", document_type: str | None = None, departme
             "OR lower(coalesce(tx.body, '')) LIKE %s)"
         )
         params += [f"%{q.lower()}%"] * 5
-    return pg_query(
+    order_by = _SEARCH_ORDER_BY.get(sort, _SEARCH_ORDER_BY["newest"])
+    params += [limit, offset]  # LIMIT/OFFSET bind last, after the WHERE params
+    rows = pg_query(
         f"{_SEARCH_SELECT}{join_txt}{join_tag}WHERE {where} "
-        f"ORDER BY d.created_at DESC LIMIT 200",
+        f"ORDER BY {order_by} LIMIT %s OFFSET %s",
         params,
     )
+    total = int(rows[0]["_total"]) if rows else 0
+    for r in rows:
+        r.pop("_total", None)
+    return rows, total
 
 
 def get_document(doc_id: str) -> dict | None:
