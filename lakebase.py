@@ -759,15 +759,13 @@ def get_links(doc_id: str) -> list[dict]:
     )
 
 
-def document_type(doc_id: str) -> str | None:
+def document_head(doc_id: str) -> dict | None:
+    """Existence + document_type in one read — the row (with document_type) or None if the
+    doc is unknown. Lets callers distinguish 'missing' from 'exists but unclassified' (NULL
+    type) without a second round-trip."""
     _ensure_documents_ready()
-    rows = pg_query(f"SELECT document_type FROM {DOCUMENTS} WHERE doc_id = %s", (doc_id,))
-    return rows[0].get("document_type") if rows else None
-
-
-def document_exists(doc_id: str) -> bool:
-    _ensure_documents_ready()
-    return bool(pg_query(f"SELECT 1 FROM {DOCUMENTS} WHERE doc_id = %s LIMIT 1", (doc_id,)))
+    rows = pg_query(f"SELECT document_type FROM {DOCUMENTS} WHERE doc_id = %s LIMIT 1", (doc_id,))
+    return rows[0] if rows else None
 
 
 def write_audit(actor: str, action: str, target: str, detail) -> None:

@@ -832,9 +832,10 @@ def api_verify(doc_id):
     email = current_user()
     lake = lakebase.docs_enabled()
     if lake:
-        dtype = lakebase.document_type(doc_id)
-        if not lakebase.document_exists(doc_id):
+        head = lakebase.document_head(doc_id)                # existence + type in one read
+        if head is None:
             return jsonify(error="not found"), 404
+        dtype = head.get("document_type")
     else:
         docs = query(f"SELECT document_type FROM {config.DOCUMENTS} WHERE doc_id = {lit(doc_id)}")
         if not docs:
