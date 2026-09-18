@@ -274,24 +274,30 @@ def _item_path(it: dict) -> str:
     return f"{folder}/{it['name']}"
 
 
+_ITEM_SELECT = "id,name,size,folder,file,lastModifiedDateTime,webUrl,parentReference"
+
+
+def _map_item(it: dict) -> dict:
+    """Normalize a Graph driveItem into the file-shaped dict the rest of the app uses."""
+    return {
+        "id": it["id"], "name": it.get("name"), "size": it.get("size", 0),
+        "is_folder": "folder" in it, "child_count": (it.get("folder") or {}).get("childCount"),
+        "mime": (it.get("file") or {}).get("mimeType"),
+        "modified": it.get("lastModifiedDateTime"),
+        "path": _item_path(it), "web_url": it.get("webUrl"),
+    }
+
+
 def list_children(token: str, drive_id: str, item_id: str | None) -> list[dict]:
     base = f"{GRAPH}/drives/{drive_id}/items/{item_id or 'root'}/children"
     out, url = [], base
-    params = {"$select": "id,name,size,folder,file,lastModifiedDateTime,webUrl,parentReference",
-              "$top": 200}
+    params = {"$select": _ITEM_SELECT, "$top": 200}
     while url:
         data = _graph(token, url, params)
         params = None  # nextLink already carries them
-        for it in data.get("value", []):
-            out.append({
-                "id": it["id"], "name": it["name"], "size": it.get("size", 0),
-                "is_folder": "folder" in it, "child_count": (it.get("folder") or {}).get("childCount"),
-                "mime": (it.get("file") or {}).get("mimeType"),
-                "modified": it.get("lastModifiedDateTime"),
-                "path": _item_path(it), "web_url": it.get("webUrl"),
-            })
+        out.extend(_map_item(it) for it in data.get("value", []))
         url = data.get("@odata.nextLink")
-    out.sort(key=lambda x: (not x["is_folder"], x["name"].lower()))
+    out.sort(key=lambda x: (not x["is_folder"], (x["name"] or "").lower()))
     return out
 
 
@@ -326,6 +332,60 @@ def get_file_meta(token: str, drive_id: str, item_id: str) -> dict | None:
         "modified": it.get("lastModifiedDateTime"),
         "path": _item_path(it), "web_url": it.get("webUrl"),
     }
+
+
+_DELTA_SELECT = "id,name,size,folder,file,deleted,lastModifiedDateTime,webUrl,parentReference"
+
+
+def delta_changes(token: str, drive_id: str, item_id: str | None = None,
+                  delta_link: str | None = None, seed_latest: bool = False):
+    """Pull changes since the last delta via Graph's delta query.
+
+    Preferred over walk_files for folder/drive targets: Graph returns only what changed
+    since the stored deltaLink (adds, edits, moves, deletes) instead of re-listing the
+    whole subtree each tick.
+
+    Returns (files, deleted_refs, new_delta_link):
+      files          - file-shaped dicts for created/updated items (folders/root skipped)
+      deleted_refs   - "{drive_id}/{id}" for items Graph reports removed; surfaced here so
+                       the crawl sees deletes/moves (lifecycle handling lands separately)
+      new_delta_link - opaque URL to persist and resume from next tick
+
+    A stored `delta_link` resumes from where we left off. Without one, `seed_latest`
+    starts tracking from *now* (empty result + a fresh link) so a sync already caught up
+    by the old watermark crawl doesn't re-download the whole drive; otherwise a full
+    initial enumeration runs (a brand-new sync). A stale link (HTTP 410 resyncRequired)
+    transparently restarts as a full crawl.
+    """
+    if delta_link:
+        url, params = delta_link, None
+    else:
+        base = f"{GRAPH}/drives/{drive_id}"
+        url = f"{base}/items/{item_id}/delta" if item_id else f"{base}/root/delta"
+        params = {"$select": _DELTA_SELECT, "$top": 200}
+        if seed_latest:
+            params["token"] = "latest"
+    files: list[dict] = []
+    deleted: list[str] = []
+    new_link = None
+    while url:
+        try:
+            data = _graph(token, url, params)
+        except requests.HTTPError as e:
+            resp = getattr(e, "response", None)
+            if delta_link and resp is not None and resp.status_code == 410:
+                return delta_changes(token, drive_id, item_id)  # deltaLink expired → full resync
+            raise
+        params = None  # next/deltaLink carry their own query
+        for it in data.get("value", []):
+            if "deleted" in it:
+                deleted.append(f"{drive_id}/{it['id']}")
+            elif "file" in it:                 # skip folders and the drive root
+                files.append(_map_item(it))
+        url = data.get("@odata.nextLink")
+        if not url:
+            new_link = data.get("@odata.deltaLink")
+    return files, deleted, new_link
 
 
 def download(token: str, drive_id: str, item_id: str) -> bytes:

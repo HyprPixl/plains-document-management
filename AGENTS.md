@@ -90,6 +90,17 @@ databricks jobs run-now 607689951574858
    This is *instrumentation only* — no enforcement change. Read the distribution via admin-only
    `GET /api/admin/acl-audit`; build per-item ACL enforcement only if the data shows meaningful
    broken inheritance.
+   **Phase 6 delta crawl (item U):** folder/drive auto-syncs now pull changes via Graph's delta
+   query (`sp.delta_changes`) instead of re-listing the subtree each tick — it returns only
+   adds/edits/moves/deletes since a stored `sharepoint_syncs.delta_link` (added lazily by
+   `job._ensure_delta_column`). A sync already caught up by the old watermark crawl is *seeded from
+   now* (`token=latest`, no re-download); a brand-new sync (no watermark) enumerates fully once;
+   a stale link (HTTP 410) transparently restarts as a full crawl. Deletes are surfaced/logged only
+   (`delta_deletes=N`) — soft-delete + hash-rehydrate is the still-unbuilt item S. Single-file
+   targets keep the watermark path (no subtree to delta). **Mirror fate decided (item U):** the
+   SPEC §13 DBX→SP mirror is **retired** — SharePoint is the live source of truth, so there is no
+   DBX→SP write-back. `documents.mirror_status` stays a vestigial column (always `'not_mirrored'`);
+   nothing reads it for behavior and no mirror will be built. Don't wire new logic to it.
 9. **Identical bytes = free reuse (SPEC §9/§10.3) — IMPLEMENTED (roadmap item R).** Everything is
    keyed on `content_sha256`. Two layers: (a) `extraction_cache` (keyed sha+prompt_version+type)
    already made the `ai_query` free on a re-run; (b) `process_doc` now short-circuits on a **twin** —

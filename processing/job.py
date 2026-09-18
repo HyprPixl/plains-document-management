@@ -139,6 +139,24 @@ SYNC_LEASE_SECONDS = int(os.getenv("SP_SYNC_LEASE", "900"))
 # first crawl mustn't fire one /permissions call per item. Beyond the budget we record NULL.
 ACL_PROBE_BUDGET = int(os.getenv("SP_ACL_PROBE_BUDGET", "25"))
 
+_delta_col_ready = False
+
+
+def _ensure_delta_column() -> None:
+    """Lazily add the delta_link column to the (out-of-band) syncs table, once per process.
+
+    The Graph delta crawl stores its resume link here; the warehouse table predates it.
+    Idempotent and best-effort — a race or an already-present column mustn't fail a pass.
+    """
+    global _delta_col_ready
+    if _delta_col_ready:
+        return
+    try:
+        execute(f"ALTER TABLE {config.SHAREPOINT_SYNCS} ADD COLUMN IF NOT EXISTS delta_link STRING")
+    except Exception as exc:
+        logger.warning("stage=sync delta_link column ensure failed: %s", exc)
+    _delta_col_ready = True
+
 
 def sync_delegated() -> int:
     """Pull new/changed files for each armed auto-sync using its owner's delegated token.
@@ -150,6 +168,7 @@ def sync_delegated() -> int:
     """
     if not sp.encryption_available():
         return 0
+    _ensure_delta_column()
     candidates = query(
         f"SELECT id FROM {config.SHAREPOINT_SYNCS} WHERE token_status = 'ok' "
         f"AND (claim_expires_at IS NULL OR claim_expires_at <= current_timestamp()) "
@@ -167,7 +186,7 @@ def sync_delegated() -> int:
         )
         rows = query(
             f"SELECT id, source_id, site_id, site_name, drive_id, folder_id, business_unit, "
-            f"department, document_type, user_email, refresh_token_enc, "
+            f"department, document_type, user_email, refresh_token_enc, delta_link, "
             f"unix_timestamp(last_synced_at) AS last_synced "
             f"FROM {config.SHAREPOINT_SYNCS} WHERE id = {lit(sync_id)} AND claimed_by = {lit(WORKER_ID)}"
         )
@@ -207,17 +226,27 @@ def _sync_one(s: dict, watermark: str | None) -> int:
         f"UPDATE {config.SHAREPOINT_SYNCS} SET refresh_token_enc = {lit(sp.encrypt(new_refresh))} "
         f"WHERE id = {lit(s['id'])}"
     )
-    # The sync target may be a whole library (folder_id NULL → root walk), a folder, or a
+    # The sync target may be a whole library (folder_id NULL → drive root), a folder, or a
     # single file. Probe a set folder_id: if it resolves to a file, sync just that item.
+    # Folder/drive targets use a Graph delta query (resumes from a stored deltaLink and
+    # returns only what changed — adds/edits/moves/deletes); single files stay watermarked.
     target = s.get("folder_id")
+    delta_link = s.get("delta_link")
+    deleted: list[str] = []
+    new_delta_link = None
+    use_delta = True
+    seed = not delta_link and bool(watermark)   # already caught up → track from now, no re-crawl
     if target:
         meta = sp.get_file_meta(access, s["drive_id"], target)  # None if it's a folder
         if meta is not None:
             files = [meta] if (not watermark or (meta.get("modified") or "") > watermark) else []
+            use_delta = False
         else:
-            files = sp.walk_files(access, s["drive_id"], target, modified_after=watermark)
+            files, deleted, new_delta_link = sp.delta_changes(
+                access, s["drive_id"], target, delta_link, seed_latest=seed)
     else:
-        files = sp.walk_files(access, s["drive_id"], None, modified_after=watermark)
+        files, deleted, new_delta_link = sp.delta_changes(
+            access, s["drive_id"], None, delta_link, seed_latest=seed)
     n = 0
     acl_budget = ACL_PROBE_BUDGET
     for it in files:
@@ -241,8 +270,18 @@ def _sync_one(s: dict, watermark: str | None) -> int:
         )
         if r["status"] == "new":
             n += 1
-    if files:
-        print(f"  ⇊ sync {s['id']}: {n} new / {len(files)} changed")
+    # Persist the advanced deltaLink so the next tick only sees what changes after this one.
+    if use_delta and new_delta_link and new_delta_link != delta_link:
+        execute(
+            f"UPDATE {config.SHAREPOINT_SYNCS} SET delta_link = {lit(new_delta_link)} "
+            f"WHERE id = {lit(s['id'])}"
+        )
+    if deleted:
+        # Delta surfaces removals/moves; soft-delete + hash-rehydrate handling lands separately.
+        logger.info("stage=sync sync_id=%s delta_deletes=%d (lifecycle handling pending)",
+                    s["id"], len(deleted))
+    if files or deleted:
+        print(f"  ⇊ sync {s['id']}: {n} new / {len(files)} changed / {len(deleted)} removed")
     return n
 
 
