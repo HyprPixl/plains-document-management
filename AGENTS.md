@@ -106,11 +106,25 @@ databricks jobs run-now 607689951574858
    `job._ensure_delta_column`). A sync already caught up by the old watermark crawl is *seeded from
    now* (`token=latest`, no re-download); a brand-new sync (no watermark) enumerates fully once;
    a stale link (HTTP 410) transparently restarts as a full crawl. Deletes are surfaced/logged only
-   (`delta_deletes=N`) — soft-delete + hash-rehydrate is the still-unbuilt item S. Single-file
+   (`delta_deletes=N`) and now drive item S (below). Single-file
    targets keep the watermark path (no subtree to delta). **Mirror fate decided (item U):** the
    SPEC §13 DBX→SP mirror is **retired** — SharePoint is the live source of truth, so there is no
    DBX→SP write-back. `documents.mirror_status` stays a vestigial column (always `'not_mirrored'`);
    nothing reads it for behavior and no mirror will be built. Don't wire new logic to it.
+   **Phase 6 delete/move lifecycle (item S) — SHIPPED (Lakebase-only, gated by `docs_enabled()`).**
+   The delta crawl's three change classes are now reconciled in `job._sync_one`: (a) **moves/renames**
+   — an existing item (dedup returns `duplicate`) whose `sp_path`/`sp_web_url`/`file_modified_at`
+   drifted is repaired in place via `lakebase.refresh_location(source_ref, ...)` (a no-op guarded by
+   `IS DISTINCT FROM`, so unchanged files don't churn); (b) **deletes** — each delta `deleted` ref is
+   soft-deleted via `lakebase.soft_delete_by_source_ref` (sets `documents.deleted_at`, keeps the row +
+   `content_sha256` + extraction/fields; never hard-deletes); (c) **re-adds** — `ingest.register_bytes`
+   now checks `find_deleted_by_sha` after the live-dup check and, on a hash match to a soft-deleted row,
+   **rehydrates** it (`deleted_at=NULL`, re-point `source_ref`/`sp_path`/`sp_web_url`) rather than
+   inserting a new doc, so a delete→re-add round-trip keeps the original doc + its verification. The
+   `deleted_at IS NULL` filter is applied everywhere live rows are read (`list_documents`, `stats`,
+   `search`, `find_by_sha`, `find_processed_twin`, `acl_stats`, `unprobed_acl_docs`) — soft-deleted
+   docs vanish from every user-facing surface but stay recoverable. `_sync_one` logs
+   `soft_deleted=N moved=N`. Column added by `_DOCS_DDL` + idempotent `ALTER ADD COLUMN IF NOT EXISTS`.
 9. **Identical bytes = free reuse (SPEC §9/§10.3) — IMPLEMENTED (roadmap item R).** Everything is
    keyed on `content_sha256`. Two layers: (a) `extraction_cache` (keyed sha+prompt_version+type)
    already made the `ai_query` free on a re-run; (b) `process_doc` now short-circuits on a **twin** —

@@ -104,6 +104,16 @@ def register_bytes(
                 "existing_doc_id": e["doc_id"], "existing_name": e["original_filename"],
                 "existing_status": e["verification_status"]}
 
+    # Hash-rehydrate (Phase 6 lifecycle): identical bytes to a soft-deleted doc → revive that
+    # row (keeping its extraction/fields) and re-point it at this location, rather than orphaning.
+    if lakebase.docs_enabled():
+        revived = lakebase.find_deleted_by_sha(sha)
+        if revived:
+            r = revived[0]
+            lakebase.rehydrate(r["doc_id"], source_ref, sp_path, sp_web_url)
+            return {"status": "rehydrated", "doc_id": r["doc_id"], "filename": filename,
+                    "existing_doc_id": r["doc_id"], "existing_name": r["original_filename"]}
+
     doc_id = "d_" + uuid.uuid4().hex
     ext = os.path.splitext(filename)[1].lower() or ".bin"
     vpath = f"{config.DOCS_VOLUME}/{subdir}/{sha}{ext}"

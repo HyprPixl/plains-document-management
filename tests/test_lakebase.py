@@ -365,3 +365,50 @@ def test_api_document_merges_warehouse_defs_with_lakebase_values(client, fake_db
     assert fld["confirmed_value"] == "Human title" and fld["proposed_value"] == "AI title"
     # No cross-store join was attempted against the warehouse document_fields.
     assert fake_db.queried_matching("document_fields") == []
+
+
+# ── Phase 6 lifecycle: soft-delete / move-refresh / hash-rehydrate (item S) ──
+def _capture_pg(monkeypatch, rows=None):
+    """Stub the pg layer + readiness so lifecycle SQL can be asserted offline."""
+    calls = []
+    monkeypatch.setattr(lakebase, "_ensure_documents_ready", lambda: None)
+    monkeypatch.setattr(lakebase, "pg_query",
+                        lambda sql, params=None: calls.append((sql, params)) or (rows or []))
+    return calls
+
+
+def test_find_by_sha_excludes_soft_deleted(monkeypatch):
+    calls = _capture_pg(monkeypatch)
+    lakebase.find_by_sha("abc")
+    assert "deleted_at IS NULL" in calls[0][0]              # dedup only sees live rows
+
+
+def test_soft_delete_by_source_ref_returns_ids(monkeypatch):
+    calls = _capture_pg(monkeypatch, rows=[{"doc_id": "d1"}, {"doc_id": "d2"}])
+    out = lakebase.soft_delete_by_source_ref("drv/i1")
+    assert out == ["d1", "d2"]
+    sql, params = calls[0]
+    assert "SET deleted_at = now()" in sql and "deleted_at IS NULL" in sql and "RETURNING doc_id" in sql
+    assert params == ("drv/i1",)
+
+
+def test_refresh_location_counts_only_real_changes(monkeypatch):
+    calls = _capture_pg(monkeypatch, rows=[{"doc_id": "d1"}])   # one row actually changed
+    n = lakebase.refresh_location("drv/i1", "/new/path.pdf", "http://new", "2024-01-01T00:00:00Z")
+    assert n == 1
+    sql = calls[0][0]
+    assert "IS DISTINCT FROM" in sql and "deleted_at IS NULL" in sql   # guarded no-op when unchanged
+
+
+def test_rehydrate_clears_deleted_and_repoints(monkeypatch):
+    calls = _capture_pg(monkeypatch)
+    lakebase.rehydrate("d1", "drv/i9", "/p.pdf", "http://u")
+    sql, params = calls[0]
+    assert "deleted_at = NULL" in sql and "source_ref = %s" in sql
+    assert params == ("drv/i9", "/p.pdf", "http://u", "d1")
+
+
+def test_list_documents_hides_soft_deleted(monkeypatch):
+    calls = _capture_pg(monkeypatch)
+    lakebase.list_documents(None, "u@x.com")
+    assert "deleted_at IS NULL" in calls[0][0]

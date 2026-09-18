@@ -544,10 +544,12 @@ _DOCS_DDL = (
     "  sp_drive_id           TEXT,"
     "  sp_path               TEXT,"
     "  sp_web_url            TEXT,"
-    "  has_unique_acl        BOOLEAN"  # Phase 6 instrumentation: NULL=unknown, else broken-inheritance
+    "  has_unique_acl        BOOLEAN,"  # Phase 6 instrumentation: NULL=unknown, else broken-inheritance
+    "  deleted_at            TIMESTAMPTZ"  # Phase 6 lifecycle: non-NULL = soft-deleted (metadata kept)
     ")",
     # ADD COLUMN IF NOT EXISTS migrates the live table (CREATE ... IF NOT EXISTS is a no-op there).
     f"ALTER TABLE {DOCUMENTS} ADD COLUMN IF NOT EXISTS has_unique_acl BOOLEAN",
+    f"ALTER TABLE {DOCUMENTS} ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
     f"CREATE INDEX IF NOT EXISTS documents_sha_idx     ON {DOCUMENTS} (content_sha256)",
     f"CREATE INDEX IF NOT EXISTS documents_srcref_idx  ON {DOCUMENTS} (source_ref)",
     f"CREATE INDEX IF NOT EXISTS documents_ext_idx     ON {DOCUMENTS} (extraction_status)",
@@ -677,7 +679,7 @@ def acl_stats() -> dict:
     _ensure_documents_ready()
     rows = pg_query(
         f"SELECT has_unique_acl AS flag, count(*) AS n FROM {DOCUMENTS} "
-        f"WHERE source_ref LIKE %s GROUP BY has_unique_acl",
+        f"WHERE source_ref LIKE %s AND deleted_at IS NULL GROUP BY has_unique_acl",
         ["%/%"],
     )
     out = {"unique": 0, "inherited": 0, "unknown": 0, "total": 0}
@@ -696,7 +698,7 @@ def unprobed_acl_docs(limit: int) -> list[dict]:
     return pg_query(
         f"SELECT doc_id, sp_drive_id, source_ref FROM {DOCUMENTS} "
         f"WHERE has_unique_acl IS NULL AND sp_drive_id IS NOT NULL AND source_ref LIKE %s "
-        f"ORDER BY created_at DESC LIMIT %s",
+        f"AND deleted_at IS NULL ORDER BY created_at DESC LIMIT %s",
         ["%/%", limit],
     )
 
@@ -715,7 +717,7 @@ def list_documents(sites, email, status: str | None = None, cstatus: str | None 
     """Queue list — mirrors api_documents' warehouse query, site-scoped."""
     _ensure_documents_ready()
     clause, params = _sites_clause(sites, email)
-    where = "1=1" + clause
+    where = "deleted_at IS NULL" + clause
     if status:
         where += " AND verification_status = %s AND classification_status = 'classified'"
         params.append(status)
@@ -735,14 +737,14 @@ def stats(sites, email):
     clause, params = _sites_clause(sites, email)
     by = pg_query(
         f"SELECT verification_status AS s, count(*) AS n FROM {DOCUMENTS} "
-        f"WHERE 1=1{clause} AND classification_status = 'classified' "
+        f"WHERE deleted_at IS NULL{clause} AND classification_status = 'classified' "
         f"GROUP BY verification_status",
         params,
     )
     clause2, params2 = _sites_clause(sites, email)
     un = pg_query(
         f"SELECT count(*) AS n FROM {DOCUMENTS} "
-        f"WHERE classification_status = 'unclassified'{clause2}",
+        f"WHERE classification_status = 'unclassified' AND deleted_at IS NULL{clause2}",
         params2,
     )
     return by, un
@@ -775,7 +777,7 @@ def search(sites, email, q: str = "", document_type: str | None = None, departme
         join_tag = f"JOIN {DOCUMENT_TAGS} tg ON tg.doc_id = d.doc_id AND tg.tag = %s "
         params.append(tag)
     params += site_params
-    where = "d.verification_status = 'verified'" + site_clause
+    where = "d.verification_status = 'verified' AND d.deleted_at IS NULL" + site_clause
     if document_type:
         where += " AND d.document_type = %s"
         params.append(document_type)
@@ -905,10 +907,12 @@ def has_amendment_parent(doc_id: str) -> bool:
 
 
 def find_by_sha(sha: str) -> list[dict]:
+    """A *live* doc with these bytes, for dedup. Soft-deleted rows are excluded so a removed
+    file can be revived by find_deleted_by_sha (hash-rehydrate) rather than blocking reuse."""
     _ensure_documents_ready()
     return pg_query(
         "SELECT doc_id, original_filename, verification_status, volume_path "
-        f"FROM {DOCUMENTS} WHERE content_sha256 = %s LIMIT 1",
+        f"FROM {DOCUMENTS} WHERE content_sha256 = %s AND deleted_at IS NULL LIMIT 1",
         (sha,),
     )
 
@@ -916,6 +920,57 @@ def find_by_sha(sha: str) -> list[dict]:
 def find_by_source_ref(ref: str) -> list[dict]:
     _ensure_documents_ready()
     return pg_query(f"SELECT doc_id FROM {DOCUMENTS} WHERE source_ref = %s LIMIT 1", (ref,))
+
+
+# ─────────────────────────────────────────── Phase 6 lifecycle (item S) ──
+
+def find_deleted_by_sha(sha: str) -> list[dict]:
+    """A soft-deleted doc with these bytes — a candidate to hash-rehydrate when a file with
+    identical content is re-added, so we revive its metadata/extraction instead of orphaning."""
+    _ensure_documents_ready()
+    return pg_query(
+        "SELECT doc_id, original_filename FROM {t} WHERE content_sha256 = %s "
+        "AND deleted_at IS NOT NULL ORDER BY updated_at DESC LIMIT 1".format(t=DOCUMENTS),
+        (sha,),
+    )
+
+
+def rehydrate(doc_id: str, source_ref: str, sp_path: str | None, sp_web_url: str | None) -> None:
+    """Revive a soft-deleted doc for a re-added file: clear deleted_at and re-point it at the
+    new SharePoint location. Keeps the existing doc_id, extraction, and field values intact."""
+    _ensure_documents_ready()
+    pg_execute(
+        f"UPDATE {DOCUMENTS} SET deleted_at = NULL, source_ref = %s, sp_path = %s, "
+        f"sp_web_url = %s, updated_at = now() WHERE doc_id = %s",
+        (source_ref, sp_path, sp_web_url, doc_id),
+    )
+
+
+def soft_delete_by_source_ref(ref: str) -> list[str]:
+    """Soft-delete the live doc(s) at a SharePoint source_ref (metadata + content_sha256 kept).
+    Returns the doc_ids affected. Idempotent — already-deleted rows are skipped."""
+    _ensure_documents_ready()
+    rows = pg_query(
+        f"UPDATE {DOCUMENTS} SET deleted_at = now(), updated_at = now() "
+        f"WHERE source_ref = %s AND deleted_at IS NULL RETURNING doc_id",
+        (ref,),
+    )
+    return [r["doc_id"] for r in rows]
+
+
+def refresh_location(ref: str, sp_path: str | None, sp_web_url: str | None,
+                     file_modified_at: str | None) -> int:
+    """Keep a live doc's SharePoint path/URL current after a move or rename (the item id in
+    source_ref is stable across an in-place move). No-op when nothing changed. Returns the
+    number of rows actually updated (>0 means a move/rename was reconciled)."""
+    _ensure_documents_ready()
+    rows = pg_query(
+        f"UPDATE {DOCUMENTS} SET sp_path = %s, sp_web_url = %s, file_modified_at = %s, "
+        f"updated_at = now() WHERE source_ref = %s AND deleted_at IS NULL "
+        f"AND (sp_path IS DISTINCT FROM %s OR sp_web_url IS DISTINCT FROM %s) RETURNING doc_id",
+        (sp_path, sp_web_url, file_modified_at, ref, sp_path, sp_web_url),
+    )
+    return len(rows)
 
 
 # ─────────────────────────────────────────────────────────── doc writes ──
@@ -1158,7 +1213,7 @@ def find_processed_twin(doc_id: str, content_sha256: str, document_type, sig_pre
     rows = pg_query(
         "SELECT doc_id, derived_pdf_path, text_source, page_count, extraction_sig, "
         "verification_status, verified_by "
-        f"FROM {DOCUMENTS} WHERE content_sha256 = %s AND doc_id <> %s "
+        f"FROM {DOCUMENTS} WHERE content_sha256 = %s AND doc_id <> %s AND deleted_at IS NULL "
         "AND extraction_status = 'done' AND document_type IS NOT DISTINCT FROM %s "
         "AND extraction_sig LIKE %s "
         "ORDER BY (verification_status = 'verified') DESC, updated_at DESC LIMIT 1",

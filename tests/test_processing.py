@@ -266,6 +266,47 @@ def test_delta_changes_stale_link_triggers_full_resync(monkeypatch):
     assert calls[1].endswith("/drives/drv/root/delta")           # then restarted full
 
 
+# ── Phase 6 lifecycle: soft-delete + move-refresh + hash-rehydrate (item S) ──
+def test_sync_one_soft_deletes_and_refreshes_moves(fake_db, bind_db, monkeypatch):
+    bind_db(fake_db, job)
+
+    def delta_changes(access, drive, item_id, delta_link=None, seed_latest=False):
+        files = [{"id": "i1", "name": "a.pdf", "mime": "application/pdf",
+                  "path": "/new/a.pdf", "web_url": "http://new", "modified": "2024-06-01T00:00:00Z"}]
+        return files, ["dr/gone1", "dr/gone2"], "DL"
+
+    _patch_sp(monkeypatch, delta_changes=delta_changes)
+    monkeypatch.setattr(job.ingest, "register_bytes", lambda *a, **k: {"status": "duplicate"})
+    monkeypatch.setattr(job.lakebase, "docs_enabled", lambda: True)
+    refreshed, deleted_refs = [], []
+    monkeypatch.setattr(job.lakebase, "refresh_location",
+                        lambda ref, p, u, m: refreshed.append((ref, p, u)) or 1)
+    monkeypatch.setattr(job.lakebase, "soft_delete_by_source_ref",
+                        lambda ref: deleted_refs.append(ref) or [ref])   # one doc per ref
+
+    n = job._sync_one(_sync_row(), "2020-01-01T00:00:00Z")
+    assert n == 0                                                 # duplicate → nothing new
+    assert refreshed == [("dr/i1", "/new/a.pdf", "http://new")]   # move/rename reconciled
+    assert deleted_refs == ["dr/gone1", "dr/gone2"]               # both removals soft-deleted
+
+
+def test_register_bytes_rehydrates_soft_deleted_twin(monkeypatch):
+    import ingest
+    monkeypatch.setattr(ingest.lakebase, "docs_enabled", lambda: True)
+    monkeypatch.setattr(ingest.lakebase, "find_by_sha", lambda sha: [])   # no live duplicate
+    monkeypatch.setattr(ingest.lakebase, "find_deleted_by_sha",
+                        lambda sha: [{"doc_id": "d_old", "original_filename": "old.pdf"}])
+    captured = {}
+    monkeypatch.setattr(ingest.lakebase, "rehydrate",
+                        lambda doc_id, ref, p, u: captured.update(doc_id=doc_id, ref=ref, path=p, url=u))
+
+    r = ingest.register_bytes(b"bytes", "new.pdf", "application/pdf", source_id="src",
+                              source_ref="drv/i1", created_by="u@x.com",
+                              sp_path="/p.pdf", sp_web_url="http://u")
+    assert r["status"] == "rehydrated" and r["doc_id"] == "d_old"   # revived, not re-inserted
+    assert captured == {"doc_id": "d_old", "ref": "drv/i1", "path": "/p.pdf", "url": "http://u"}
+
+
 # ── Phase 6 ACL-coverage backfill ─────────────────────────────────────────────
 def test_acl_backfill_probes_records_and_leaves_unknown(monkeypatch):
     docs = [

@@ -248,6 +248,7 @@ def _sync_one(s: dict, watermark: str | None) -> int:
         files, deleted, new_delta_link = sp.delta_changes(
             access, s["drive_id"], None, delta_link, seed_latest=seed)
     n = 0
+    moved = 0
     acl_budget = ACL_PROBE_BUDGET
     for it in files:
         # Phase 6 instrumentation (best-effort, never blocks sync): sample whether items have
@@ -270,18 +271,28 @@ def _sync_one(s: dict, watermark: str | None) -> int:
         )
         if r["status"] == "new":
             n += 1
+        elif lakebase.docs_enabled():
+            # Known item re-seen (dup/rehydrated) — a move or rename keeps the same item id, so
+            # refresh the stored path/URL keyed by source_ref. No-op when nothing changed.
+            moved += lakebase.refresh_location(
+                f"{s['drive_id']}/{it['id']}", it.get("path"), it.get("web_url"), it.get("modified"))
+    # Soft-delete docs whose SharePoint items the delta reported gone (metadata kept for a
+    # possible hash-rehydrate). Folder-scoped syncs also see items moved *out* of scope as gone.
+    removed = 0
+    if lakebase.docs_enabled():
+        for ref in deleted:
+            removed += len(lakebase.soft_delete_by_source_ref(ref))
     # Persist the advanced deltaLink so the next tick only sees what changes after this one.
     if use_delta and new_delta_link and new_delta_link != delta_link:
         execute(
             f"UPDATE {config.SHAREPOINT_SYNCS} SET delta_link = {lit(new_delta_link)} "
             f"WHERE id = {lit(s['id'])}"
         )
-    if deleted:
-        # Delta surfaces removals/moves; soft-delete + hash-rehydrate handling lands separately.
-        logger.info("stage=sync sync_id=%s delta_deletes=%d (lifecycle handling pending)",
-                    s["id"], len(deleted))
+    if deleted or moved:
+        logger.info("stage=sync sync_id=%s soft_deleted=%d moved=%d", s["id"], removed, moved)
     if files or deleted:
-        print(f"  ⇊ sync {s['id']}: {n} new / {len(files)} changed / {len(deleted)} removed")
+        print(f"  ⇊ sync {s['id']}: {n} new / {len(files)} changed / "
+              f"{moved} moved / {removed} removed")
     return n
 
 
