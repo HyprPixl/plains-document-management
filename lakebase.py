@@ -107,29 +107,39 @@ def _get_sp_token():
 
 
 def _get_sdk_credential():
-    """Mint a Lakebase credential via the Databricks SDK using *ambient* auth.
+    """Mint a Lakebase OAuth JWT via the run-as identity's *ambient* Databricks auth.
 
-    This is the path for the **processing job**: a Databricks Job running as the app SP
-    (or any identity) authenticates the SDK ambiently, but — unlike an App — is NOT given
-    `DATABRICKS_CLIENT_ID/SECRET` env, so `_get_sp_token()` can't mint via OIDC. The SDK's
-    `generate_database_credential` returns a short-lived token for the run-as identity
-    (which must hold a Postgres role on the instance). Cached in the same dict/lock as the
-    OIDC token. Returns None when the SDK/instance is unavailable (→ inert, warehouse path).
+    This is the **processing job** path: a Databricks Job authenticates the SDK ambiently but —
+    unlike an App — is NOT given `DATABRICKS_CLIENT_ID/SECRET` env, so `_get_sp_token()` can't
+    mint via OIDC. We call the workspace credential REST API directly through the SDK's
+    ambient-authenticated `api_client`. Two reasons for the raw call rather than
+    `w.database.generate_database_credential`: (1) it works on the cluster's older
+    databricks-sdk that predates `w.database`; (2) our instance is **autoscale**, which the
+    credential API addresses by endpoint `claims`, not by provisioned `instance_names`. The
+    `permission_set` is a required-but-nominal claim value — actual read/write is governed by
+    the identity's Postgres role (the run-as user owns the instance → full RW). Cached in the
+    same dict/lock as the OIDC token. Returns None when unavailable (→ inert, warehouse path).
+    Verified end-to-end 2026-09-18.
     """
-    instance = os.getenv("LAKEBASE_INSTANCE", "plains-lakebase")
+    endpoint = os.getenv(
+        "LAKEBASE_ENDPOINT", "projects/plains-lakebase/branches/production/endpoints/primary"
+    )
     with _token_lock:
         if _token_cache.get("token") and time.monotonic() < _token_cache.get("expires_at", 0) - 60:
             return _token_cache["token"]
         try:
-            import uuid
             from databricks.sdk import WorkspaceClient
-            cred = WorkspaceClient().database.generate_database_credential(
-                request_id=str(uuid.uuid4()), instance_names=[instance]
+            resp = WorkspaceClient().api_client.do(
+                "POST", "/api/2.0/database/credentials",
+                body={
+                    "request_id": str(uuid.uuid4()),
+                    "claims": [{"endpoint": endpoint, "permission_set": "READ_ONLY"}],
+                },
             )
-            _token_cache["token"] = cred.token
-            # SDK creds are ~1h; refresh a minute early like the OIDC path.
+            _token_cache["token"] = resp["token"]
+            # Creds are ~1h; refresh a minute early like the OIDC path.
             _token_cache["expires_at"] = time.monotonic() + 3600
-            return cred.token
+            return resp["token"]
         except Exception as e:
             logger.error(f"SDK Lakebase credential fetch failed: {e}")
             return None

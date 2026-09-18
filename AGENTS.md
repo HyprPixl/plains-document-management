@@ -227,33 +227,41 @@ every call site, so the flag is an instant rollback.
   branch on `docs_enabled()`. `upsert_proposed_field` preserves human provenance via
   `coalesce(document_fields.source_provenance,'ai')`.
 
-**Job → Lakebase connectivity: WIRED + VALIDATED (2026-09-17).** This was the blocker before flipping
-`USE_LAKEBASE_DOCUMENTS=true`: the processing job (`worker.py` → `processing/job.py`) is a **separate
-Databricks Job**, not the web app — it does **not** get the `database` resource binding, so no
-`PGHOST/PGUSER/PGPORT` is injected. Flip the flag while the job can't reach Lakebase and you split the
-brain (app writes Lakebase, job drains an empty warehouse). Resolved as follows — and note the
-**autoscale** wrinkle: our Lakebase (`ep-flat-moon`, `projects/plains-lakebase`, owned by Caleb) is an
-**autoscale** instance, so it needs an **OAuth JWT** as the Postgres password. A job's ambient token
-is a PAT (rejected: "not a valid JWT"), and `generate_database_credential` is a *provisioned*-instance
-API that doesn't apply. So the only headless-job path is OIDC client-credentials with the app SP's
-`client_id`+`secret`:
+**Job → Lakebase connectivity: ambient run-as JWT (reworked 2026-09-18).** The processing job
+(`worker.py` → `processing/job.py`) is a **separate Databricks Job**, not the web app — it does **not**
+get the `database` resource binding, so no `PGHOST/PGUSER/PGPORT` is injected. Our Lakebase
+(`ep-flat-moon`, `projects/plains-lakebase`, owned by Caleb) is an **autoscale** instance, so it needs
+an **OAuth JWT** as the Postgres password (a raw ambient PAT is rejected: "not a valid JWT"). The job
+now mints that JWT as its **run-as identity**, with **no SP secret and nothing written onto its
+cluster**:
 
-- Created an OAuth secret for the app SP (`app id 532acbc1-b288-4dd3-9a2d-6896d76706b1`, SCIM id
-  `143845247881551`) via `databricks service-principal-secrets-proxy create`; stored `client_id` +
-  `secret` in Databricks-backed scope **`document-hub`** (keys `sp-client-id`, `sp-oauth-secret`).
-- Job `607689951574858` (partial `databricks jobs update`, so its paused periodic trigger survived):
-  added lib `psycopg2-binary` + `spark_env_vars` `PGHOST/PGPORT/PGDATABASE/PGUSER=<SP app id>/
-  LAKEBASE_SCHEMA=document_hub/LAKEBASE_OIDC_HOST=https://adb-1979327425712808.8.azuredatabricks.net/
-  LAKEBASE_CLIENT_ID={{secrets/document-hub/sp-client-id}}/LAKEBASE_CLIENT_SECRET={{secrets/
-  document-hub/sp-oauth-secret}}`. **`run_as` stays Caleb** — the Postgres identity is decoupled from
-  the job's Databricks identity, so no SP re-grants for secrets/git/warehouse/volume were needed.
-- `_get_sp_token()` prefers **`LAKEBASE_*`-prefixed** creds over `DATABRICKS_*` precisely so setting
-  them on the job does NOT trip the databricks-sdk default-auth chain into re-identifying the whole job
-  as the SP (which would break its run-as-user SharePoint/DI/volume calls). Don't rename these back.
+- `lakebase._get_sdk_credential()` calls the credential REST API through the SDK's
+  ambient-authenticated `api_client`: `POST /api/2.0/database/credentials` with
+  `claims=[{"endpoint": "<autoscale endpoint>", "permission_set": "READ_ONLY"}]`. Two reasons for the
+  raw call over `w.database.generate_database_credential`: it works on the cluster's **older
+  databricks-sdk** (0.40, predates `w.database`), and autoscale is addressed by endpoint `claims`, not
+  provisioned `instance_names` (those 404). `permission_set` is a required-but-nominal claim — real
+  read/write is governed by the Postgres role, and the run-as user **owns** the instance → full RW
+  (verified: a `READ_ONLY` cred has `transaction_read_only=off` and can write). Endpoint override:
+  `LAKEBASE_ENDPOINT`.
+- `worker.py._bootstrap_job_env()` sets `PGHOST/PGPORT/PGDATABASE/LAKEBASE_SCHEMA` + the cutover flags
+  (`USE_LAKEBASE_DOCUMENTS`/`USE_LAKEBASE_PERMISSIONS=true`) and resolves `PGUSER` from
+  `current_user.me()` — all via `setdefault`, **before** importing `config`/`job` (config snapshots the
+  flags at import). This replaces the old dependency on cluster `spark_env_vars`.
+- **Why the rework:** the job was moved onto the shared existing cluster `1008-171723-j7v5frie`, which
+  dropped the dedicated `new_cluster` block that had carried all the Lakebase `spark_env_vars` (incl.
+  the SP OAuth secret-scope refs) — so every connection var vanished at once and the job couldn't auth.
+  The ambient-JWT path removes that fragility: no per-cluster env, works on any cluster the job lands
+  on. `run_as` stays Caleb (the Postgres identity), so no SP re-grants were needed.
+- **Superseded (old SP-secret path):** previously the job used OIDC client-credentials with the app SP's
+  `client_id`+`secret` from scope `document-hub` (keys `sp-client-id`/`sp-oauth-secret`) via
+  `LAKEBASE_*`-prefixed `spark_env_vars`. No longer used. Rollback to it by re-adding those
+  `spark_env_vars` (setdefault yields to them). The `_get_sp_token()` LAKEBASE_*-over-DATABRICKS_*
+  preference still matters for that path — don't rename it.
 - Validate anytime with `worker.py --check-lakebase` (non-destructive `SELECT 1`; probe-only, exits) —
-  also runs passively at startup once `lakebase.enabled()`. Proven green: run `182572589457336`
-  logged `lakebase check OK`. (Gotcha baked into the fix: a bare `sys.exit(0)` raises `SystemExit`,
-  which the spark_python_task executor flags as FAILED — the probe returns cleanly on success instead.)
+  also runs passively at startup once `lakebase.enabled()`. (Gotcha: a bare `sys.exit(0)` raises
+  `SystemExit`, which the spark_python_task executor flags as FAILED — the probe returns cleanly on
+  success instead.)
 
 `ai_query` extraction stays on the warehouse regardless (it's fed OCR text inline, not read from a
 table).
@@ -262,11 +270,13 @@ table).
 `app.yaml` (push + deploy the app) AND the job's `spark_env_vars` (`databricks jobs update`). Rollback =
 set the flag `false` in both places (warehouse path is untouched).
 
-🔒 **Pending: rotate the SP OAuth secret** (it was printed to a terminal during setup). Steps:
-1. `databricks service-principal-secrets-proxy create 143845247881551 -o json` → fresh `secret`.
-2. `databricks secrets put-secret document-hub sp-oauth-secret --string-value <NEW_SECRET>`.
-3. `databricks service-principal-secrets-proxy delete 143845247881551 a6786ee1239531cf3ad569992798e57c96161d3848b4a1f9c877f3d06ae6cf57` (revoke the exposed id).
-4. `databricks jobs run-now 607689951574858 --python-params '--check-lakebase'` (or the admin bench) to confirm the new secret works. No redeploy — creds are read fresh from scope `document-hub` each run.
+🔒 **Pending: revoke the exposed SP OAuth secret** (it was printed to a terminal during setup). As of
+the 2026-09-18 ambient-JWT rework the **job no longer uses this secret**, and the App authenticates with
+its own platform-injected SP creds — not this scope secret — so revoking it breaks nothing. Just revoke
+(no reissue needed):
+1. `databricks service-principal-secrets-proxy delete 143845247881551 a6786ee1239531cf3ad569992798e57c96161d3848b4a1f9c877f3d06ae6cf57` (revoke the exposed id).
+2. Optionally delete the now-unused scope keys: `databricks secrets delete-secret document-hub sp-oauth-secret` and `... sp-client-id`.
+3. Confirm the job still auths (it doesn't depend on the secret): `databricks jobs run-now 607689951574858 --python-params '--check-lakebase'`.
 
 **Suite:** 112 tests, still fully offline/green.
 
