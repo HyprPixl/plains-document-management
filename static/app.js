@@ -1039,7 +1039,6 @@ function wireFields() {
   $("#modifyFieldsBtn").addEventListener("click", () => setFieldsMode(true));
   $("#fieldsDoneBtn").addEventListener("click", () => setFieldsMode(false));
   $("#fieldAddBtn").addEventListener("click", () => openFieldModal(null));
-  $("#benchRunBtn").addEventListener("click", runBench);
   $("#accessGrantBtn").addEventListener("click", grantAccess);
   $("#accessEmail").addEventListener("keydown", (e) => { if (e.key === "Enter") grantAccess(); });
   $("#ffCancel").addEventListener("click", () => ($("#fieldScrim").hidden = true));
@@ -1110,58 +1109,6 @@ async function setAccess(email, access_type) {
   } catch (e) {
     toast(e.status === 409 ? "Can't remove the last admin" : "Failed: " + e.message, true);
     loadAccess();  // resync the dropdown if a change was rejected
-  }
-}
-
-// ─────────────────────────────────────────────── BENCHMARK (admin) ──
-// Server-side warehouse-latency baseline. POSTs /api/admin/bench, which times the hot-path
-// queries in-process, then renders per-operation p50/p95/max. See ROADMAP Phase 2.
-const fmtMs = (v) => (v == null ? "—" : v + " ms");
-
-async function runBench() {
-  const btn = $("#benchRunBtn");
-  const out = $("#benchResult");
-  const orig = btn.textContent;
-  btn.disabled = true; btn.textContent = "Running…";
-  out.hidden = false;
-  out.replaceChildren(el("div", { class: "muted small" },
-    "Sampling the warehouse — this can take up to a minute…"));
-  try {
-    const r = await api("/api/admin/bench?n=20", { method: "POST" });
-    renderBench(r);
-  } catch (e) {
-    out.replaceChildren(el("div", { class: "muted small" },
-      e.status === 403 ? "Admin access required." : "Benchmark failed: " + e.message));
-  } finally {
-    btn.disabled = false; btn.textContent = orig;
-  }
-}
-
-function renderBench(r) {
-  const rows = Object.entries(r.operations || {}).map(([name, m]) =>
-    el("tr", {},
-      el("td", {}, name),
-      el("td", {}, fmtMs(m.p50)), el("td", {}, fmtMs(m.p95)),
-      el("td", {}, fmtMs(m.max)), el("td", {}, fmtMs(m.mean)),
-      el("td", {}, String(m.n))));
-  const table = el("table", { class: "bench-table" },
-    el("thead", {}, el("tr", {}, ...["Operation", "p50", "p95", "max", "mean", "n"].map((h) => el("th", {}, h)))),
-    el("tbody", {}, ...rows));
-  const meta = el("div", { class: "muted small" },
-    `n=${r.n} · wall ${fmtMs(r.wall_ms)} · ${r.captured_at}` + (r.commit ? ` · ${r.commit}` : ""));
-  const copyBtn = el("button", { class: "btn small", onclick: () => copyBench(r) }, "Copy JSON");
-  $("#benchResult").replaceChildren(
-    el("div", { class: "bench-head" }, el("strong", {}, "Warehouse latency (server-side)"), copyBtn),
-    table, meta);
-}
-
-function copyBench(r) {
-  const text = JSON.stringify(r, null, 2);
-  if (navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(text).then(() => toast("Benchmark JSON copied"),
-      () => toast("Copy failed", true));
-  } else {
-    toast("Clipboard unavailable", true);
   }
 }
 

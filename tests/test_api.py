@@ -300,38 +300,6 @@ def test_field_def_write_busts_the_cache(client, fake_db):
     assert len(fake_db.queried_matching(DEFS_SELECT)) == 2
 
 
-# ── admin warehouse-latency bench ────────────────────────────────────────────
-def test_admin_bench_forbidden_for_non_admin(client, fake_db):
-    fake_db.responder = route([(PERMS, SITE_A)])
-    r = client.post("/api/admin/bench")
-    assert r.status_code == 403
-
-
-def test_admin_bench_returns_expected_shape_for_admin(client, fake_db):
-    # Admin (FULL scope) + a discoverable doc_id so the single-document op also runs.
-    fake_db.responder = route([
-        (PERMS, ADMIN),
-        ("ORDER BY created_at DESC LIMIT 1", [{"doc_id": "d1"}]),
-    ], default=[])
-    r = client.post("/api/admin/bench?n=3")
-    assert r.status_code == 200
-    body = r.get_json()
-    assert body["n"] == 3
-    assert "captured_at" in body and "wall_ms" in body
-    ops = body["operations"]
-    for name in ("documents", "stats", "search", "document"):
-        assert name in ops
-        assert set(ops[name]) == {"p50", "p95", "max", "mean", "n"}
-        assert ops[name]["n"] == 3
-
-
-def test_admin_bench_caps_n(client, fake_db):
-    fake_db.responder = route([(PERMS, ADMIN)], default=[])
-    r = client.post("/api/admin/bench?n=9999")
-    assert r.status_code == 200
-    assert r.get_json()["n"] == 100
-
-
 # ── admin access management ──────────────────────────────────────────────────
 GRANTS = "upper(access_type) <> 'SITE'"  # distinctive substring of _elevated_grants query
 

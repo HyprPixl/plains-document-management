@@ -751,24 +751,6 @@ def get_document(doc_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
-def get_field_values(doc_id: str) -> list[dict]:
-    """This doc's stored field rows (Lakebase). The drawer merges these against the
-    warehouse field_defs in Python — a cross-store join isn't possible, so the single
-    LEFT JOIN api_document used becomes two reads + a Python merge (both cheap here)."""
-    _ensure_documents_ready()
-    return pg_query(
-        "SELECT field_key, proposed_value, confirmed_value, source_provenance, confidence "
-        f"FROM {DOCUMENT_FIELDS} WHERE doc_id = %s",
-        (doc_id,),
-    )
-
-
-def get_tags(doc_id: str) -> list[str]:
-    _ensure_documents_ready()
-    return [r["tag"] for r in pg_query(
-        f"SELECT tag FROM {DOCUMENT_TAGS} WHERE doc_id = %s ORDER BY tag", (doc_id,))]
-
-
 def tag_facets() -> list[dict]:
     _ensure_documents_ready()
     return pg_query(

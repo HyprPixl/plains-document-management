@@ -147,10 +147,8 @@ live warehouse + SSO), not offline.
   or raw `--header` (Databricks Apps SSO). Timestamped JSON+md land in `bench/results/` (gitignored).
   **Run-on-deploy:** `DOC_HUB_BENCH_TOKEN=<tok> python bench/bench.py -n 30 --label pre-lakebase`.
   Full instructions in `bench/README.md`. These are the baselines Phase 2/3 are measured against.
-- `POST /api/admin/bench` (admin-gated, same `_require_admin` as field-def CRUD): the **server-side**
-  companion — times the hot-path warehouse queries (documents/stats/search/single-doc) in-process
-  over `n` samples (default 20, capped 100) and returns per-op `{p50,p95,max,mean,n}` + wall-time +
-  UTC timestamp + commit. Queries run with the caller's `perms_where` scope (admin = unrestricted).
+  (The in-app `POST /api/admin/bench` companion route was **removed** after Phase 3 — the baseline it
+  captured now lives in `bench/BASELINE.md`; re-run `bench/bench.py` if you need fresh numbers.)
   Triggered by the **"Run benchmark"** button in the admin Fields panel ("Modify fields" → header);
   renders the table + a Copy JSON affordance. Read-only (no writes/ai_query). This measures the
   warehouse round-trip the Lakebase migration is measured against, without CLI/token juggling.
@@ -220,9 +218,10 @@ every call site, so the flag is an instant rollback.
   SQL's textual `%s` order (the tag JOIN precedes WHERE, so its param binds first).
 - **`app.py`**: `perms_sites(email)` helper (None for full/admin, else site list) feeds the Lakebase
   scope. Every document call site got a `lakebase.docs_enabled()` branch:
-  documents/stats/classify/enqueue/tags/save_fields/verify/unverify/link/search/download/document +
-  `/api/admin/bench`. `api_document` can't cross-store join, so it reads **field_defs from the
-  warehouse**, values from Lakebase, and merges by `field_key` in Python.
+  documents/stats/classify/enqueue/tags/save_fields/verify/unverify/link/search/download/document.
+  `api_document` can't cross-store join, so it reads **field_defs from the warehouse**, values from
+  Lakebase, and merges by `field_key` in Python (all four Lakebase reads folded into one round-trip
+  via `get_document_bundle`).
 - **`ingest.py` / `processing/job.py`**: dedup + insert, and the job's claim/lease/commit paths,
   branch on `docs_enabled()`. `upsert_proposed_field` preserves human provenance via
   `coalesce(document_fields.source_provenance,'ai')`.
