@@ -93,9 +93,13 @@ databricks jobs run-now 607689951574858
    the delta crawl never revisits stable files, so existing docs stay `has_unique_acl = NULL`. A
    one-off `python -m processing.job --acl-backfill [--acl-limit N]` (job.acl_backfill →
    `graph.item_has_unique_acl`, app-only token, one light /permissions call per doc, no downloads,
-   429-backed-off) probes the unmeasured docs so the audit rests on real coverage. First readout
-   (2026-09-18, pre-backfill): 189 docs, 0 unique, 1 inherited, 188 unknown → per-item ACL not
-   justified; re-run the audit after a backfill to confirm on real coverage.
+   429-backed-off) probes the unmeasured docs so the audit rests on real coverage. **DECIDED
+   (2026-09-18): per-item ACL enforcement is NOT built.** After the backfill (run 772778508702186,
+   probed 188) the audit is full-coverage 189 docs / **0 unique / 189 inherited / 0 unknown** —
+   zero broken inheritance anywhere in the tenant, so site-level enforcement already mirrors
+   SharePoint access exactly. Don't build the per-item ACL table / group expansion / hybrid
+   enforcement unless a future re-audit shows unique>0. The probe + acl-audit + backfill stay as
+   the standing tripwire.
    **Phase 6 delta crawl (item U):** folder/drive auto-syncs now pull changes via Graph's delta
    query (`sp.delta_changes`) instead of re-listing the subtree each tick — it returns only
    adds/edits/moves/deletes since a stored `sharepoint_syncs.delta_link` (added lazily by
