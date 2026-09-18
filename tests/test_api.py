@@ -158,11 +158,13 @@ def test_documents_full_access_unrestricted(client, fake_db):
     assert docs_q and "1=0" not in docs_q[0] and "sp_site_id IN" not in docs_q[0]
 
 
-def test_documents_no_perms_sees_nothing(client, fake_db):
+def test_documents_no_perms_sees_only_own_uploads(client, fake_db):
+    # No site grants → no SharePoint docs, but a user still sees their own NULL-site uploads.
     fake_db.responder = route([(PERMS, NONE)], default=[])
     r = client.get("/api/documents")
     assert r.status_code == 200
-    assert any("1=1 AND 1=0" in s for s in fake_db.queried_matching("LIMIT 500"))
+    q = fake_db.queried_matching("LIMIT 500")
+    assert any("1=0 OR (sp_site_id IS NULL AND created_by =" in s for s in q)
 
 
 # ── per-request permission caching (BASELINE.md: perms_where fired 2-3x/page) ─

@@ -9,7 +9,7 @@
 
 | Area | Decision |
 |---|---|
-| System of record | **Databricks-primary**, mirror one-way to SharePoint (fast cadence). |
+| System of record | ~~Databricks-primary, one-way file mirror to SharePoint~~ → **revised 2026-09-18**: SharePoint is the live source of truth for file lifecycle/access; Databricks is the brain (extraction/search/metadata). See §13 banner. |
 | Stack | **Flask + gunicorn Databricks App**, server-rendered vanilla JS, service principal. |
 | UI | **Business-facing**: clean, light, plain-language, Plains-branded (not the reference apps' dark theme). |
 | Heavy processing | **Handed off** to an async Databricks Job — never in the web process (§10.0). |
@@ -17,13 +17,13 @@
 | Reference impl | Reuse the existing **Land Records OCR Pipeline** (Azure DI + SHA-256 dedup + idempotent tracking table) — §10.4. |
 | File scope (v1) | **PDF-first** (incl. scanned); Word/Excel/PPT/image/email as fast-follow (Phase 1.5). |
 | UC location | **`product_dev.document_hub`** schema (matches product convention) + a `docs` volume; promote to prod catalog later. |
-| Permissions (v1) | **Manual, BU-scoped `permissions` table** (contract-explorer pattern); AAD/SharePoint mirroring is a later phase. |
+| Permissions (v1) | ~~Manual, BU-scoped `permissions` table~~ → **site-scoped, auto-mirrored from each user's SP browse** (shipped); **per-item ACL parity is the committed v2 target** (Phase 6 item T). See §14. |
 | Dedup | Content **SHA-256**, surfaced to the user. |
 | Field schema | **Admin-configurable** at runtime via `field_defs` (no code deploy). |
 | Sensitivity | **Optional field** per Document Type (AI-suggested, human-confirmed) — not a preset. |
 | Departments | Finance and Accounting **separate**; IT department is named **IS**. |
 | Relationships | **Amendments must link to a parent contract**; documents linkable into a general **tree** (§8.1). |
-| Mirror cadence | **On-verify + N-minute background sweep**, both idempotent/concurrency-safe (§13.1). |
+| Mirror cadence | ~~On-verify + N-minute file mirror sweep~~ → **file mirror dropped 2026-09-18** (never built). Sync is now SP→DBX reconciliation (delta query, move/delete + ACL); optional metadata write-back is a Phase 6 decision. See §13 banner. |
 | Scale target | **Thousands → hundreds of thousands** of documents; everything idempotent, crash-safe, resumable (§4A). |
 
 ---
@@ -686,7 +686,23 @@ Admins manage `field_defs` through an admin UI (no code deploy):
 
 ## 13. Mirror to SharePoint
 
-One-way, **DBX → SharePoint**, on a fast cadence.
+> **Revised (2026-09-18) — source-of-truth flip.** The original locked decision
+> ("Databricks-primary, one-way DBX→SharePoint file mirror") is **superseded**. SharePoint is now the
+> **live source of truth for file lifecycle** — file existence, location, and per-item access all
+> originate in SharePoint; Databricks stays the *brain* (extraction, search, metadata, verification)
+> but no longer owns whether or where a file exists. Consequences:
+> - The **file mirror (pushing bytes DBX→SP) is dropped.** `mirror_status` was never built (only ever
+>   written `not_mirrored`) and is not resurrected as a file mirror.
+> - What remains open is a **metadata write-back**: pushing Document Hub's confirmed field values back
+>   onto the *existing* SharePoint item's columns (no new files created). Whether to build this is a
+>   Phase 6 (`ROADMAP.md`) decision, not a locked commitment.
+> - Reconciling the corpus **against** SharePoint (detect moves/deletes, refresh links, soft-delete +
+>   hash-rehydrate) becomes the primary sync concern — see §14 and Phase 6 (S1/S3).
+>
+> The subsections below describe the *original* one-way-file-mirror design and are retained for
+> history; treat the banner above as authoritative.
+
+Original design (superseded) — one-way, **DBX → SharePoint**, on a fast cadence.
 
 - **Trigger (both):** (a) **on-verify** — enqueue a mirror the moment a document is
   verified/changed, for near-real-time propagation; **and** (b) a **background sweep every
@@ -722,6 +738,10 @@ The mirror is a claim-based worker over a `mirror` queue (per §4A):
 > Alternative considered & rejected for v1: SharePoint-primary. It complicates the
 > extraction pipeline, dedup index, and search for little benefit given the AI-heavy
 > workload. Revisit if a hard requirement to author in SharePoint emerges.
+>
+> **Update (2026-09-18): that alternative is now adopted** for lifecycle/access (the "hard requirement"
+> materialised — users author and move/delete in SharePoint). Extraction, dedup, and search remain
+> Databricks-side exactly as designed; only file existence/location/ACL move to SharePoint as source.
 
 ---
 
@@ -730,8 +750,17 @@ The mirror is a claim-based worker over a `mirror` queue (per §4A):
 > **Revised (2026-09-16):** v1 scope is now the **SharePoint site** a doc lives in (`allowed_site_id`),
 > mirrored by capturing each user's visible sites from their delegated browse — not a manual
 > `allowed_business_unit` table. See "Model revision — SharePoint as the spine" in `PLAN.md`.
+>
+> **Revised again (2026-09-18) — per-file ACL parity is now the target.** Site-level scope
+> (current, shipped) is an **interim** state, not the destination: today anyone who can reach a site
+> sees *every* Doc Hub doc from it, including files they could not open in SharePoint. The committed
+> goal is now **per-item ACL parity** — reflect each SharePoint item's own `/permissions` (handling
+> broken inheritance and item-level sharing), not just site membership. This is Phase 6 item T in
+> `ROADMAP.md`. (Also fix there: in-app uploads have `sp_site_id = NULL` and are invisible to non-FULL
+> users — uploads need a first-class scope.)
 
-Goal: **mirror SharePoint permissions where possible**, degrade gracefully where not.
+Goal: **mirror SharePoint permissions faithfully** (per-item where the ACL allows), degrade gracefully
+where not.
 
 - **App auth:** Databricks Apps **SSO** in front of the app; identity from forwarded
   headers (`X-Forwarded-Email` etc.), as in `contracts-ver`. Unauthenticated → 401.
@@ -748,8 +777,11 @@ Goal: **mirror SharePoint permissions where possible**, degrade gracefully where
 - **Admin** access is a `permissions` row with `access_type = ADMIN`; only admins reach
   §12 and source connection.
 
-> Honest constraint: true per-document ACL parity with SharePoint is hard and is **not**
-> promised for v1. V1 = BU/site-level mirroring; v2 can tighten to item-level if needed.
+> Honest constraint: true per-document ACL parity with SharePoint is hard and was **not**
+> promised for v1. V1 = BU/site-level mirroring (shipped); **v2 (Phase 6, item T) tightens to
+> item-level** — this is now committed, not "if needed". Cost to weigh: a Graph `/permissions` read per
+> item + storage of each item's allowed principals, reconciled on the same delta sweep as lifecycle (§13
+> banner / Phase 6 S3).
 
 ---
 

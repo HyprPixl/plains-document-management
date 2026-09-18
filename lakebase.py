@@ -630,17 +630,19 @@ def _ensure_documents_ready():
         logger.info("Lakebase document_hub document_* tables ready")
 
 
-def _sites_clause(sites, col: str = "sp_site_id"):
+def _sites_clause(sites, email, col: str = "sp_site_id"):
     """Translate the app's site scope into a Postgres predicate + params.
 
-    `sites is None`  → unrestricted (FULL/ADMIN).  `sites == []` → see nothing.
-    Otherwise → `col = ANY(%s)` (psycopg2 adapts the list to a PG array).
+    `sites is None`  → unrestricted (FULL/ADMIN).  Otherwise the doc is visible if its
+    site is in scope (`col = ANY(%s)`; empty list matches nothing) OR it's the caller's
+    own non-SharePoint upload (`col IS NULL AND created_by = %s`). The upload clause is
+    confined to NULL-site rows, mirroring app.perms_where — see its docstring.
     """
     if sites is None:
         return "", []
-    if not sites:
-        return " AND 1=0", []
-    return f" AND {col} = ANY(%s)", [list(sites)]
+    cb = (col.rsplit(".", 1)[0] + ".created_by") if "." in col else "created_by"
+    return (f" AND ({col} = ANY(%s) OR ({col} IS NULL AND {cb} = %s))",
+            [list(sites), (email or "").lower()])
 
 
 # ─────────────────────────────────────────────────────────── doc reads ──
@@ -651,10 +653,10 @@ _DOC_LIST_COLS = (
 )
 
 
-def list_documents(sites, status: str | None = None, cstatus: str | None = None) -> list[dict]:
+def list_documents(sites, email, status: str | None = None, cstatus: str | None = None) -> list[dict]:
     """Queue list — mirrors api_documents' warehouse query, site-scoped."""
     _ensure_documents_ready()
-    clause, params = _sites_clause(sites)
+    clause, params = _sites_clause(sites, email)
     where = "1=1" + clause
     if status:
         where += " AND verification_status = %s AND classification_status = 'classified'"
@@ -669,17 +671,17 @@ def list_documents(sites, status: str | None = None, cstatus: str | None = None)
     )
 
 
-def stats(sites):
+def stats(sites, email):
     """Return (by_status_rows, unclassified_count) — mirrors api_stats."""
     _ensure_documents_ready()
-    clause, params = _sites_clause(sites)
+    clause, params = _sites_clause(sites, email)
     by = pg_query(
         f"SELECT verification_status AS s, count(*) AS n FROM {DOCUMENTS} "
         f"WHERE 1=1{clause} AND classification_status = 'classified' "
         f"GROUP BY verification_status",
         params,
     )
-    clause2, params2 = _sites_clause(sites)
+    clause2, params2 = _sites_clause(sites, email)
     un = pg_query(
         f"SELECT count(*) AS n FROM {DOCUMENTS} "
         f"WHERE classification_status = 'unclassified'{clause2}",
@@ -699,7 +701,7 @@ _SEARCH_SELECT = (
 )
 
 
-def search(sites, q: str = "", document_type: str | None = None, department: str | None = None,
+def search(sites, email, q: str = "", document_type: str | None = None, department: str | None = None,
            path: str | None = None, tag: str | None = None) -> list[dict]:
     """Full search over verified docs — mirrors api_search (Spark concat_ws/collect_list
     becomes Postgres string_agg; LIKE terms are ILIKE params).
@@ -708,7 +710,7 @@ def search(sites, q: str = "", document_type: str | None = None, department: str
     binds first, then the WHERE site scope, filters, and free-text LIKEs.
     """
     _ensure_documents_ready()
-    site_clause, site_params = _sites_clause(sites, "d.sp_site_id")
+    site_clause, site_params = _sites_clause(sites, email, "d.sp_site_id")
     params: list = []
     join_txt = join_tag = ""
     if tag:  # JOIN clause is textually before WHERE → its %s must bind first

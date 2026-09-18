@@ -171,14 +171,20 @@ def get_perms(email: str):
 
 
 def perms_where(email: str, col: str = "sp_site_id") -> str:
-    """SQL predicate enforcing site-scoped access. Returns '' for full access."""
+    """SQL predicate enforcing site-scoped access. Returns '' for full access.
+
+    Non-SharePoint docs (drag-drop uploads) carry sp_site_id = NULL, which matches no
+    site scope — so without this they'd be invisible to everyone but FULL/ADMIN. A user
+    always sees their own uploads: sp_site_id IS NULL AND created_by = them. This is
+    confined to NULL-site rows, so it never widens visibility on SharePoint-sourced docs.
+    """
     is_admin, is_full, allowed = get_perms(email)
     if is_full:
         return ""
-    if not allowed:
-        return " AND 1=0 "  # no permissions → see nothing
-    vals = ",".join(lit(b) for b in allowed)
-    return f" AND {col} IN ({vals}) "
+    cb = (col.rsplit(".", 1)[0] + ".created_by") if "." in col else "created_by"
+    own = f"({col} IS NULL AND {cb} = {lit(email)})"
+    site = f"{col} IN ({','.join(lit(b) for b in allowed)})" if allowed else "1=0"
+    return f" AND ({site} OR {own}) "
 
 
 def perms_sites(email: str):
@@ -436,7 +442,7 @@ def api_documents():
     status = request.args.get("verification_status")
     cstatus = request.args.get("classification_status")
     if lakebase.docs_enabled():
-        return jsonify(lakebase.list_documents(perms_sites(email), status, cstatus))
+        return jsonify(lakebase.list_documents(perms_sites(email), email, status, cstatus))
     where = "1=1" + perms_where(email)
     if status:
         # A doc only enters the review pipeline once it's classified; unclassified docs stay
@@ -458,7 +464,7 @@ def api_documents():
 def api_stats():
     email = current_user()
     if lakebase.docs_enabled():
-        rows, unclassified = lakebase.stats(perms_sites(email))
+        rows, unclassified = lakebase.stats(perms_sites(email), email)
     else:
         where = "1=1" + perms_where(email)
         rows = query(
@@ -751,7 +757,7 @@ def api_search():
     path = request.args.get("path")  # prefix filter on the SharePoint path
     tag = request.args.get("tag")
     if lakebase.docs_enabled():
-        return jsonify(lakebase.search(perms_sites(email), q, dt, dept, path, tag))
+        return jsonify(lakebase.search(perms_sites(email), email, q, dt, dept, path, tag))
     where = "verification_status = 'verified'" + perms_where(email, "d.sp_site_id")
     if dt:
         where += f" AND d.document_type = {lit(dt)}"

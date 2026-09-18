@@ -154,14 +154,20 @@ def test_perms_where_scopes_to_allowed_sites(bind_db):
     ])
     bind_db(fake, app_module)
     where = app_module.perms_where("u@x.com")
-    assert where == " AND sp_site_id IN ('site-A','site-B') "
+    assert where == (
+        " AND (sp_site_id IN ('site-A','site-B') "
+        "OR (sp_site_id IS NULL AND created_by = 'u@x.com')) "
+    )
 
 
-def test_perms_where_no_permissions_sees_nothing(bind_db):
+def test_perms_where_no_permissions_sees_only_own_uploads(bind_db):
+    # A user with no site grants still sees their own non-SharePoint uploads (NULL site).
     import app as app_module
     fake = _perms([])
     bind_db(fake, app_module)
-    assert app_module.perms_where("u@x.com") == " AND 1=0 "
+    assert app_module.perms_where("u@x.com") == (
+        " AND (1=0 OR (sp_site_id IS NULL AND created_by = 'u@x.com')) "
+    )
 
 
 def test_perms_where_respects_custom_column(bind_db):
@@ -169,4 +175,7 @@ def test_perms_where_respects_custom_column(bind_db):
     fake = _perms([{"access_type": "READ", "allowed_site": "site-A"}])
     bind_db(fake, app_module)
     where = app_module.perms_where("u@x.com", "d.sp_site_id")
-    assert where == " AND d.sp_site_id IN ('site-A') "
+    assert where == (
+        " AND (d.sp_site_id IN ('site-A') "
+        "OR (d.sp_site_id IS NULL AND d.created_by = 'u@x.com')) "
+    )
