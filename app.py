@@ -23,7 +23,7 @@ import config
 import ingest
 import lakebase
 import sharepoint as sp
-from db import query, execute, lit
+from db import query, execute, lit, cached_query, bust_cache
 
 app = Flask(__name__)
 _w = WorkspaceClient()
@@ -195,7 +195,7 @@ def api_me():
 
 @app.get("/api/taxonomy")
 def api_taxonomy():
-    rows = query(
+    rows = cached_query(
         f"SELECT category, value, label, business_unit, sort_order FROM {config.TAXONOMY} "
         f"WHERE active = true ORDER BY category, sort_order"
     )
@@ -214,7 +214,7 @@ def api_field_defs():
     if doc_type:
         where += f" OR applies_to = {lit(doc_type)}"
     where += ")"
-    rows = query(
+    rows = cached_query(
         f"SELECT field_key, label, data_type, applies_to, picklist_source, "
         f"extraction_prompt_hint, required_for_verify, sort_order FROM {config.FIELD_DEFS} WHERE {where} "
         f"ORDER BY (applies_to = 'common') DESC, sort_order"
@@ -230,12 +230,12 @@ def api_field_defs():
 @app.get("/api/field-defs/all")
 def api_field_defs_all():
     """Every active field def, grouped by what it applies to — for the Fields admin screen."""
-    rows = query(
+    rows = cached_query(
         f"SELECT field_key, label, data_type, applies_to, picklist_source, "
         f"extraction_prompt_hint, required_for_verify, sort_order FROM {config.FIELD_DEFS} "
         f"WHERE active = true ORDER BY (applies_to = 'common') DESC, applies_to, sort_order"
     )
-    doc_types = [r["value"] for r in query(
+    doc_types = [r["value"] for r in cached_query(
         f"SELECT value FROM {config.TAXONOMY} WHERE category = 'document_type' AND active = true "
         f"ORDER BY sort_order")]
     return jsonify(fields=rows, doc_types=doc_types)
@@ -274,6 +274,7 @@ def api_field_def_create():
         f"{lit(b.get('picklist_source'))}, {lit(b.get('extraction_prompt_hint'))}, "
         f"{lit(bool(b.get('required_for_verify')))}, {int(order)}, true, {lit(email)}, current_timestamp())"
     )
+    bust_cache()
     _audit(email, "field_def_create", key, b)
     return jsonify(ok=True, field_key=key)
 
@@ -293,6 +294,7 @@ def api_field_def_update(field_key):
     if "sort_order" in b and b["sort_order"] is not None:
         sets.append(f"sort_order = {int(b['sort_order'])}")
     execute(f"UPDATE {config.FIELD_DEFS} SET {', '.join(sets)} WHERE field_key = {lit(field_key)}")
+    bust_cache()
     _audit(email, "field_def_update", field_key, b)
     return jsonify(ok=True)
 
@@ -304,6 +306,7 @@ def api_field_def_delete(field_key):
         return jsonify(error="forbidden"), 403
     execute(f"UPDATE {config.FIELD_DEFS} SET active = false, updated_at = current_timestamp() "
             f"WHERE field_key = {lit(field_key)}")
+    bust_cache()
     _audit(email, "field_def_delete", field_key, None)
     return jsonify(ok=True)
 
@@ -732,7 +735,7 @@ def api_document(doc_id):
         # field_defs lives on the warehouse; the doc's values on Lakebase — a cross-store
         # join isn't possible, so read the defs (warehouse) and values (Lakebase) separately
         # and merge by field_key in Python (both round-trips are cheap).
-        defs = query(
+        defs = cached_query(
             f"SELECT fd.field_key, fd.label, fd.data_type, fd.picklist_source, fd.required_for_verify, "
             f"fd.applies_to, fd.sort_order FROM {config.FIELD_DEFS} fd "
             f"WHERE fd.active = true AND "
@@ -819,8 +822,9 @@ def api_verify(doc_id):
         if not docs:
             return jsonify(error="not found"), 404
         dtype = docs[0].get("document_type")
-    # required fields present? (field_defs is warehouse-resident in either mode)
-    req = query(
+    # required fields present? (field_defs is warehouse-resident in either mode; cached —
+    # it changes only via admin field-def edits, which bust the cache)
+    req = cached_query(
         f"SELECT fd.field_key FROM {config.FIELD_DEFS} fd "
         f"WHERE fd.active = true AND fd.required_for_verify = true AND "
         f"(fd.applies_to = 'common' OR fd.applies_to = {lit(dtype)})"

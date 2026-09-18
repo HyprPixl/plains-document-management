@@ -119,12 +119,27 @@ def bind_db(monkeypatch):
 
 
 # ── Flask API fixtures ──────────────────────────────────────────────────────
+@pytest.fixture(autouse=True)
+def _reset_config_cache():
+    """db.cached_query() memoizes on a process-global dict; clear it around every test so a
+    cached config read from one test can't leak into the next."""
+    import db as db_module
+    db_module.bust_cache()
+    yield
+    db_module.bust_cache()
+
+
 @pytest.fixture
 def app_module(fake_db, monkeypatch):
     import app as app_module
     import ingest as ingest_module
+    import db as db_module
     monkeypatch.setattr(app_module, "query", fake_db.query)
     monkeypatch.setattr(app_module, "execute", fake_db.execute)
+    # cached_query() lives in db.py and calls db.query directly, so fake the db-layer binding
+    # too (app.py holds its own imported `query`, patched above).
+    monkeypatch.setattr(db_module, "query", fake_db.query)
+    monkeypatch.setattr(db_module, "execute", fake_db.execute)
     # api_upload delegates to ingest.register_bytes which issues its own SQL.
     monkeypatch.setattr(ingest_module, "query", fake_db.query)
     monkeypatch.setattr(ingest_module, "execute", fake_db.execute)

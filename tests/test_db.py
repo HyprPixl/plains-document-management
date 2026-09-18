@@ -117,3 +117,63 @@ def test_lit_strings_are_quoted_and_escaped():
     assert db.lit("plain") == "'plain'"
     assert db.lit("O'Brien") == "'O''Brien'"          # single-quote doubled
     assert db.lit("back\\slash") == "'back\\\\slash'"  # backslash escaped
+
+
+# ── cached_query: config-read TTL cache ──────────────────────────────────────
+# Collapses repeat reads of the rarely-changing warehouse config tables (field_defs,
+# taxonomy) to one round-trip per TTL window — the hot-path win in Phase 3. Pins: a
+# hit skips the warehouse, a hit is mutation-safe (callers add keys to rows), and both
+# TTL expiry and bust_cache() force a fresh read.
+def _counting_query(monkeypatch):
+    """Replace db.query with a counter returning a fresh mutable row each call."""
+    calls = {"n": 0}
+
+    def _q(sql, timeout_s=120):
+        calls["n"] += 1
+        return [{"field_key": "title", "n": calls["n"]}]
+
+    monkeypatch.setattr(db, "query", _q)
+    db.bust_cache()
+    return calls
+
+
+def test_cached_query_serves_second_call_from_cache(monkeypatch):
+    calls = _counting_query(monkeypatch)
+    first = db.cached_query("SELECT 1", ttl_s=60)
+    second = db.cached_query("SELECT 1", ttl_s=60)
+    assert calls["n"] == 1                        # warehouse hit exactly once
+    assert first == second == [{"field_key": "title", "n": 1}]
+
+
+def test_cached_query_is_mutation_safe(monkeypatch):
+    """A caller mutating a returned row (e.g. adding 'options') must not poison the cache."""
+    _counting_query(monkeypatch)
+    rows = db.cached_query("SELECT 1", ttl_s=60)
+    rows[0]["options"] = ["a", "b"]              # api_document does exactly this
+    fresh = db.cached_query("SELECT 1", ttl_s=60)
+    assert "options" not in fresh[0]
+
+
+def test_cached_query_distinct_sql_keyed_separately(monkeypatch):
+    calls = _counting_query(monkeypatch)
+    db.cached_query("SELECT 1", ttl_s=60)
+    db.cached_query("SELECT 2", ttl_s=60)        # different SQL -> its own entry
+    assert calls["n"] == 2
+
+
+def test_cached_query_re_reads_after_ttl_expiry(monkeypatch):
+    calls = _counting_query(monkeypatch)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(db.time, "monotonic", lambda: clock["t"])
+    db.cached_query("SELECT 1", ttl_s=30)
+    clock["t"] += 31                             # TTL window elapsed
+    db.cached_query("SELECT 1", ttl_s=30)
+    assert calls["n"] == 2
+
+
+def test_bust_cache_forces_fresh_read(monkeypatch):
+    calls = _counting_query(monkeypatch)
+    db.cached_query("SELECT 1", ttl_s=60)
+    db.bust_cache()                              # e.g. an admin edited a field def
+    db.cached_query("SELECT 1", ttl_s=60)
+    assert calls["n"] == 2

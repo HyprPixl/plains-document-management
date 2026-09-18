@@ -104,6 +104,36 @@ def _coercer(type_name):
     return lambda v: v
 
 
+# ─────────────────────────────────────────────────────── config-read cache ──
+# The warehouse config tables (field_defs, taxonomy) change rarely but are read on hot
+# paths — every document open re-reads field_defs, ~1.2s of Statement Execution latency
+# (see bench/BASELINE.md). A tiny per-process TTL cache keyed on the exact SQL string
+# collapses those repeat reads to one warehouse round-trip per TTL window. Correctness
+# holds because the cache key *is* the full query, so a cached hit is byte-identical to a
+# fresh run; only staleness (≤ TTL) is traded. Config writes bust the cache in the writing
+# worker; the other gunicorn workers converge within one TTL. Use ONLY for read-only queries
+# over rarely-changing config — never for per-row / per-user / per-document data.
+_cache: dict[str, tuple[float, list]] = {}
+CONFIG_CACHE_TTL_S = 60
+
+
+def cached_query(sql: str, ttl_s: int = CONFIG_CACHE_TTL_S) -> list[dict]:
+    """query() with a per-process TTL cache keyed on the SQL string. Returns fresh row copies
+    each call so a caller that mutates rows (e.g. adds an 'options' key) can't poison the cache."""
+    now = time.monotonic()
+    hit = _cache.get(sql)
+    if hit is not None and now - hit[0] < ttl_s:
+        return [dict(r) for r in hit[1]]
+    rows = query(sql)
+    _cache[sql] = (now, rows)
+    return [dict(r) for r in rows]
+
+
+def bust_cache() -> None:
+    """Drop all cached config reads — call after a config-table write in this worker."""
+    _cache.clear()
+
+
 def execute(sql: str, timeout_s: int = 120) -> None:
     """Run a statement for its side effects."""
     query(sql, timeout_s)

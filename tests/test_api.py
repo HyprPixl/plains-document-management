@@ -275,6 +275,31 @@ def test_field_def_delete_is_soft(client, fake_db):
     assert any("active = false" in s for s in fake_db.executed_matching("UPDATE"))
 
 
+# ── config-read caching (field_defs / taxonomy) ──────────────────────────────
+DEFS_SELECT = "extraction_prompt_hint, required_for_verify, sort_order"  # field-defs list read
+
+
+def test_field_defs_cached_across_requests(client, fake_db):
+    fake_db.responder = route([(DEFS_SELECT, [])], default=[])
+    client.get("/api/field-defs")
+    client.get("/api/field-defs")
+    # Same SQL, within TTL → the warehouse field_defs read runs exactly once.
+    assert len(fake_db.queried_matching(DEFS_SELECT)) == 1
+
+
+def test_field_def_write_busts_the_cache(client, fake_db):
+    fake_db.responder = route([
+        (DEFS_SELECT, []),
+        ("SELECT 1 FROM", []),            # create's existence check
+        ("max(sort_order)", [{"m": 1}]),
+        (PERMS, ADMIN),
+    ], default=[])
+    client.get("/api/field-defs")                                  # populate cache
+    client.post("/api/field-defs", json={"field_key": "po", "label": "PO"})  # busts it
+    client.get("/api/field-defs")                                  # must re-read
+    assert len(fake_db.queried_matching(DEFS_SELECT)) == 2
+
+
 # ── admin warehouse-latency bench ────────────────────────────────────────────
 def test_admin_bench_forbidden_for_non_admin(client, fake_db):
     fake_db.responder = route([(PERMS, SITE_A)])
