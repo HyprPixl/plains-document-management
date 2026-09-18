@@ -1006,8 +1006,9 @@ def sp_status():
     email = current_user()
     if not sp.configured():
         return jsonify(configured=False, connected=False, can_import=_can_import(email))
-    return jsonify(configured=True, connected=sp.session_connected(email),
-                   has_refresh=sp.has_refresh(email), can_import=_can_import(email))
+    connected, has_refresh = sp.session_status(email)        # one session read, not two
+    return jsonify(configured=True, connected=connected,
+                   has_refresh=has_refresh, can_import=_can_import(email))
 
 
 @app.get("/api/sharepoint/login")

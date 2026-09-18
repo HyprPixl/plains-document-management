@@ -192,13 +192,11 @@ def _session(email: str) -> dict | None:
     return rows[0] if rows else None
 
 
-def session_connected(email: str) -> bool:
-    return _session(email) is not None
-
-
-def has_refresh(email: str) -> bool:
+def session_status(email: str) -> tuple[bool, bool]:
+    """(connected, has_refresh) from ONE session read — sp_status is polled, so collapse
+    what were two warehouse round-trips (session_connected + has_refresh) into one."""
     s = _session(email)
-    return bool(s and s.get("refresh_token_enc"))
+    return (s is not None, bool(s and s.get("refresh_token_enc")))
 
 
 def access_token_for(email: str) -> str:
