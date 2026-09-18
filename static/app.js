@@ -930,7 +930,7 @@ function openSharePoint() {
   spState.selected.clear(); spState.visible = [];
   spState.view = "sites"; spState.site = null; spState.drive = null; spState.path = [];
   $("#spScrim").hidden = false;
-  $("#spAutoSync").checked = false;
+  $("#spAutoSync").checked = true;   // default ON — imports stay in sync unless opted out
   if (spState.status?.connected) showSpBrowser();
   else { $("#spConnect").hidden = false; $("#spBrowser").hidden = true; $("#spFoot").hidden = true; }
 }
