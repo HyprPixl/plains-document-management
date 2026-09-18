@@ -271,7 +271,7 @@ async function uploadFiles(fileList) {
   } catch (e) { toast("Upload failed: " + e.message, true); box.replaceChildren(); }
 }
 
-// ─────────────────────────────────────────────── CLASSIFY WALKTHROUGH ──
+// ─────────────────────────────────────────────── BULK CLASSIFY ──
 function fillSelect(sel, cat, placeholder) {
   sel.replaceChildren(el("option", { value: "" }, placeholder));
   (state.taxonomy[cat] || []).forEach((o) => sel.append(el("option", { value: o.value }, o.label)));
@@ -281,43 +281,106 @@ function fillTypeSelect(sel) {
   (state.taxonomy.document_type || [])
     .forEach((o) => sel.append(el("option", { value: o.value }, o.label)));
 }
-// "Classify selected…" opens the selected docs in the normal detail drawer, one at a time —
-// each gets the same per-doc classify panel (prefilled type/dept guess + field preview) as
-// opening a single doc. The first loads immediately; the rest lazy-load as you step through.
+function mostCommon(vals) {
+  const counts = new Map();
+  vals.forEach((v) => counts.set(v, (counts.get(v) || 0) + 1));
+  let best = null, n = 0;
+  for (const [v, c] of counts) if (c > n) { best = v; n = c; }
+  return best;
+}
+// "Classify selected…" opens a bulk panel in the detail drawer: pick one type/department for
+// the whole batch and apply in one click. You can glance at any file (title in the list →
+// first page in the left viewer) if you want to, but you don't have to open each one. The
+// type defaults to the most common name-based guess across the selection.
 function openClassify() {
   const ids = [...state.selected];
   if (!ids.length) return;
-  state.classify = { ids, idx: 0 };
-  openClassifyAt(0);
+  state.classify = { ids, focus: null, drawList: null };
+  renderBulkClassify();
 }
-function openClassifyAt(idx) {
-  state.classify.idx = idx;
-  const id = state.classify.ids[idx];
-  openDoc(id, state.rowById.get(id));
+function renderBulkClassify() {
+  const ids = state.classify.ids;
+  $("#drawer").hidden = false; $("#drawerScrim").hidden = false;
+  $("#drawerTitle").textContent = `Classify ${ids.length} document${ids.length > 1 ? "s" : ""}`;
+  $("#drawerSub").textContent = "Set a type and department for the batch — preview any file on the left if you want.";
+  const body = $("#drawerBody"); body.replaceChildren();
+  $("#reviewFrame").hidden = true; $("#reviewNoPrev").hidden = false;  // until a file is focused
+
+  const guess = mostCommon(ids.map((id) => state.rowById.get(id)?.document_type).filter(Boolean));
+  const typeSel = el("select", {}); fillTypeSelect(typeSel); if (guess) typeSel.value = guess;
+  const deptSel = el("select", {}); fillSelect(deptSel, "department", "— none —");
+  body.append(
+    el("div", { class: "section-label" }, "Apply to the whole batch"),
+    el("div", { class: "field-row" }, el("label", {}, "Document type"), typeSel),
+    el("div", { class: "field-row" }, el("label", {}, "Department"), deptSel));
+  if (guess)
+    body.append(el("div", { class: "prov" }, "Type pre-filled from the most common file-name guess — change it to override the batch."));
+
+  // Which fields the chosen type will extract — mirrors the single-doc classify panel.
+  const preview = el("div", { class: "extract-preview" });
+  body.append(el("div", { class: "section-label" }, "Fields to be extracted"), preview);
+  const loadFieldsPreview = async () => {
+    const dt = typeSel.value;
+    if (!dt) { preview.replaceChildren(el("div", { class: "muted small" },
+      "Pick a document type to see the fields that will be extracted.")); return; }
+    preview.replaceChildren(el("div", { class: "muted small" }, "Loading fields…"));
+    try { renderExtractPreview(preview, await api("/api/field-defs?document_type=" + encodeURIComponent(dt))); }
+    catch (e) { preview.replaceChildren(el("div", { class: "muted small" }, "Could not load fields.")); }
+  };
+  typeSel.addEventListener("change", loadFieldsPreview); loadFieldsPreview();
+
+  // The batch as a clickable list: click a row to load its first page on the left; ✕ drops a
+  // doc from the batch (so an outlier you spot while glancing can be handled separately).
+  body.append(el("div", { class: "section-label" }, "Documents in this batch"));
+  const list = el("div", { class: "bulk-doc-list" });
+  const drawList = () => {
+    list.replaceChildren();
+    state.classify.ids.forEach((id) => {
+      const row = state.rowById.get(id) || { doc_id: id };
+      list.append(el("div", { class: "bulk-doc" + (id === state.classify.focus ? " active" : "") },
+        el("button", { class: "bulk-doc-main", onclick: () => focusBulkDoc(id) },
+          el("span", { class: "doc-name" }, row.original_filename || id),
+          el("span", { class: "muted small" }, locationOf(row) + " · " + (row.document_type || "unclassified"))),
+        el("button", { class: "tag-x", title: "Remove from batch", onclick: () => dropBulkDoc(id) }, "✕")));
+    });
+  };
+  state.classify.drawList = drawList; drawList();
+  body.append(list);
+
+  $("#drawerFoot").replaceChildren(
+    el("button", { class: "btn primary",
+      onclick: () => applyBulkClassify(typeSel.value || null, deptSel.value || null) },
+      "Classify & queue extraction"));
+
+  focusBulkDoc(ids[0]);  // lazy-preview the first so the viewer isn't empty
 }
-// After a doc is classified (or when stepping past it), move to the next selected doc;
-// when the list is exhausted, end the walkthrough and refresh the queue. Returns true if
-// it handled the "what next" so the caller shouldn't also close the drawer.
-function advanceClassify() {
-  const w = state.classify;
-  if (!w) return false;
-  state.selected.delete(w.ids[w.idx]); updateBulkBar();
-  if (w.idx + 1 < w.ids.length) { openClassifyAt(w.idx + 1); return true; }
-  state.classify = null;
-  state.selected.clear(); updateBulkBar();
-  closeDrawer(); loadManage();
-  return true;
+function focusBulkDoc(id) {
+  if (!state.classify) return;
+  state.classify.focus = id;
+  const row = state.rowById.get(id);
+  if (row) { $("#drawerSub").textContent = "Previewing: " + (row.original_filename || id); loadPreview(row); }
+  state.classify.drawList?.();
 }
-// A prev/next strip shown atop the drawer while walking a multi-doc selection.
-function classifyNav() {
-  const w = state.classify;
-  if (!w || w.ids.length < 2) return null;
-  return el("div", { class: "classify-nav" },
-    el("button", { class: "btn small", disabled: w.idx === 0 ? "" : undefined,
-      onclick: () => openClassifyAt(w.idx - 1) }, "‹ Prev"),
-    el("span", { class: "muted small" }, `Document ${w.idx + 1} of ${w.ids.length}`),
-    el("button", { class: "btn small", disabled: w.idx + 1 >= w.ids.length ? "" : undefined,
-      onclick: () => openClassifyAt(w.idx + 1) }, "Skip ›"));
+function dropBulkDoc(id) {
+  if (!state.classify) return;
+  state.classify.ids = state.classify.ids.filter((x) => x !== id);
+  state.selected.delete(id); updateBulkBar();
+  if (!state.classify.ids.length) { closeDrawer(); loadManage(); return; }
+  if (state.classify.focus === id) { renderBulkClassify(); return; }  // refresh header count + list
+  state.classify.drawList?.();
+}
+async function applyBulkClassify(dt, dept) {
+  if (!dt && !dept) { toast("Pick at least a type or department", true); return; }
+  const ids = state.classify.ids;
+  try {
+    await api("/api/documents/classify", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ doc_ids: ids, document_type: dt, department: dept }) });
+    await api("/api/documents/enqueue", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ doc_ids: ids }) });
+    toast(`Classified and queued ${ids.length} document${ids.length > 1 ? "s" : ""}`);
+    state.classify = null; state.selected.clear(); updateBulkBar();
+    closeDrawer(); loadManage();
+  } catch (e) { toast("Failed: " + e.message, true); }
 }
 
 // ─────────────────────────────────────────────── DRAWER (detail/verify) ──
@@ -369,7 +432,6 @@ function renderDrawer(data) {
   $("#drawerSub").textContent =
     `${locationOf(d)} · ${d.document_type || "unclassified"}`;
   const body = $("#drawerBody"); body.replaceChildren();
-  const nav = classifyNav(); if (nav) body.append(nav);
 
   const actions = el("div", { class: "field-actions" },
     el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}&inline=1`, target: "_blank" }, "View file"),
@@ -523,7 +585,6 @@ async function classifyOne(id, dt, dept) {
     await api("/api/documents/enqueue", { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ doc_ids: [id] }) });
     toast("Classified and queued for extraction");
-    if (advanceClassify()) return;   // multi-select walkthrough → move to the next doc
     closeDrawer(); loadManage();
   } catch (e) { toast("Failed: " + e.message, true); }
 }
