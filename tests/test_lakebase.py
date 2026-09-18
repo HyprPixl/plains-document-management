@@ -463,6 +463,71 @@ def test_api_search_returns_rows_and_total_and_clamps_paging(client, fake_db, mo
     assert captured == {"sort": "oldest", "limit": 200, "offset": 0}  # clamped to 1..200 / >=0
 
 
+# ── item O: retrieval passages (char-budget accumulation) ────────────────────
+def test_passages_for_docs_joins_filename_and_caps_budget(monkeypatch):
+    calls = _capture_pg(monkeypatch, rows=[
+        {"doc_id": "d1", "page": 1, "text": "a" * 8000, "filename": "a.pdf"},
+        {"doc_id": "d1", "page": 2, "text": "b" * 8000, "filename": "a.pdf"},
+        {"doc_id": "d2", "page": 1, "text": "c" * 8000, "filename": "b.pdf"},
+    ])
+    out = lakebase.passages_for_docs(["d1", "d2"], char_budget=12000)
+    sql, params = calls[0]
+    assert "document_text" in sql and "JOIN" in sql and "= ANY(%s)" in sql
+    assert "ORDER BY t.doc_id, t.page" in sql
+    assert params == (["d1", "d2"],)
+    # first passage (8000) fits; second pushes past 12000 → included then loop stops; third dropped
+    assert [(p["doc_id"], p["page"]) for p in out] == [("d1", 1), ("d1", 2)]
+    assert out[0]["filename"] == "a.pdf"
+
+
+def test_passages_for_docs_empty_ids_is_noop(monkeypatch):
+    calls = _capture_pg(monkeypatch)
+    assert lakebase.passages_for_docs([]) == []
+    assert calls == []                                   # no round-trip when nothing to fetch
+
+
+# ── item L: relation graph (recursive CTE, both directions, cycle guard) ──────
+def test_link_graph_recursive_both_directions_and_cycle_guard(monkeypatch):
+    calls = _capture_pg(monkeypatch, rows=[
+        {"doc_id": "d1", "original_filename": "a", "document_type": "X",
+         "parent_doc_id": "d1", "child_doc_id": "d2", "relationship": "related"}])
+    g = lakebase.link_graph("d1", max_depth=25)
+    sql0, params0 = calls[0]
+    assert "WITH RECURSIVE" in sql0
+    # traverses BOTH directions: parent→child and child→parent inside the lateral
+    assert "WHERE parent_doc_id = r.doc_id" in sql0 and "WHERE child_doc_id = r.doc_id" in sql0
+    assert "NOT (nb.nb = ANY(r.path))" in sql0          # cycle guard via visited path
+    assert "array_length(r.path, 1) < %s" in sql0       # depth bound
+    assert params0 == ("d1", "d1", 25)
+    # then edges among the component, then node metadata (live docs only)
+    assert any("SELECT DISTINCT parent_doc_id, child_doc_id, relationship" in c[0] for c in calls)
+    assert any("deleted_at IS NULL" in c[0] and "original_filename" in c[0] for c in calls)
+    assert isinstance(g["nodes"], list) and isinstance(g["edges"], list)
+
+
+# ── item L: obligations query (date field_keys, site scope, non-null value) ───
+def test_obligations_builds_site_scoped_date_field_query(monkeypatch):
+    calls = _capture_pg(monkeypatch, rows=[])
+    lakebase.obligations(["site-A"], "u@x.com", ["expiry_date", "effective_date"],
+                         document_type="Contract")
+    sql, params = calls[0]
+    assert "df.field_key = ANY(%s)" in sql
+    assert "coalesce(df.confirmed_value, df.proposed_value) IS NOT NULL" in sql
+    assert "d.deleted_at IS NULL" in sql
+    assert "d.sp_site_id = ANY(%s)" in sql               # site scope applied
+    assert "d.document_type = %s" in sql
+    # params textual order: date_keys, then site list + email, then document_type
+    assert params[0] == ["expiry_date", "effective_date"]
+    assert params[1] == ["site-A"] and params[2] == "u@x.com"
+    assert params[-1] == "Contract"
+
+
+def test_obligations_empty_date_keys_short_circuits(monkeypatch):
+    calls = _capture_pg(monkeypatch)
+    assert lakebase.obligations(None, "u@x.com", []) == []
+    assert calls == []                                   # no query when there are no date fields
+
+
 # ── Phase 4 fix: classify requires a document_type ───────────────────────────
 def test_classify_rejects_missing_document_type(client, fake_db, monkeypatch):
     import app as app_module

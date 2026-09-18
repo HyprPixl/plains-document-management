@@ -386,3 +386,68 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #cfe0f5; border-c
 .rc-check-wrap { position: absolute; top: 12px; right: 12px; display: inline-flex; }
 .rc-check-wrap input { width: 16px; height: 16px; cursor: pointer; }
 .load-more-wrap { text-align: center; margin: 18px 0 4px; }
+
+/* ── Explore sub-tabs (Search | Chat | Obligations) ── */
+.explore-tabs { display: flex; gap: 4px; margin-bottom: 18px; border-bottom: 1px solid var(--line); }
+.etab {
+  border: 0; background: transparent; color: var(--muted); cursor: pointer;
+  padding: 9px 16px; font-weight: 600; font-size: 14px;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.etab:hover { color: var(--ink); }
+.etab.active { color: var(--brand); border-bottom-color: var(--brand); }
+.etab:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; border-radius: 6px; }
+
+/* ── Corpus chat ── */
+.chat-panel { display: flex; flex-direction: column; height: min(64vh, 620px);
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow); }
+.chat-messages { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+.chat-empty { margin: auto; text-align: center; max-width: 40ch; }
+.chat-msg { display: flex; flex-direction: column; max-width: 82%; }
+.chat-msg.user { align-self: flex-end; align-items: flex-end; }
+.chat-msg.assistant { align-self: flex-start; align-items: flex-start; }
+.chat-bubble { padding: 10px 14px; border-radius: 14px; font-size: 14px; line-height: 1.5;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-msg.user .chat-bubble { background: var(--brand); color: var(--brand-ink); border-bottom-right-radius: 4px; }
+.chat-msg.assistant .chat-bubble { background: var(--bg); color: var(--ink); border-bottom-left-radius: 4px; }
+.chat-bubble.chat-err { background: #fbeaea; color: var(--danger); }
+.chat-bubble.streaming:empty::after { content: "▋"; color: var(--muted); animation: chat-blink 1s step-start infinite; }
+@keyframes chat-blink { 50% { opacity: 0; } }
+.chat-citations { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.cite-chip { border: 1px solid var(--line); background: var(--panel); color: var(--brand);
+  border-radius: 999px; padding: 3px 10px; font-size: 12px; font-weight: 600; cursor: pointer; }
+.cite-chip:hover { background: #eef4fb; }
+.chat-input-row { display: flex; gap: 10px; padding: 12px; border-top: 1px solid var(--line); }
+.chat-input-row input { flex: 1; }
+
+/* ── Relation tree (drawer) ── */
+.rel-tree { font-size: 13px; }
+.rel-node { position: relative; }
+.rel-children { margin-left: 14px; padding-left: 12px; border-left: 1px solid var(--line); }
+.rel-self, .rel-link { display: block; text-align: left; padding: 5px 8px; border-radius: 8px;
+  width: 100%; }
+.rel-self { font-weight: 600; background: var(--bg); }
+.rel-link { border: 0; background: none; cursor: pointer; color: inherit; font: inherit; }
+.rel-link:hover { background: var(--bg); }
+.rel-link:focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; }
+.rel-edge { color: var(--brand); font-weight: 600; }
+.rel-name { font-weight: 600; }
+.rel-type { font-weight: 400; }
+
+/* ── Obligations calendar ── */
+.oblig-controls { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; flex-wrap: wrap; }
+.oblig-date-field { font-size: 13px; font-weight: 600; color: var(--muted); display: inline-flex;
+  align-items: center; gap: 6px; }
+.oblig-date-field input { font-weight: 400; }
+.oblig-controls #obligCount { margin-left: auto; }
+.oblig-month { margin-bottom: 20px; }
+.oblig-month-head { font-size: 13px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted);
+  margin: 0 0 8px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+.oblig-item { display: flex; gap: 14px; align-items: baseline; padding: 10px 12px; border-radius: 8px;
+  cursor: pointer; transition: .12s; }
+.oblig-item:hover { background: var(--bg); }
+.oblig-item:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+.oblig-date { flex-shrink: 0; width: 108px; font-weight: 600; font-size: 13px; color: var(--brand); }
+.oblig-main { min-width: 0; }
+.oblig-title { font-size: 14px; }
+.oblig-meta { margin-top: 2px; }

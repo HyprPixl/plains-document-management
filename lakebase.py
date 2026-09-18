@@ -881,6 +881,102 @@ def get_document_bundle(doc_id: str) -> dict | None:
     }
 
 
+def passages_for_docs(doc_ids, char_budget: int = 12000) -> list[dict]:
+    """Passage text for a set of docs, page-ordered per doc, capped at a character budget —
+    the retrieval context for the keyword-grounded corpus chat (item O). Joins document_text
+    to documents for the filename each passage cites, then accumulates whole passages until the
+    running character count reaches char_budget (always keeps at least the first). Site scoping
+    is enforced UPSTREAM by search(): only doc_ids the caller can already see are passed here."""
+    _ensure_documents_ready()
+    if not doc_ids:
+        return []
+    rows = pg_query(
+        f"SELECT t.doc_id, t.page, t.text, d.original_filename AS filename "
+        f"FROM {DOCUMENT_TEXT} t JOIN {DOCUMENTS} d ON d.doc_id = t.doc_id "
+        f"WHERE t.doc_id = ANY(%s) ORDER BY t.doc_id, t.page",
+        (list(doc_ids),),
+    )
+    out: list[dict] = []
+    used = 0
+    for r in rows:
+        text = r.get("text") or ""
+        if not text.strip():
+            continue
+        out.append({"doc_id": r["doc_id"], "page": r["page"],
+                    "text": text, "filename": r["filename"]})
+        used += len(text)
+        if used >= char_budget:
+            break
+    return out
+
+
+def link_graph(doc_id: str, max_depth: int = 25) -> dict:
+    """Connected-component relation graph around ``doc_id`` (item L) via a recursive CTE over
+    document_links, traversing BOTH directions (parent→child and child→parent). Cycle-guarded
+    by carrying the visited path array and refusing to revisit a node (so a link cycle can't
+    loop), and depth-bounded by max_depth. Returns {"nodes": [...], "edges": [...]} where nodes
+    carry (doc_id, original_filename, document_type) for every live doc in the component and
+    edges are the raw (parent_doc_id, child_doc_id, relationship) triples among those nodes."""
+    _ensure_documents_ready()
+    reach = pg_query(
+        "WITH RECURSIVE reach(doc_id, path) AS ("
+        "  SELECT %s::text, ARRAY[%s::text] "
+        "  UNION ALL "
+        "  SELECT nb.nb, r.path || nb.nb "
+        "  FROM reach r "
+        "  JOIN LATERAL ("
+        f"      SELECT child_doc_id AS nb FROM {DOCUMENT_LINKS} WHERE parent_doc_id = r.doc_id "
+        "      UNION "
+        f"      SELECT parent_doc_id AS nb FROM {DOCUMENT_LINKS} WHERE child_doc_id = r.doc_id "
+        "  ) nb ON true "
+        "  WHERE NOT (nb.nb = ANY(r.path)) AND array_length(r.path, 1) < %s "
+        ") SELECT DISTINCT doc_id FROM reach",
+        (doc_id, doc_id, max_depth),
+    )
+    node_ids = [r["doc_id"] for r in reach]
+    if doc_id not in node_ids:
+        node_ids.append(doc_id)
+    edges = pg_query(
+        f"SELECT DISTINCT parent_doc_id, child_doc_id, relationship FROM {DOCUMENT_LINKS} "
+        f"WHERE parent_doc_id = ANY(%s) AND child_doc_id = ANY(%s)",
+        (node_ids, node_ids),
+    )
+    nodes = pg_query(
+        f"SELECT doc_id, original_filename, document_type FROM {DOCUMENTS} "
+        f"WHERE doc_id = ANY(%s) AND deleted_at IS NULL",
+        (node_ids,),
+    )
+    return {"nodes": nodes, "edges": edges}
+
+
+def obligations(sites, email, date_keys, document_type: str | None = None) -> list[dict]:
+    """Raw date-field rows for the obligations calendar (item L), site-scoped via _sites_clause.
+    Selects document_fields rows for the given date field_keys with a non-null/non-empty
+    coalesce(confirmed_value, proposed_value), joined to non-deleted, visible documents. Values
+    are returned as their raw strings — the route parses + range-filters them in Python (they're
+    free text, never SQL-cast). Includes sp_web_url / sp_site_name / document_type for the UI."""
+    _ensure_documents_ready()
+    if not date_keys:
+        return []
+    site_clause, site_params = _sites_clause(sites, email, "d.sp_site_id")
+    params: list = [list(date_keys)] + site_params
+    where = ("df.field_key = ANY(%s) "
+             "AND coalesce(df.confirmed_value, df.proposed_value) IS NOT NULL "
+             "AND coalesce(df.confirmed_value, df.proposed_value) <> '' "
+             "AND d.deleted_at IS NULL" + site_clause)
+    if document_type:
+        where += " AND d.document_type = %s"
+        params.append(document_type)
+    return pg_query(
+        f"SELECT d.doc_id, d.original_filename, d.document_type, df.field_key, "
+        f"coalesce(df.confirmed_value, df.proposed_value) AS value, "
+        f"d.sp_web_url, d.sp_site_name "
+        f"FROM {DOCUMENT_FIELDS} df JOIN {DOCUMENTS} d ON d.doc_id = df.doc_id "
+        f"WHERE {where} ORDER BY d.doc_id",
+        params,
+    )
+
+
 def document_head(doc_id: str) -> dict | None:
     """Existence + document_type in one read — the row (with document_type) or None if the
     doc is unknown. Lets callers distinguish 'missing' from 'exists but unclassified' (NULL

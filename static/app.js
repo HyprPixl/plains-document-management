@@ -514,7 +514,7 @@ function wireDrawer() {
 function closeDrawer() {
   closeOverlay($("#drawer"));
   $("#drawer").hidden = true; $("#drawerScrim").hidden = true;
-  const frame = $("#reviewFrame"); frame.src = "about:blank"; frame.dataset.src = "";  // free the viewer
+  const frame = $("#reviewFrame"); frame.removeAttribute("srcdoc"); frame.src = "about:blank"; frame.dataset.src = "";  // free the viewer
   state.currentDoc = null;
   state.classify = null;   // closing mid-walkthrough ends it
 }
@@ -539,18 +539,48 @@ async function openDoc(docId, row, opts = {}) {
     loadPreview(data.document);  // refine with authoritative mime/derived
   } catch (e) { toast("Could not open: " + e.message, true); closeDrawer(); }
 }
-// Load the file into the left-hand viewer. PDFs (incl. the derived searchable PDF) and
-// images render inline; anything else falls back to the View/Download actions. Idempotent:
+// Office docs the server can render to standalone HTML via /api/render.
+const OFFICE_EXTS = [".docx", ".xlsx", ".xlsm"];
+const isOfficeRenderable = (name) => {
+  const n = (name || "").toLowerCase();
+  return OFFICE_EXTS.some((e) => n.endsWith(e));
+};
+// Load the file into the left-hand viewer. PDFs (incl. the derived searchable PDF) and images
+// embed via the download endpoint; Office docs (docx/xlsx/xlsm) fetch server-rendered HTML into
+// the iframe's srcdoc; anything else falls back to the View/Download actions. Idempotent:
 // re-calling with the same target (row → detail refine) won't reload the iframe.
 function loadPreview(d) {
   const frame = $("#reviewFrame"), noprev = $("#reviewNoPrev");
   const mime = (d.mime_type || "").toLowerCase();
   const embeddable = !!d.derived_pdf_path || mime === "application/pdf" || mime.startsWith("image/");
-  const target = embeddable ? `/api/download?doc_id=${d.doc_id}&inline=1` : "";
+  const office = !embeddable && isOfficeRenderable(d.original_filename);
+  // Synthetic dataset keys keep row→detail refines idempotent while still reloading when the
+  // preview mode changes (download-embed ↔ srcdoc-render ↔ none).
+  const target = embeddable ? `dl:${d.doc_id}` : office ? `office:${d.doc_id}` : "";
   if (frame.dataset.src === target) return;
   frame.dataset.src = target;
-  if (embeddable) { frame.hidden = false; noprev.hidden = true; frame.src = target; }
-  else { frame.hidden = true; noprev.hidden = false; frame.src = "about:blank"; }
+  if (embeddable) {
+    frame.hidden = false; noprev.hidden = true;
+    frame.removeAttribute("srcdoc");
+    frame.src = `/api/download?doc_id=${d.doc_id}&inline=1`;
+  } else if (office) {
+    frame.hidden = false; noprev.hidden = true;
+    frame.src = "about:blank";
+    frame.srcdoc = "<!doctype html><body style=\"font:15px system-ui,sans-serif;color:#cbd5e1;" +
+      "background:#3a3f44;display:flex;align-items:center;justify-content:center;height:100vh;" +
+      "margin:0\">Rendering preview…</body>";
+    fetch(`/api/render?doc_id=${d.doc_id}`)
+      .then((r) => { if (!r.ok) throw new Error("render"); return r.text(); })
+      .then((html) => { if (frame.dataset.src === target) frame.srcdoc = html; })
+      .catch(() => {
+        if (frame.dataset.src !== target) return;
+        frame.removeAttribute("srcdoc"); frame.src = "about:blank";
+        frame.hidden = true; noprev.hidden = false;
+      });
+  } else {
+    frame.hidden = true; noprev.hidden = false;
+    frame.removeAttribute("srcdoc"); frame.src = "about:blank";
+  }
 }
 function renderDrawer(data, readOnly = false) {
   const d = data.document;
@@ -559,15 +589,19 @@ function renderDrawer(data, readOnly = false) {
     `${locationOf(d)} · ${d.document_type || "unclassified"}`;
   const body = $("#drawerBody"); body.replaceChildren();
 
-  // The viewer only embeds PDFs, images and the derived searchable PDF. When nothing can be
-  // shown inline, offer the original for download rather than a "View file" that opens blank.
+  // The viewer embeds PDFs, images and the derived searchable PDF directly, and renders Office
+  // docs (docx/xlsx/xlsm) to HTML — all are "viewable". When nothing can be shown inline, offer
+  // the original for download rather than a "View file" that opens blank.
   const mime = (d.mime_type || "").toLowerCase();
   const embeddable = !!d.derived_pdf_path || mime === "application/pdf" || mime.startsWith("image/");
+  const office = !embeddable && isOfficeRenderable(d.original_filename);
+  const viewable = embeddable || office;
+  const viewHref = office ? `/api/render?doc_id=${d.doc_id}` : `/api/download?doc_id=${d.doc_id}&inline=1`;
   const actions = el("div", { class: "field-actions" },
-    embeddable
-      ? el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}&inline=1`, target: "_blank" }, "View file")
+    viewable
+      ? el("a", { class: "btn", href: viewHref, target: "_blank" }, "View file")
       : el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}` }, "Download original"));
-  if (embeddable)  // keep a plain download alongside the inline view; redundant when not embeddable
+  if (viewable)  // keep a plain download alongside the inline view; redundant when not viewable
     actions.append(el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}` }, "Download"));
   if (d.sp_web_url) {
     actions.append(el("a", { class: "btn", href: d.sp_web_url, target: "_blank" }, "Open in SharePoint"));
@@ -585,6 +619,10 @@ function renderDrawer(data, readOnly = false) {
     body.append(tags.length
       ? el("div", { class: "tag-chips" }, ...tags.map((t) => el("span", { class: "tag-chip" }, t)))
       : el("div", { class: "muted small" }, "No tags."));
+    body.append(el("div", { class: "section-label" }, "Related documents"));
+    const treeBox = el("div", { class: "rel-tree" });
+    body.append(treeBox);
+    renderRelationTree(treeBox, d.doc_id, true);
     $("#drawerFoot").replaceChildren();
     return;
   }
@@ -644,26 +682,16 @@ function renderDrawer(data, readOnly = false) {
   }
 
   body.append(el("div", { class: "section-label" }, "Related documents"));
-  const links = el("div", { class: "links-list" });
-  const RELS = { amendment_of: "Amendment of", attachment_of: "Attachment of",
-    supersedes: "Supersedes", related: "Related to" };
-  const relLabel = (r) => RELS[r] || r;
-  const drawLinks = () => {
-    links.replaceChildren();
-    if (!data.links.length) { links.append(el("div", { class: "muted small" }, "No linked documents.")); return; }
-    data.links.forEach((l) => links.append(el("div", { class: "link-item" },
-      el("span", { class: "link-rel" }, relLabel(l.relationship) + ": "),
-      `${l.original_filename} (${l.document_type || "—"})`)));
-  };
-  drawLinks();
-  body.append(links);
+  const treeBox = el("div", { class: "rel-tree" });
+  body.append(treeBox);
+  renderRelationTree(treeBox, d.doc_id, false);
   const needsParent = () => d.document_type === "Amendment" &&
     !data.links.some((l) => l.relationship === "amendment_of");
   const warn = el("div", { class: "prov", style: "color:var(--warn)" },
     "Amendments must be linked to a parent contract before they can be verified.");
   warn.hidden = !needsParent();
   body.append(renderLinkAdder(d.doc_id, d.document_type, (newLink) => {
-    data.links.push(newLink); drawLinks(); warn.hidden = !needsParent();
+    data.links.push(newLink); renderRelationTree(treeBox, d.doc_id, false); warn.hidden = !needsParent();
   }));
   body.append(warn);
 
@@ -865,6 +893,61 @@ function renderLinkAdder(docId, dtype, onLinked) {
   wrap.append(el("div", { class: "link-adder-row" }, rel, search), results);
   return wrap;
 }
+// Fetch the relation graph for a doc and render it as an indented tree rooted at that doc.
+// Each edge is labelled with its relationship and direction; non-root nodes open in the drawer
+// (preserving read-only mode when called from Explore). A lone root → "no related" empty state.
+async function renderRelationTree(container, docId, readOnly) {
+  container.replaceChildren(el("div", { class: "muted small" }, "Loading related documents…"));
+  let tree;
+  try { tree = await api(`/api/documents/${docId}/tree`); }
+  catch { container.replaceChildren(el("div", { class: "muted small" }, "Could not load related documents.")); return; }
+  const nodes = new Map((tree.nodes || []).map((n) => [n.doc_id, n]));
+  const edges = tree.edges || [];
+  if (!edges.length) { container.replaceChildren(el("div", { class: "muted small" }, "No related documents.")); return; }
+  // Relationship phrasing depends on which way we're traversing the edge. FWD = label seen from
+  // the parent looking at the child; REV = label seen from the child looking at the parent.
+  const FWD = { amendment_of: "Amended by", attachment_of: "Has attachment",
+    supersedes: "Supersedes", related: "Related to" };
+  const REV = { amendment_of: "Amendment of", attachment_of: "Attachment of",
+    supersedes: "Superseded by", related: "Related to" };
+  const adj = new Map();
+  const push = (from, other, label) => { (adj.get(from) || adj.set(from, []).get(from)).push({ other, label }); };
+  edges.forEach((e) => {
+    push(e.parent_doc_id, e.child_doc_id, FWD[e.relationship] || e.relationship);
+    push(e.child_doc_id, e.parent_doc_id, REV[e.relationship] || e.relationship);
+  });
+  const root = tree.root != null ? tree.root : docId;
+  const seen = new Set([root]);
+  const childrenOf = (id) => {
+    const out = [];
+    for (const { other, label } of (adj.get(id) || [])) {
+      if (seen.has(other)) continue;
+      seen.add(other); out.push({ id: other, label });
+    }
+    return out;
+  };
+  const renderNode = (id, edgeLabel) => {
+    const n = nodes.get(id) || { doc_id: id, original_filename: id };
+    const isRoot = id === root;
+    const label = el(
+      isRoot ? "div" : "button",
+      isRoot ? { class: "rel-self" }
+             : { class: "rel-link", type: "button",
+                 onclick: () => openDoc(id, { original_filename: n.original_filename, document_type: n.document_type }, { readOnly }) },
+      edgeLabel ? el("span", { class: "rel-edge" }, edgeLabel + ": ") : null,
+      el("span", { class: "rel-name" }, n.original_filename || id),
+      n.document_type ? el("span", { class: "rel-type muted small" }, " (" + n.document_type + ")") : null);
+    const nodeEl = el("div", { class: "rel-node" }, label);
+    const kids = childrenOf(id);
+    if (kids.length) {
+      const wrap = el("div", { class: "rel-children" });
+      kids.forEach((k) => wrap.append(renderNode(k.id, k.label)));
+      nodeEl.append(wrap);
+    }
+    return nodeEl;
+  };
+  container.replaceChildren(renderNode(root, null));
+}
 // Only the fields whose value changed from what we rendered — so saving one field doesn't
 // mark the rest as human-edited (verify accepts unedited AI proposals server-side).
 function collectFieldValues() {
@@ -901,13 +984,28 @@ async function setVerify(on) {
 // ─────────────────────────────────────────────── EXPLORE ──
 // limit/offset drive "Load more"; selected mirrors Manage's state.selected (prep for the
 // plains-nexus hand-off). Read-only discovery for everyone — the drawer opens read-only.
-const exploreState = { limit: 50, offset: 0, total: 0, selected: new Set() };
+const exploreState = { limit: 50, offset: 0, total: 0, selected: new Set(), tab: "search" };
 
 async function loadExploreFilters() {
   fillSelectKeep($("#filterType"), "document_type", "All types");
   fillSelectKeep($("#filterDept"), "department", "All departments");
+  fillSelectKeep($("#obligType"), "document_type", "All types");
   await loadTagFilter();
-  if (!$("#searchResults").children.length) runSearch();
+  if (exploreState.tab === "search" && !$("#searchResults").children.length) runSearch();
+}
+// Explore has three sub-tabs: Search (default), Chat, Obligations. Only one panel shows at once.
+function setExploreTab(name) {
+  exploreState.tab = name;
+  $$(".etab").forEach((b) => {
+    const on = b.dataset.exploreTab === name;
+    b.classList.toggle("active", on); b.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  $("#explore-search").hidden = name !== "search";
+  $("#explore-chat").hidden = name !== "chat";
+  $("#explore-obligations").hidden = name !== "obligations";
+  if (name === "search" && !$("#searchResults").children.length) runSearch();
+  else if (name === "chat") $("#chatInput").focus();
+  else if (name === "obligations") loadObligations();
 }
 async function loadTagFilter() {
   const sel = $("#filterTag"), cur = sel.value;
@@ -936,6 +1034,12 @@ function wireExplore() {
   $("#filterPath").addEventListener("input", debounced);
   $("#sortSel").addEventListener("change", debounced);
   $("#loadMoreBtn").addEventListener("click", () => runSearch(true));
+  $$(".etab").forEach((b) => b.addEventListener("click", () => setExploreTab(b.dataset.exploreTab)));
+  wireChat();
+  const obligDebounced = debounce(loadObligations, 300);
+  $("#obligFrom").addEventListener("change", obligDebounced);
+  $("#obligTo").addEventListener("change", obligDebounced);
+  $("#obligType").addEventListener("change", obligDebounced);
 }
 function searchParams() {
   const params = new URLSearchParams();
@@ -1001,6 +1105,183 @@ function updateExploreBulkBar() {
   $("#exploreBulkBar").hidden = n === 0;
   $("#exploreBulkCount").textContent = `${n} selected`;
   // "Open in plains-nexus" stays disabled until the hand-off contract lands (separate item).
+}
+
+// ─────────────────────────────────────────────── EXPLORE · CHAT ──
+// Corpus chat over SSE. Client keeps a {role,content} history for multi-turn; each POST sends
+// the new question plus the prior turns. The stream frames are: default (a JSON token string to
+// append), `event: citations` (chips), `event: done`, `event: error`.
+const chatState = { history: [], streaming: false };
+
+function wireChat() {
+  $("#chatSend").addEventListener("click", sendChat);
+  $("#chatInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
+  });
+}
+function chatBubble(role, text) {
+  const empty = $("#chatMessages .chat-empty");
+  if (empty) empty.remove();
+  const bubble = el("div", { class: "chat-bubble" }, text || "");
+  const msg = el("div", { class: "chat-msg " + role }, bubble);
+  $("#chatMessages").append(msg);
+  scrollChat();
+  return msg;
+}
+function scrollChat() { const m = $("#chatMessages"); m.scrollTop = m.scrollHeight; }
+function renderCitations(msg, cites) {
+  if (!cites || !cites.length) return;
+  let box = msg.querySelector(".chat-citations");
+  if (!box) { box = el("div", { class: "chat-citations" }); msg.append(box); }
+  box.replaceChildren(...cites.map((c) =>
+    el("button", { class: "cite-chip", type: "button",
+      onclick: () => openDoc(c.doc_id, {}, { readOnly: true }) },
+      (c.filename || "document") + (c.page != null ? " p." + c.page : ""))));
+  scrollChat();
+}
+// Parse one SSE frame ("event:"/"data:" lines) and act on it. Returns a small result object so
+// the reader loop can accumulate the assistant text and know when the stream is finished.
+function handleChatFrame(frame, bubble, msg) {
+  let event = "message";
+  const dataLines = [];
+  for (const line of frame.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+  }
+  const data = dataLines.join("\n");
+  if (event === "done") return { done: true };
+  if (event === "error") {
+    if (!bubble.textContent) { bubble.textContent = "Chat error."; bubble.classList.add("chat-err"); }
+    toast("Chat is unavailable", true);
+    return { done: true, error: true };
+  }
+  if (event === "citations") {
+    try { renderCitations(msg, JSON.parse(data)); } catch {}
+    return {};
+  }
+  try {
+    const token = JSON.parse(data);
+    if (typeof token === "string") { bubble.textContent += token; scrollChat(); return { token }; }
+  } catch {}
+  return {};
+}
+async function sendChat() {
+  if (chatState.streaming) return;
+  const input = $("#chatInput"), sendBtn = $("#chatSend");
+  const q = input.value.trim();
+  if (!q) return;
+  input.value = "";
+  chatBubble("user", q);
+  const prior = chatState.history.slice();   // turns before this question
+  chatState.history.push({ role: "user", content: q });
+  const msg = chatBubble("assistant", "");
+  const bubble = msg.querySelector(".chat-bubble");
+  bubble.classList.add("streaming");
+  chatState.streaming = true; sendBtn.disabled = true; input.disabled = true;
+  let answer = "";
+  const finish = () => {
+    chatState.streaming = false; sendBtn.disabled = false; input.disabled = false;
+    bubble.classList.remove("streaming"); input.focus();
+  };
+  try {
+    const resp = await fetch("/api/chat", { method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ question: q, history: prior }) });
+    if (!resp.ok || !resp.body) {
+      // 503 chat_unavailable comes back as JSON, not a stream.
+      bubble.textContent = resp.status === 503 ? "Chat is unavailable." : "Something went wrong.";
+      bubble.classList.add("chat-err");
+      toast("Chat is unavailable", true);
+      chatState.history.pop();   // drop the unanswered turn
+      finish(); return;
+    }
+    const reader = resp.body.getReader(), decoder = new TextDecoder();
+    let buffer = "", stop = false;
+    while (!stop) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, idx); buffer = buffer.slice(idx + 2);
+        if (!frame.trim()) continue;
+        const r = handleChatFrame(frame, bubble, msg);
+        if (r.token) answer += r.token;
+        if (r.done) stop = true;
+      }
+    }
+    if (answer) chatState.history.push({ role: "assistant", content: answer });
+    else chatState.history.pop();   // no answer produced — don't leave a dangling user turn
+  } catch (e) {
+    if (!bubble.textContent) { bubble.textContent = "Chat failed."; bubble.classList.add("chat-err"); }
+    toast("Chat is unavailable", true);
+    chatState.history.pop();
+  } finally { finish(); }
+}
+
+// ─────────────────────────────────────────────── EXPLORE · OBLIGATIONS ──
+// Read-only calendar of dated obligations (expirations, renewals…) grouped by month. Backend
+// returns rows sorted by date asc; default range is today..+1yr.
+const pad2 = (n) => String(n).padStart(2, "0");
+const ymd = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+function initObligDates() {
+  const from = $("#obligFrom"), to = $("#obligTo");
+  if (!from.value) from.value = ymd(new Date());
+  if (!to.value) { const d = new Date(); d.setFullYear(d.getFullYear() + 1); to.value = ymd(d); }
+}
+function fmtObligDate(s) {
+  const d = new Date(s + "T00:00:00");
+  return isNaN(d) ? (s || "—") : d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+function obligMonth(s) {
+  const d = new Date(s + "T00:00:00");
+  return isNaN(d) ? "Undated" : d.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+function obligRow(r) {
+  const open = () => openDoc(r.doc_id, { original_filename: r.original_filename,
+    document_type: r.document_type, sp_web_url: r.sp_web_url, sp_site_name: r.sp_site_name },
+    { readOnly: true });
+  return el("div", { class: "oblig-item", role: "button", tabindex: "0",
+      onclick: open, onkeydown: activate(open) },
+    el("div", { class: "oblig-date" }, fmtObligDate(r.date)),
+    el("div", { class: "oblig-main" },
+      el("div", { class: "oblig-title doc-name" }, r.original_filename || "(unnamed)"),
+      el("div", { class: "oblig-meta muted small" },
+        [r.field_label, r.document_type].filter(Boolean).join(" · ") || "—")));
+}
+async function loadObligations() {
+  initObligDates();
+  const list = $("#obligList");
+  list.replaceChildren(el("div", { class: "muted small" }, "Loading obligations…"));
+  const params = new URLSearchParams();
+  if ($("#obligFrom").value) params.set("from", $("#obligFrom").value);
+  if ($("#obligTo").value) params.set("to", $("#obligTo").value);
+  if ($("#obligType").value) params.set("document_type", $("#obligType").value);
+  let rows;
+  try { rows = await api("/api/obligations?" + params); }
+  catch (e) {
+    $("#obligCount").textContent = "";
+    list.replaceChildren(el("div", { class: "empty" },
+      "Could not load obligations. ", el("button", { class: "link-btn", onclick: loadObligations }, "Retry")));
+    return;
+  }
+  rows = rows || [];
+  $("#obligCount").textContent = `${rows.length} upcoming`;
+  if (!rows.length) {
+    list.replaceChildren(el("div", { class: "empty" }, "No upcoming obligations in this range."));
+    return;
+  }
+  list.replaceChildren();
+  let curMonth = null, section = null;
+  rows.forEach((r) => {
+    const m = obligMonth(r.date);
+    if (m !== curMonth) {
+      curMonth = m;
+      section = el("div", { class: "oblig-month" }, el("h3", { class: "oblig-month-head" }, m));
+      list.append(section);
+    }
+    section.append(obligRow(r));
+  });
 }
 
 // ─────────────────────────────────────────────── SHAREPOINT ──

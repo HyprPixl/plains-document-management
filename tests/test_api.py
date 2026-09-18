@@ -460,3 +460,172 @@ def test_httpexception_returns_friendly_json(client):
     assert body["error"] == "not_found"
     assert "detail" in body
     assert "Traceback" not in r.get_data(as_text=True)
+
+
+# ── item E: Office render endpoint ────────────────────────────────────────────
+DOCS = __import__("config").DOCUMENTS
+
+
+def test_render_unsupported_ext_returns_415(client, fake_db):
+    # Warehouse mode (no PGHOST in tests): the doc row is looked up, visibility passes (FULL),
+    # then a non-Office extension short-circuits to 415 before any volume read.
+    fake_db.responder = route([
+        (PERMS, FULL),
+        ("FROM " + DOCS, [{"volume_path": "/v/x.txt", "content_sha256": "sha1",
+                           "original_filename": "notes.txt", "sp_site_id": None,
+                           "created_by": "caleb.fedyshen@plains.com"}]),
+    ], default=[])
+    r = client.get("/api/render?doc_id=d1")
+    assert r.status_code == 415
+    assert r.get_json() == {"error": "unsupported"}
+
+
+def test_render_not_found_returns_404(client, fake_db):
+    fake_db.responder = route([(PERMS, FULL), ("FROM " + DOCS, [])], default=[])
+    r = client.get("/api/render?doc_id=missing")
+    assert r.status_code == 404
+
+
+def test_render_forbidden_when_outside_sites(client, fake_db):
+    # READ on site-A only; the doc lives on site-Z → not visible → 403 (never renders).
+    fake_db.responder = route([
+        (PERMS, SITE_A),
+        ("FROM " + DOCS, [{"volume_path": "/v/x.docx", "content_sha256": "sha1",
+                           "original_filename": "x.docx", "sp_site_id": "site-Z",
+                           "created_by": "someone@else.com"}]),
+    ], default=[])
+    r = client.get("/api/render?doc_id=d1")
+    assert r.status_code == 403
+
+
+# ── item O: keyword-grounded corpus chat (SSE) ────────────────────────────────
+class _FakeStreamClient:
+    """Minimal stand-in for the OpenAI client: yields two content deltas."""
+    def __init__(self, tokens):
+        self._tokens = tokens
+
+    class _Delta:
+        def __init__(self, c): self.content = c
+
+    class _Choice:
+        def __init__(self, c): self._c = c
+        @property
+        def delta(self): return _FakeStreamClient._Delta(self._c)
+
+    class _Chunk:
+        def __init__(self, c): self.choices = [_FakeStreamClient._Choice(c)]
+
+    @property
+    def chat(self):
+        outer = self
+
+        class _Completions:
+            def create(self, **kwargs):
+                outer.last_kwargs = kwargs
+                return [_FakeStreamClient._Chunk(t) for t in outer._tokens]
+
+        class _Chat:
+            completions = _Completions()
+        return _Chat()
+
+
+def test_chat_unavailable_returns_503(client, fake_db, monkeypatch):
+    import app as app_module
+    monkeypatch.setattr(app_module, "_get_serving_client", lambda force_rebuild=False: None)
+    r = client.post("/api/chat", json={"question": "hello?"})
+    assert r.status_code == 503
+    assert r.get_json() == {"error": "chat_unavailable"}
+
+
+def test_chat_streams_site_scoped_passages_and_citations(client, fake_db, monkeypatch):
+    import app as app_module
+    fake_db.responder = route([(PERMS, SITE_A)], default=[])
+    monkeypatch.setattr(app_module.lakebase, "docs_enabled", lambda: True)
+    captured = {}
+
+    def _search(sites, email, q, limit=8):
+        captured.update(sites=sites, q=q, limit=limit)
+        return ([{"doc_id": "d1"}], 1)
+
+    monkeypatch.setattr(app_module.lakebase, "search", _search)
+    monkeypatch.setattr(app_module.lakebase, "passages_for_docs",
+                        lambda ids, char_budget=12000: [
+                            {"doc_id": "d1", "page": 3, "text": "the term is 5 years",
+                             "filename": "lease.pdf"}])
+    fake = _FakeStreamClient(["The term ", "is 5 years [lease.pdf p.3]"])
+    monkeypatch.setattr(app_module, "_get_serving_client", lambda force_rebuild=False: fake)
+
+    r = client.post("/api/chat", json={"question": "what is the term?", "history": []})
+    assert r.status_code == 200
+    text = r.get_data(as_text=True)
+    assert 'data: "The term "' in text
+    assert "event: citations" in text
+    assert '"filename": "lease.pdf"' in text and '"page": 3' in text
+    assert "event: done" in text
+    # retrieval was site-scoped: READ on site-A → perms_sites == ["site-A"], limit pinned to 8
+    assert captured["sites"] == ["site-A"] and captured["limit"] == 8
+
+
+# ── item L: relation tree + obligations calendar routes ───────────────────────
+def test_tree_forbidden_when_root_not_visible(client, fake_db, monkeypatch):
+    import app as app_module
+    fake_db.responder = route([(PERMS, SITE_A)], default=[])
+    monkeypatch.setattr(app_module.lakebase, "docs_enabled", lambda: True)
+    monkeypatch.setattr(app_module.lakebase, "get_document",
+                        lambda doc_id: {"doc_id": doc_id, "sp_site_id": "site-Z",
+                                        "created_by": "x@y.com"})
+    r = client.get("/api/documents/d1/tree")
+    assert r.status_code == 403
+
+
+def test_tree_returns_graph_when_visible(client, fake_db, monkeypatch):
+    import app as app_module
+    fake_db.responder = route([(PERMS, FULL)], default=[])
+    monkeypatch.setattr(app_module.lakebase, "docs_enabled", lambda: True)
+    monkeypatch.setattr(app_module.lakebase, "get_document",
+                        lambda doc_id: {"doc_id": doc_id, "sp_site_id": None, "created_by": None})
+    monkeypatch.setattr(app_module.lakebase, "link_graph", lambda doc_id: {
+        "nodes": [{"doc_id": "d1", "original_filename": "a", "document_type": "X"}],
+        "edges": [{"parent_doc_id": "d1", "child_doc_id": "d2", "relationship": "amendment_of"}]})
+    r = client.get("/api/documents/d1/tree")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["root"] == "d1"
+    assert body["nodes"][0]["doc_id"] == "d1"
+    assert body["edges"][0]["relationship"] == "amendment_of"
+
+
+def test_obligations_parses_and_filters_by_range(client, fake_db, monkeypatch):
+    import app as app_module
+    fake_db.responder = route([
+        (PERMS, FULL),
+        ("data_type='date'", [{"field_key": "expiry_date", "label": "Expiry Date"}]),
+    ], default=[])
+    monkeypatch.setattr(app_module.lakebase, "docs_enabled", lambda: True)
+    rows = [
+        {"doc_id": "d1", "original_filename": "a.pdf", "document_type": "Contract",
+         "field_key": "expiry_date", "value": "2026-10-01",
+         "sp_web_url": "http://a", "sp_site_name": "S"},
+        {"doc_id": "d2", "original_filename": "b.pdf", "document_type": "Contract",
+         "field_key": "expiry_date", "value": "2099-01-01",  # outside the [from,to] window
+         "sp_web_url": None, "sp_site_name": None},
+        {"doc_id": "d3", "original_filename": "c.pdf", "document_type": "Contract",
+         "field_key": "expiry_date", "value": "not a date",  # unparseable → skipped
+         "sp_web_url": None, "sp_site_name": None},
+    ]
+    monkeypatch.setattr(app_module.lakebase, "obligations", lambda *a, **k: rows)
+    r = client.get("/api/obligations?from=2026-01-01&to=2026-12-31")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert [x["doc_id"] for x in body] == ["d1"]         # only the in-range, parseable row
+    assert body[0]["field_label"] == "Expiry Date"
+    assert body[0]["date"] == "2026-10-01"
+
+
+def test_obligations_empty_when_no_date_fields(client, fake_db, monkeypatch):
+    import app as app_module
+    fake_db.responder = route([(PERMS, FULL), ("data_type='date'", [])], default=[])
+    monkeypatch.setattr(app_module.lakebase, "docs_enabled", lambda: True)
+    r = client.get("/api/obligations")
+    assert r.status_code == 200
+    assert r.get_json() == []

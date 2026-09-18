@@ -133,29 +133,63 @@
         <h1>Explore</h1>
         <p class="muted">Search verified documents by content, title, or category.</p>
       </div>
-      <div class="search-bar">
-        <input type="search" id="searchInput" placeholder="Search content, title, or path…">
-        <select id="filterType"><option value="">All types</option></select>
-        <select id="filterDept"><option value="">All departments</option></select>
-        <select id="filterTag"><option value="">All tags</option></select>
-        <input type="search" id="filterPath" class="filter-path" placeholder="Path contains…">
-        <select id="sortSel" aria-label="Sort results">
-          <option value="newest">Newest</option>
-          <option value="oldest">Oldest</option>
-          <option value="title">Title</option>
-          <option value="type">Type</option>
-        </select>
-        <button class="btn primary" id="searchBtn">Search</button>
+
+      <nav class="explore-tabs" role="tablist">
+        <button class="etab active" data-explore-tab="search" role="tab" aria-selected="true">Search</button>
+        <button class="etab" data-explore-tab="chat" role="tab" aria-selected="false">Chat</button>
+        <button class="etab" data-explore-tab="obligations" role="tab" aria-selected="false">Obligations</button>
+      </nav>
+
+      <!-- Search sub-tab -->
+      <div id="explore-search" class="explore-tab-panel">
+        <div class="search-bar">
+          <input type="search" id="searchInput" placeholder="Search content, title, or path…">
+          <select id="filterType"><option value="">All types</option></select>
+          <select id="filterDept"><option value="">All departments</option></select>
+          <select id="filterTag"><option value="">All tags</option></select>
+          <input type="search" id="filterPath" class="filter-path" placeholder="Path contains…">
+          <select id="sortSel" aria-label="Sort results">
+            <option value="newest">Newest</option>
+            <option value="oldest">Oldest</option>
+            <option value="title">Title</option>
+            <option value="type">Type</option>
+          </select>
+          <button class="btn primary" id="searchBtn">Search</button>
+        </div>
+        <div class="explore-head-row">
+          <div id="searchCount" class="muted small"></div>
+          <div class="bulk-bar" id="exploreBulkBar" hidden>
+            <span id="exploreBulkCount">0 selected</span>
+            <button class="btn" id="exploreNexusBtn" disabled title="Coming soon">Open in plains-nexus</button>
+          </div>
+        </div>
+        <div id="searchResults" class="result-grid"></div>
+        <div class="load-more-wrap"><button class="btn" id="loadMoreBtn" hidden>Load more</button></div>
       </div>
-      <div class="explore-head-row">
-        <div id="searchCount" class="muted small"></div>
-        <div class="bulk-bar" id="exploreBulkBar" hidden>
-          <span id="exploreBulkCount">0 selected</span>
-          <button class="btn" id="exploreNexusBtn" disabled title="Coming soon">Open in plains-nexus</button>
+
+      <!-- Chat sub-tab -->
+      <div id="explore-chat" class="explore-tab-panel" hidden>
+        <div class="chat-panel">
+          <div class="chat-messages" id="chatMessages">
+            <div class="chat-empty muted small">Ask a question about your documents — answers cite the source files.</div>
+          </div>
+          <div class="chat-input-row">
+            <input type="text" id="chatInput" placeholder="Ask a question about your documents…" autocomplete="off">
+            <button class="btn primary" id="chatSend">Send</button>
+          </div>
         </div>
       </div>
-      <div id="searchResults" class="result-grid"></div>
-      <div class="load-more-wrap"><button class="btn" id="loadMoreBtn" hidden>Load more</button></div>
+
+      <!-- Obligations sub-tab -->
+      <div id="explore-obligations" class="explore-tab-panel" hidden>
+        <div class="oblig-controls">
+          <label class="oblig-date-field">From <input type="date" id="obligFrom"></label>
+          <label class="oblig-date-field">To <input type="date" id="obligTo"></label>
+          <select id="obligType" aria-label="Filter by document type"><option value="">All types</option></select>
+          <span id="obligCount" class="muted small"></span>
+        </div>
+        <div id="obligList" class="oblig-list"></div>
+      </div>
     </section>
   </main>
 

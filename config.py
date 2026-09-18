@@ -43,6 +43,11 @@ USE_LAKEBASE_DOCUMENTS = _env_bool("USE_LAKEBASE_DOCUMENTS", default=False)
 EXTRACT_MODEL = os.getenv("EXTRACT_MODEL", "databricks-claude-sonnet-4-5")
 PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v1")
 
+# Keyword-grounded corpus chat (item O): the Databricks serving endpoint the /api/chat
+# route calls through the OpenAI-compatible client. Unlike ai_query's batch model, the
+# serving path supports the newer sonnet endpoints.
+CHAT_MODEL = os.getenv("CHAT_MODEL", "databricks-claude-sonnet-4-6")
+
 # Processing job / external services (used by processing/*, not the web app)
 DI_ENDPOINT = os.getenv("DI_ENDPOINT", "https://westus2.api.cognitive.microsoft.com/")
 DI_SECRET_SCOPE = os.getenv("DI_SECRET_SCOPE", "pna-wu2-dm-dev-data-keyv")

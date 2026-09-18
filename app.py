@@ -9,10 +9,13 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import traceback
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
 
 from flask import Flask, Response, g, jsonify, request, send_file, render_template
 from werkzeug.exceptions import HTTPException
@@ -193,6 +196,20 @@ def perms_sites(email: str):
     (possibly empty → see nothing) — the same three-way scope perms_where() encodes."""
     _is_admin, is_full, allowed = get_perms(email)
     return None if is_full else allowed
+
+
+def _doc_visibility(d: dict, email: str) -> bool:
+    """Whether the caller may see a single doc row under site scope — the row-level equivalent
+    of perms_where / _sites_clause, for the by-doc-id endpoints (render, tree). FULL/ADMIN see
+    all; otherwise the doc's sp_site_id must be in the caller's allowed sites, OR it's their own
+    NULL-site upload (sp_site_id IS NULL AND created_by = them)."""
+    sites = perms_sites(email)
+    if sites is None:  # FULL / ADMIN — unrestricted
+        return True
+    site = d.get("sp_site_id")
+    if site is None:
+        return (d.get("created_by") or "").lower() == (email or "").lower()
+    return site in sites
 
 
 # ─────────────────────────────────────────────────────────────────────── pages ──
@@ -887,6 +904,408 @@ def api_download():
         as_attachment=not inline,
         download_name=d.get("original_filename") or "document",
     )
+
+
+# ──────────────────────────────────────── Office render (multi-filetype viewer) ──
+# Item E: render Office docs (docx / xlsx) to standalone HTML so the viewer can show them
+# inline. Content-addressed by the file's sha256: identical bytes render once, cached in a
+# volume sidecar that survives across the 4 gunicorn workers and restarts. A tiny per-worker
+# LRU sits on top so a hot doc doesn't re-read the sidecar every request.
+
+_RENDER_MEM: "OrderedDict[str, str]" = OrderedDict()
+_RENDER_MEM_MAX = 32
+_RENDER_MEM_LOCK = threading.Lock()
+
+_HTML_HEAD = (
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    "<style>"
+    "body{max-width:900px;margin:2rem auto;padding:0 1.25rem;line-height:1.55;color:#1a1a1a;"
+    "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;}"
+    "table{border-collapse:collapse;margin:1rem 0;max-width:100%;}"
+    "td,th{border:1px solid #cbd0d6;padding:4px 8px;vertical-align:top;}"
+    "th{background:#f4f6f8;}img{max-width:100%;height:auto;}"
+    "h1,h2,h3{line-height:1.25;}"
+    ".xl-tabs{margin:0 0 1rem;border-bottom:1px solid #cbd0d6;}"
+    ".xl-tab{background:none;border:0;padding:.5rem .9rem;cursor:pointer;font:inherit;"
+    "border-bottom:2px solid transparent;color:#556;}"
+    ".xl-tab.active{border-bottom-color:#2563eb;color:#111;font-weight:600;}"
+    "</style></head><body>"
+)
+_HTML_TAIL = "</body></html>"
+
+
+def _html_shell(body: str) -> str:
+    return _HTML_HEAD + body + _HTML_TAIL
+
+
+def _render_mem_get(key):
+    with _RENDER_MEM_LOCK:
+        html = _RENDER_MEM.get(key)
+        if html is not None:
+            _RENDER_MEM.move_to_end(key)
+        return html
+
+
+def _render_mem_put(key, html):
+    with _RENDER_MEM_LOCK:
+        _RENDER_MEM[key] = html
+        _RENDER_MEM.move_to_end(key)
+        while len(_RENDER_MEM) > _RENDER_MEM_MAX:
+            _RENDER_MEM.popitem(last=False)
+
+
+def _render_sidecar_read(path: str):
+    """Read the cached HTML sidecar from the volume, or None if it's absent/unreadable."""
+    try:
+        return _w.files.download(path).contents.read().decode("utf-8")
+    except Exception:
+        return None
+
+
+def _render_sidecar_write(path: str, html: str):
+    """Best-effort write-through of the rendered HTML sidecar. Never raises into the request —
+    a failed cache write just means the next request re-renders."""
+    try:
+        _w.files.upload(path, io.BytesIO(html.encode("utf-8")), overwrite=True)
+    except Exception as exc:
+        app.logger.warning(f"render cache write skipped ({exc!r}) — {_req_ctx()}")
+
+
+def _render_docx(raw: bytes) -> str:
+    import mammoth
+    body = mammoth.convert_to_html(io.BytesIO(raw)).value
+    return _html_shell(body)
+
+
+def _render_xlsx(raw: bytes, sheet_arg=None) -> str:
+    """Render every sheet of a workbook into one tabbed HTML page (buttons show/hide each
+    sheet div). ``sheet_arg`` (from &sheet=) may pre-select a tab."""
+    import openpyxl
+    from xlsx2html import xlsx2html
+    wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True)
+    names = list(wb.sheetnames)
+    wb.close()
+    try:
+        pre = int(sheet_arg) if sheet_arg is not None else 0
+    except (TypeError, ValueError):
+        pre = 0
+    if pre < 0 or pre >= len(names):
+        pre = 0
+    tabs, panels = [], []
+    for idx, name in enumerate(names):
+        out = io.StringIO()
+        try:
+            xlsx2html(io.BytesIO(raw), out, sheet=idx)
+            table = out.getvalue()
+        except Exception as exc:
+            table = f"<p>Could not render sheet: {exc}</p>"
+        active = " active" if idx == pre else ""
+        hidden = "" if idx == pre else " style=\"display:none\""
+        safe = (name or f"Sheet {idx + 1}").replace("<", "&lt;").replace(">", "&gt;")
+        tabs.append(f'<button class="xl-tab{active}" onclick="xlShow({idx})">{safe}</button>')
+        panels.append(f'<div class="xl-sheet" id="xl-sheet-{idx}"{hidden}>{table}</div>')
+    js = (
+        "<script>function xlShow(i){"
+        "document.querySelectorAll('.xl-sheet').forEach(function(d,j){"
+        "d.style.display=(j===i)?'':'none';});"
+        "document.querySelectorAll('.xl-tab').forEach(function(b,j){"
+        "b.classList.toggle('active',j===i);});}</script>"
+    )
+    body = f'<div class="xl-tabs">{"".join(tabs)}</div>{"".join(panels)}{js}'
+    return _html_shell(body)
+
+
+@app.get("/api/render")
+def api_render():
+    """Render a docx / xlsx doc to standalone HTML for the inline viewer. Auth + site-scope
+    like /api/download; content-addressed sidecar cache in the volume (read-through)."""
+    email = current_user()
+    doc_id = request.args.get("doc_id")
+    if lakebase.docs_enabled():
+        d = lakebase.get_document(doc_id)
+    else:
+        docs = query(
+            f"SELECT volume_path, content_sha256, original_filename, sp_site_id, created_by "
+            f"FROM {config.DOCUMENTS} WHERE doc_id = {lit(doc_id)}")
+        d = docs[0] if docs else None
+    if not d:
+        return jsonify(error="not found"), 404
+    if not _doc_visibility(d, email):
+        return jsonify(error="forbidden"), 403
+    ext = os.path.splitext(d.get("original_filename") or "")[1].lower()
+    if ext == ".docx":
+        kind = "docx"
+    elif ext in (".xlsx", ".xlsm"):
+        kind = "xlsx"
+    else:
+        return jsonify(error="unsupported"), 415
+    sha = d.get("content_sha256") or ""
+    sheet_arg = request.args.get("sheet")
+    # The sidecar (and the mem LRU) are content-addressed, so they hold the full workbook (all
+    # sheets); &sheet= only changes which tab is pre-selected client-side, so it's safe to serve
+    # the cached all-sheets page and let the JS default to tab 0 — good enough for the contract.
+    cache_key = f"{sha}.{kind}"
+    cache_path = f"{config.DOCS_VOLUME}/_render_cache/{sha}.{kind}.html"
+    html = _render_mem_get(cache_key)
+    if html is None:
+        html = _render_sidecar_read(cache_path)
+        if html is not None:
+            _render_mem_put(cache_key, html)
+    if html is None:
+        raw = _w.files.download(d["volume_path"]).contents.read()
+        html = _render_docx(raw) if kind == "docx" else _render_xlsx(raw, sheet_arg)
+        _render_sidecar_write(cache_path, html)
+        _render_mem_put(cache_key, html)
+    return Response(html, mimetype="text/html")
+
+
+# ─────────────────────────────────────── keyword-grounded corpus chat (SSE) ──
+# Item O: retrieval-augmented chat over the corpus. Retrieval reuses search()'s site scoping
+# (so a user can never be answered from a doc outside their sites); the model is a Databricks
+# serving endpoint reached through the OpenAI-compatible client, exactly as contract-explorer
+# does. Answers stream back over Server-Sent Events with a trailing citations event.
+
+_CHAT_CLIENT = {"client": None, "expires_at": 0.0}
+_CHAT_CLIENT_LOCK = threading.Lock()
+
+
+def _get_serving_client(force_rebuild: bool = False):
+    """Build (and ~50-min cache) an OpenAI client pointed at the workspace serving endpoints,
+    authed with a freshly minted Databricks token. Returns None when serving isn't configured
+    (no host, or the openai package / SDK auth is unavailable) so the route can 503 cleanly."""
+    now = time.monotonic()
+    with _CHAT_CLIENT_LOCK:
+        if (not force_rebuild and _CHAT_CLIENT["client"] is not None
+                and now < _CHAT_CLIENT["expires_at"]):
+            return _CHAT_CLIENT["client"]
+        try:
+            from openai import OpenAI
+            auth = _w.config.authenticate()
+            token = (auth or {}).get("Authorization", "").removeprefix("Bearer ")
+            host = (_w.config.host or "").rstrip("/")
+            if not host or not token:
+                return None
+            client = OpenAI(api_key=token, base_url=host + "/serving-endpoints")
+        except Exception as exc:
+            app.logger.warning(f"serving client unavailable ({exc!r})")
+            return None
+        _CHAT_CLIENT["client"] = client
+        _CHAT_CLIENT["expires_at"] = now + 50 * 60
+        return client
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return (exc.__class__.__name__ in ("AuthenticationError", "PermissionDeniedError")
+            or "401" in s or "unauthorized" in s or "authentication" in s
+            or "invalid_api_key" in s or "expired" in s)
+
+
+def _chat_retrieve(sites, email, question: str) -> list[dict]:
+    """Site-scoped retrieval: candidate docs from search(), then their passages. Never surfaces
+    a doc outside the caller's sites — search() applies the same site scope the rest of the app
+    does, and passages_for_docs only reads the doc_ids it returns."""
+    if not question:
+        return []
+    if lakebase.docs_enabled():
+        rows, _total = lakebase.search(sites, email, question, limit=8)
+        doc_ids = [r["doc_id"] for r in rows]
+        return lakebase.passages_for_docs(doc_ids, char_budget=12000) if doc_ids else []
+    # Warehouse fallback: mirror api_search's verified + site-scoped candidate query, then pull
+    # page text for the matches and pack to the same char budget.
+    where = "verification_status = 'verified'" + perms_where(email, "d.sp_site_id")
+    ql = lit(f"%{question.lower()}%")
+    rows = query(
+        f"SELECT d.doc_id FROM {config.DOCUMENTS} d "
+        f"LEFT JOIN (SELECT doc_id, concat_ws(' ', collect_list(text)) AS body "
+        f"FROM {config.DOCUMENT_TEXT} GROUP BY doc_id) tx ON tx.doc_id = d.doc_id "
+        f"WHERE {where} AND (lower(d.original_filename) LIKE {ql} "
+        f"OR lower(coalesce(tx.body, '')) LIKE {ql}) ORDER BY d.created_at DESC LIMIT 8"
+    )
+    doc_ids = [r["doc_id"] for r in rows]
+    if not doc_ids:
+        return []
+    id_list = ",".join(lit(i) for i in doc_ids)
+    trows = query(
+        f"SELECT t.doc_id, t.page, t.text, d.original_filename AS filename "
+        f"FROM {config.DOCUMENT_TEXT} t JOIN {config.DOCUMENTS} d ON d.doc_id = t.doc_id "
+        f"WHERE t.doc_id IN ({id_list}) ORDER BY t.doc_id, t.page"
+    )
+    out, used = [], 0
+    for r in trows:
+        text = r.get("text") or ""
+        if not text.strip():
+            continue
+        out.append({"doc_id": r["doc_id"], "page": r["page"],
+                    "text": text, "filename": r["filename"]})
+        used += len(text)
+        if used >= 12000:
+            break
+    return out
+
+
+def _build_chat_messages(passages, history, question):
+    system = (
+        "You are a document assistant. Answer the user's question using ONLY the context "
+        "passages provided below. If the answer is not contained in the context, say you don't "
+        "have that information. Cite every claim inline as [<filename> p.<page>] using the "
+        "filename and page from the passage you drew it from."
+    )
+    if passages:
+        ctx = "\n\n".join(
+            f"[doc_id={p['doc_id']} | {p['filename']} p.{p['page']}]\n{p['text']}"
+            for p in passages)
+    else:
+        ctx = "(no matching documents were found in the corpus)"
+    messages = [{"role": "system", "content": system},
+                {"role": "system", "content": "Context:\n\n" + ctx}]
+    for h in history or []:
+        role, content = h.get("role"), h.get("content")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": question})
+    return messages
+
+
+@app.post("/api/chat")
+def api_chat():
+    email = current_user()
+    body = request.get_json(force=True) or {}
+    question = (body.get("question") or "").strip()
+    history = body.get("history") or []
+    if _get_serving_client() is None:
+        return jsonify(error="chat_unavailable"), 503
+    sites = perms_sites(email)
+    passages = _chat_retrieve(sites, email, question)
+    messages = _build_chat_messages(passages, history, question)
+    citations = [{"doc_id": p["doc_id"], "page": p["page"], "filename": p["filename"]}
+                 for p in passages]
+
+    def generate():
+        try:
+            client = _get_serving_client()
+            try:
+                stream = client.chat.completions.create(
+                    model=config.CHAT_MODEL, max_tokens=2048, messages=messages, stream=True)
+            except Exception as exc:
+                if not _is_auth_error(exc):
+                    raise
+                client = _get_serving_client(force_rebuild=True)  # rotate the token, retry once
+                stream = client.chat.completions.create(
+                    model=config.CHAT_MODEL, max_tokens=2048, messages=messages, stream=True)
+            for chunk in stream:
+                choices = getattr(chunk, "choices", None)
+                if not choices:
+                    continue
+                token = getattr(choices[0].delta, "content", None)
+                if token:
+                    yield f"data: {json.dumps(token)}\n\n"
+            yield f"event: citations\ndata: {json.dumps(citations)}\n\n"
+            yield "event: done\ndata: {}\n\n"
+        except Exception as exc:
+            app.logger.error(f"chat stream failed ({exc!r}) — {_req_ctx()}")
+            yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+
+    return Response(generate(), mimetype="text/event-stream")
+
+
+# ─────────────────────────────────── relation tree + obligations calendar ──
+# Item L: a document's connected relation graph (for a tree/graph view) and a corpus-wide
+# calendar of upcoming date-field obligations, both site-scoped and Lakebase-first.
+
+@app.get("/api/documents/<doc_id>/tree")
+def api_document_tree(doc_id):
+    email = current_user()
+    if lakebase.docs_enabled():
+        d = lakebase.get_document(doc_id)
+    else:
+        docs = query(
+            f"SELECT doc_id, original_filename, document_type, sp_site_id, created_by "
+            f"FROM {config.DOCUMENTS} WHERE doc_id = {lit(doc_id)}")
+        d = docs[0] if docs else None
+    if not d:
+        return jsonify(error="not found"), 404
+    if not _doc_visibility(d, email):
+        return jsonify(error="forbidden"), 403
+    if lakebase.docs_enabled():
+        g = lakebase.link_graph(doc_id)
+        return jsonify(root=doc_id, nodes=g["nodes"], edges=g["edges"])
+    # Warehouse fallback: one-hop links only (no recursive CTE on the warehouse).
+    rows = query(
+        f"SELECT l.relationship, l.child_doc_id, l.parent_doc_id, d.original_filename, "
+        f"d.document_type FROM {config.DOCUMENT_LINKS} l JOIN {config.DOCUMENTS} d ON d.doc_id = "
+        f"  CASE WHEN l.parent_doc_id = {lit(doc_id)} THEN l.child_doc_id ELSE l.parent_doc_id END "
+        f"WHERE l.parent_doc_id = {lit(doc_id)} OR l.child_doc_id = {lit(doc_id)}")
+    nodes = {doc_id: {"doc_id": doc_id, "original_filename": d.get("original_filename"),
+                      "document_type": d.get("document_type")}}
+    edges = []
+    for r in rows:
+        nb = r["child_doc_id"] if r["parent_doc_id"] == doc_id else r["parent_doc_id"]
+        nodes[nb] = {"doc_id": nb, "original_filename": r.get("original_filename"),
+                     "document_type": r.get("document_type")}
+        edges.append({"parent_doc_id": r["parent_doc_id"], "child_doc_id": r["child_doc_id"],
+                      "relationship": r["relationship"]})
+    return jsonify(root=doc_id, nodes=list(nodes.values()), edges=edges)
+
+
+_DATE_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d/%m/%Y",
+                 "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y", "%Y/%m/%d")
+
+
+def _parse_date(s):
+    """Best-effort parse of a free-text date string to a date, or None if unparseable."""
+    if not s:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s[:10])  # ISO date or the date half of an ISO datetime
+    except ValueError:
+        pass
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+@app.get("/api/obligations")
+def api_obligations():
+    email = current_user()
+    d_from = _parse_date(request.args.get("from")) or date.today()
+    d_to = _parse_date(request.args.get("to")) or (date.today() + timedelta(days=365))
+    document_type = request.args.get("document_type")
+    defs = cached_query(
+        f"SELECT field_key, label FROM {config.FIELD_DEFS} "
+        f"WHERE data_type='date' AND active=true")
+    date_keys = [r["field_key"] for r in defs]
+    labels = {r["field_key"]: r.get("label") for r in defs}
+    if not date_keys:
+        return jsonify([])
+    sites = perms_sites(email)
+    if lakebase.docs_enabled():
+        rows = lakebase.obligations(sites, email, date_keys, document_type)
+    else:
+        # Warehouse fallback is awkward (free-string dates, cross-store) — return empty + log.
+        app.logger.info(f"obligations: warehouse mode — returning [] (Lakebase-first) — {_req_ctx()}")
+        return jsonify([])
+    out = []
+    for r in rows:
+        d = _parse_date(r.get("value"))
+        if d is None or d < d_from or d > d_to:
+            continue
+        out.append({
+            "doc_id": r["doc_id"], "original_filename": r.get("original_filename"),
+            "document_type": r.get("document_type"), "field_key": r["field_key"],
+            "field_label": labels.get(r["field_key"]) or r["field_key"],
+            "date": d.isoformat(), "sp_web_url": r.get("sp_web_url"),
+            "sp_site_name": r.get("sp_site_name"),
+        })
+    out.sort(key=lambda x: x["date"])
+    return jsonify(out)
 
 
 # ──────────────────────────────────────────────── SharePoint (delegated OAuth) ──
