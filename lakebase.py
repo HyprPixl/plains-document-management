@@ -871,6 +871,28 @@ def save_field(doc_id: str, field_key: str, value, email: str) -> None:
     )
 
 
+def save_fields(doc_id: str, values: dict, email: str) -> None:
+    """Batch-upsert human-confirmed values in ONE round-trip (vs. one per field). Same
+    semantics as save_field, collapsed into a single multi-row INSERT ... ON CONFLICT."""
+    if not values:
+        return
+    _ensure_documents_ready()
+    items = list(values.items())
+    rows_sql = ", ".join("(%s, %s, %s, 'human', now(), %s)" for _ in items)
+    params = []
+    for key, val in items:
+        params += [doc_id, key, val, email]
+    pg_execute(
+        f"INSERT INTO {DOCUMENT_FIELDS} "
+        "(doc_id, field_key, confirmed_value, source_provenance, updated_at, updated_by) "
+        f"VALUES {rows_sql} "
+        "ON CONFLICT (doc_id, field_key) DO UPDATE SET "
+        "confirmed_value = EXCLUDED.confirmed_value, source_provenance = 'human', "
+        "updated_at = now(), updated_by = EXCLUDED.updated_by",
+        tuple(params),
+    )
+
+
 def verify(doc_id: str, email: str) -> None:
     _ensure_documents_ready()
     pg_execute(

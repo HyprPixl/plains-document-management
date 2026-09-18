@@ -65,6 +65,30 @@ def test_write_audit_inserts_row_to_lakebase(monkeypatch):
     assert '"document_type": "Invoice"' in params[4]
 
 
+def test_save_fields_batches_all_keys_into_one_upsert(monkeypatch):
+    monkeypatch.setattr(lakebase, "_ensure_documents_ready", lambda: None)
+    calls = []
+    monkeypatch.setattr(lakebase, "pg_execute", lambda sql, params=None: calls.append((sql, params)))
+    lakebase.save_fields("d1", {"title": "New Title", "amount": "42"}, "u@x.com")
+    assert len(calls) == 1                                  # one round-trip, not one-per-field
+    sql, params = calls[0]
+    assert "INSERT INTO" in sql and "document_fields" in sql
+    assert "ON CONFLICT" in sql and "'human'" in sql
+    assert sql.count("(%s, %s, %s, 'human', now(), %s)") == 2  # two value tuples
+    # doc_id / field_key / value / updated_by, flattened per row in insertion order
+    assert params == ("d1", "title", "New Title", "u@x.com",
+                      "d1", "amount", "42", "u@x.com")
+
+
+def test_save_fields_empty_is_a_noop(monkeypatch):
+    monkeypatch.setattr(lakebase, "_ensure_documents_ready",
+                        lambda: (_ for _ in ()).throw(AssertionError("should not connect")))
+    calls = []
+    monkeypatch.setattr(lakebase, "pg_execute", lambda *a, **k: calls.append(a))
+    lakebase.save_fields("d1", {}, "u@x.com")
+    assert calls == []                                     # nothing posted → no write
+
+
 def test_set_access_grant_revoke_deletes_without_insert(monkeypatch):
     import config
     monkeypatch.setattr(lakebase, "enabled", lambda: True)

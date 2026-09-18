@@ -809,10 +809,10 @@ def api_save_fields(doc_id):
     """Upsert confirmed field values (human edits)."""
     email = current_user()
     values = request.get_json(force=True).get("values", {})
-    for key, val in values.items():
-        if lakebase.docs_enabled():
-            lakebase.save_field(doc_id, key, val, email)
-        else:
+    if lakebase.docs_enabled():
+        lakebase.save_fields(doc_id, values, email)          # one round-trip for all fields
+    else:
+        for key, val in values.items():
             execute(
                 f"MERGE INTO {config.DOCUMENT_FIELDS} t "
                 f"USING (SELECT {lit(doc_id)} AS doc_id, {lit(key)} AS field_key) s "
@@ -1130,7 +1130,7 @@ def sp_import():
             document_type=b.get("document_type"), department=b.get("department"))
     except sp.SPReauth:
         return jsonify(error="reauth"), 401
-    _trigger_processing_run()  # best-effort: don't make the user wait for the schedule
+    _submit_bg(_trigger_processing_run)  # best-effort, off-thread: don't make the user wait
     _audit(email, "sp_import", drive_id, {"request_id": req_id, "selected": len(selections)})
     return jsonify(request_id=req_id, queued=True)
 
