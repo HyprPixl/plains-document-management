@@ -71,9 +71,15 @@ def run_di(file_bytes: bytes) -> tuple[bytes, list[dict]]:
     if not pages and getattr(result, "content", None):
         pages = [{"page": 1, "text": result.content}]
 
-    # Retrieve the searchable PDF produced by the same operation.
-    op_location = poller.details["operation_location"]
-    result_id = op_location.split("/analyzeResults/")[-1].split("?")[0]
+    # Retrieve the searchable PDF produced by the same operation. In
+    # azure-ai-documentintelligence 1.0.0 (GA — what runs on the job cluster) the poller
+    # exposes the result id as `operation_id`; earlier betas exposed only `operation_location`
+    # (a URL ending in /analyzeResults/{id}). Support both so a raw `["operation_location"]`
+    # index can't KeyError every scanned PDF into `failed` (as it did before this fix).
+    details = poller.details
+    result_id = details.get("operation_id")
+    if not result_id and details.get("operation_location"):
+        result_id = details["operation_location"].split("/analyzeResults/")[-1].split("?")[0]
     pdf_stream = client.get_analyze_result_pdf(model_id=DI_MODEL, result_id=result_id)
     searchable = b"".join(chunk for chunk in pdf_stream)
     return searchable, pages
