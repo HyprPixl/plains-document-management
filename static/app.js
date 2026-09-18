@@ -50,6 +50,21 @@ const locationOf = (d) => {
   const parts = [d.sp_site_name, d.sp_path].filter(Boolean);
   return parts.length ? parts.join(" · ") : "—";
 };
+// Enclosing-folder URL for a SharePoint file link: drop the last path segment of the item's
+// webUrl (e.g. ".../Docs/2023/file.pdf" → ".../Docs/2023"). Query/fragment stripped first.
+// Returns null when there's no usable parent (no url, or the file sits at the web root).
+const parentFolderUrl = (webUrl) => {
+  if (!webUrl) return null;
+  try {
+    const u = new URL(webUrl);
+    u.search = ""; u.hash = "";
+    const segs = u.pathname.split("/").filter(Boolean);
+    if (segs.length < 2) return null;   // nothing above the file to open
+    segs.pop();
+    u.pathname = "/" + segs.join("/");
+    return u.toString();
+  } catch { return null; }
+};
 
 // ─────────────────────────────────────────────── surfaces ──
 function setSurface(name) {
@@ -471,8 +486,12 @@ function renderDrawer(data) {
   const actions = el("div", { class: "field-actions" },
     el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}&inline=1`, target: "_blank" }, "View file"),
     el("a", { class: "btn", href: `/api/download?doc_id=${d.doc_id}` }, "Download"));
-  if (d.sp_web_url)
+  if (d.sp_web_url) {
     actions.append(el("a", { class: "btn", href: d.sp_web_url, target: "_blank" }, "Open in SharePoint"));
+    const folder = parentFolderUrl(d.sp_web_url);
+    if (folder)
+      actions.append(el("a", { class: "btn", href: folder, target: "_blank" }, "Open folder"));
+  }
   body.append(actions);
 
   // Unclassified docs get a classify-first panel (no extracted fields yet); once classified
