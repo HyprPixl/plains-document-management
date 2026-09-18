@@ -747,12 +747,14 @@ def api_remove_tag(doc_id, tag):
 @app.get("/api/documents/<doc_id>")
 def api_document(doc_id):
     if lakebase.docs_enabled():
-        doc = lakebase.get_document(doc_id)
-        if not doc:
+        # Document row + field values + links + tags in ONE Lakebase round-trip (was four
+        # serial reads — see bench/BASELINE.md). field_defs still comes from the warehouse:
+        # a cross-store join isn't possible, so read the defs there and merge the doc's values
+        # (from the bundle) by field_key in Python.
+        bundle = lakebase.get_document_bundle(doc_id)
+        if not bundle:
             return jsonify(error="not found"), 404
-        # field_defs lives on the warehouse; the doc's values on Lakebase — a cross-store
-        # join isn't possible, so read the defs (warehouse) and values (Lakebase) separately
-        # and merge by field_key in Python (both round-trips are cheap).
+        doc = bundle["document"]
         defs = cached_query(
             f"SELECT fd.field_key, fd.label, fd.data_type, fd.picklist_source, fd.required_for_verify, "
             f"fd.applies_to, fd.sort_order FROM {config.FIELD_DEFS} fd "
@@ -760,7 +762,7 @@ def api_document(doc_id):
             f"(fd.applies_to = 'common' OR fd.applies_to = {lit(doc.get('document_type'))}) "
             f"ORDER BY (fd.applies_to='common') DESC, fd.sort_order"
         )
-        vals = {r["field_key"]: r for r in lakebase.get_field_values(doc_id)}
+        vals = {r["field_key"]: r for r in bundle["fields"]}
         for d in defs:
             v = vals.get(d["field_key"], {})
             d["proposed_value"] = v.get("proposed_value")
@@ -769,7 +771,7 @@ def api_document(doc_id):
             if d.get("picklist_source") and "|" in str(d["picklist_source"]):
                 d["options"] = str(d["picklist_source"]).split("|")
         return jsonify(document=doc, fields=defs,
-                       links=lakebase.get_links(doc_id), tags=lakebase.get_tags(doc_id))
+                       links=bundle["links"], tags=bundle["tags"])
     docs = query(f"SELECT * FROM {config.DOCUMENTS} WHERE doc_id = {lit(doc_id)}")
     if not docs:
         return jsonify(error="not found"), 404

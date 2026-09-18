@@ -345,14 +345,16 @@ def test_api_document_merges_warehouse_defs_with_lakebase_values(client, fake_db
     fake_db.responder = route([("access_type, allowed_site", [{"access_type": "FULL", "allowed_site": None}]),
                                ("field_defs", defs)])
     monkeypatch.setattr(app_module.lakebase, "docs_enabled", lambda: True)
-    monkeypatch.setattr(app_module.lakebase, "get_document",
-                        lambda doc_id: {"doc_id": doc_id, "document_type": "Invoice"})
-    monkeypatch.setattr(app_module.lakebase, "get_field_values",
-                        lambda doc_id: [{"field_key": "title", "proposed_value": "AI title",
-                                         "confirmed_value": "Human title", "source_provenance": "human",
-                                         "confidence": None}])
-    monkeypatch.setattr(app_module.lakebase, "get_links", lambda doc_id: [])
-    monkeypatch.setattr(app_module.lakebase, "get_tags", lambda doc_id: ["t1"])
+    # api_document reads the whole drawer (document + values + links + tags) in one bundle.
+    monkeypatch.setattr(app_module.lakebase, "get_document_bundle",
+                        lambda doc_id: {
+                            "document": {"doc_id": doc_id, "document_type": "Invoice"},
+                            "fields": [{"field_key": "title", "proposed_value": "AI title",
+                                        "confirmed_value": "Human title", "source_provenance": "human",
+                                        "confidence": None}],
+                            "links": [],
+                            "tags": ["t1"],
+                        })
     r = client.get("/api/documents/d1")
     assert r.status_code == 200
     body = r.get_json()

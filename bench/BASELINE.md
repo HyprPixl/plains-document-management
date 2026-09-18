@@ -56,4 +56,15 @@ Not yet migrated (still warehouse, so unchanged): `documents` (~1.1 s warm), `st
 way is what will move the admin "Run benchmark" numbers (that endpoint times these warehouse
 queries; the permission win doesn't show there because its one lookup is `g`-cached outside the
 timed loops).
+
+## Phase 3 result — `document` drawer folded to one round-trip (2026-09-18)
+
+On the Lakebase-live path (`USE_LAKEBASE_DOCUMENTS=true`), `api_document` was still issuing
+**four serial Postgres reads** (`get_document`, `get_field_values`, `get_links`, `get_tags`).
+`lakebase.get_document_bundle()` now folds the three child collections into jsonb columns beside
+the document row via correlated subqueries, so the whole drawer is **one** Lakebase round-trip
+(the document keeps its native psycopg2 types, so the JSON response is byte-for-byte the same).
+The warehouse `field_defs` read stays separate — a cross-store join we can't do in Postgres.
+At single-digit-ms/round-trip this is ~4× fewer hops on the drawer-open path; the warehouse
+fallback in `api_document` (dead once the flag stays on) is left untouched.
 </content>

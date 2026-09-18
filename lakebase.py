@@ -789,6 +789,48 @@ def get_links(doc_id: str) -> list[dict]:
     )
 
 
+def get_document_bundle(doc_id: str) -> dict | None:
+    """Document row + its field values, links, and tags in ONE Postgres round-trip.
+
+    api_document needs all four; issued serially (get_document / get_field_values /
+    get_links / get_tags) that's four network hops to Lakebase per drawer open. Correlated
+    subqueries fold the three child collections into jsonb columns beside the document's own
+    columns, so the document keeps its native psycopg2 types (timestamps etc. serialize
+    exactly as the four-query path did) while fields/links/tags come back as already-parsed
+    lists. Returns {document, fields, links, tags} or None if the doc is unknown. The
+    warehouse field_defs are still read separately by the caller — that's a cross-store join
+    we can't do here (see bench/BASELINE.md)."""
+    _ensure_documents_ready()
+    rows = pg_query(
+        "SELECT d.*, "
+        "  (SELECT coalesce(jsonb_agg(jsonb_build_object("
+        "       'field_key', f.field_key, 'proposed_value', f.proposed_value, "
+        "       'confirmed_value', f.confirmed_value, 'source_provenance', f.source_provenance, "
+        "       'confidence', f.confidence)), '[]'::jsonb) "
+        f"   FROM {DOCUMENT_FIELDS} f WHERE f.doc_id = d.doc_id) AS _fields, "
+        "  (SELECT coalesce(jsonb_agg(jsonb_build_object("
+        "       'relationship', l.relationship, 'child_doc_id', l.child_doc_id, "
+        "       'parent_doc_id', l.parent_doc_id, 'original_filename', ld.original_filename, "
+        "       'document_type', ld.document_type)), '[]'::jsonb) "
+        f"   FROM {DOCUMENT_LINKS} l JOIN {DOCUMENTS} ld ON ld.doc_id = "
+        "     CASE WHEN l.parent_doc_id = d.doc_id THEN l.child_doc_id ELSE l.parent_doc_id END "
+        "   WHERE l.parent_doc_id = d.doc_id OR l.child_doc_id = d.doc_id) AS _links, "
+        "  (SELECT coalesce(jsonb_agg(t.tag ORDER BY t.tag), '[]'::jsonb) "
+        f"   FROM {DOCUMENT_TAGS} t WHERE t.doc_id = d.doc_id) AS _tags "
+        f"FROM {DOCUMENTS} d WHERE d.doc_id = %s",
+        (doc_id,),
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "document": row,
+        "fields": row.pop("_fields"),
+        "links": row.pop("_links"),
+        "tags": row.pop("_tags"),
+    }
+
+
 def document_head(doc_id: str) -> dict | None:
     """Existence + document_type in one read — the row (with document_type) or None if the
     doc is unknown. Lets callers distinguish 'missing' from 'exists but unclassified' (NULL
